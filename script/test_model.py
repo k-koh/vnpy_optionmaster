@@ -37,6 +37,6 @@ for py_model, cy_model in [
         if "tree" in model.__name__:
             print("vega", model.calculate_vega(s, k, r, t, v, cp))
         else:
-            print("vega", model.calculate_vega(s, k, r, t, v))
+            print("vega", model.calculate_vega(s, k, r, t, v, cp))
 
         print("greeks", model.calculate_greeks(s, k, r, t, v, cp))
