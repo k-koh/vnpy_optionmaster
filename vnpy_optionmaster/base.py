@@ -716,6 +716,9 @@ def get_underlying_prefix(portfolio_name: str) -> str:
     # 郑商所
     elif portfolio_name.endswith("CZCE"):
         return portfolio_name.replace(".CZCE", "")
+    # JPX
+    elif portfolio_name.endswith("JPX"):
+        return portfolio_name.replace("_o.JPX", "")
     # 其他
     else:
         return ""
