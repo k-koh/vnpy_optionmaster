@@ -151,31 +151,42 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         portfolio: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
 
         for chain in portfolio.chains.values():
+            # Get call data
             call_impv: list = []
-            put_impv: list = []
             pricing_impv: list = []
-            strike_prices: list = []
+            call_strikes: list = []
 
-            for index in chain.indexes:
-                call: OptionData = chain.calls[index]
+            calls: list[OptionData] = list(chain.calls.values())
+            calls.sort(key=lambda x: x.strike_price)
+
+            for call in calls:
                 call_impv.append(call.mid_impv * 100)
                 pricing_impv.append(call.pricing_impv * 100)
-                strike_prices.append(call.strike_price)
+                call_strikes.append(call.strike_price)
 
-                put: OptionData = chain.puts[index]
+            # Get put data
+            put_impv: list = []
+            put_strikes: list = []
+
+            puts: list[OptionData] = list(chain.puts.values())
+            puts.sort(key=lambda x: x.strike_price)
+
+            for put in puts:
                 put_impv.append(put.mid_impv * 100)
+                put_strikes.append(put.strike_price)
 
+            # Plot curves
             self.call_curves[chain.chain_symbol].setData(
                 y=call_impv,
-                x=strike_prices
+                x=call_strikes
             )
             self.put_curves[chain.chain_symbol].setData(
                 y=put_impv,
-                x=strike_prices
+                x=put_strikes
             )
             self.pricing_curves[chain.chain_symbol].setData(
                 y=pricing_impv,
-                x=strike_prices
+                x=call_strikes
             )
 
     def update_curve_visible(self) -> None:

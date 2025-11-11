@@ -195,44 +195,50 @@ class OptionMarketMonitor(MonitorTable):
             )
 
             for index in chain.indexes:
-                call: OptionData = chain.calls[index]
-                put: OptionData = chain.puts[index]
+                call: OptionData = chain.calls.get(index)
+                put: OptionData = chain.puts.get(index)
+
+                if not call and not put:
+                    continue
 
                 current_row += 1
 
                 # Call cells
-                call_cells: dict = {}
+                if call:
+                    call_cells: dict = {}
 
-                for column, d in enumerate(self.headers):
-                    value = getattr(call, d["name"], "")
-                    cell = d["cell"](
-                        text=str(value),
-                        vt_symbol=call.vt_symbol
-                    )
-                    self.setItem(current_row, column, cell)
-                    call_cells[d["name"]] = cell
+                    for column, d in enumerate(self.headers):
+                        value = getattr(call, d["name"], "")
+                        cell = d["cell"](
+                            text=str(value),
+                            vt_symbol=call.vt_symbol
+                        )
+                        self.setItem(current_row, column, cell)
+                        call_cells[d["name"]] = cell
 
-                self.cells[call.vt_symbol] = call_cells
+                    self.cells[call.vt_symbol] = call_cells
 
                 # Put cells
-                put_cells: dict = {}
-                put_headers: list = copy(self.headers)
-                put_headers.reverse()
+                if put:
+                    put_cells: dict = {}
+                    put_headers: list = copy(self.headers)
+                    put_headers.reverse()
 
-                for column, d in enumerate(put_headers):
-                    column += (strike_column + 1)
-                    value = getattr(put, d["name"], "")
-                    cell = d["cell"](
-                        text=str(value),
-                        vt_symbol=put.vt_symbol
-                    )
-                    self.setItem(current_row, column, cell)
-                    put_cells[d["name"]] = cell
+                    for column, d in enumerate(put_headers):
+                        column += (strike_column + 1)
+                        value = getattr(put, d["name"], "")
+                        cell = d["cell"](
+                            text=str(value),
+                            vt_symbol=put.vt_symbol
+                        )
+                        self.setItem(current_row, column, cell)
+                        put_cells[d["name"]] = cell
 
-                self.cells[put.vt_symbol] = put_cells
+                    self.cells[put.vt_symbol] = put_cells
 
                 # Strike cell
-                index_cell: IndexCell = IndexCell(str(call.chain_index))
+                strike_price = call.chain_index if call else put.chain_index
+                index_cell: IndexCell = IndexCell(str(strike_price))
                 self.setItem(current_row, strike_column, index_cell)
 
             # Move to next row

@@ -468,7 +468,9 @@ class ChainData:
         atm_index: str = ""
 
         for index, call in self.calls.items():
-            put: OptionData = self.puts[index]
+            put: OptionData = self.puts.get(index)
+            if not put:
+                continue
 
             call_tick: TickData = call.tick
             if not call_tick or not call_tick.bid_price_1 or not call_tick.ask_price_1:
@@ -493,7 +495,7 @@ class ChainData:
 
     def calculate_underlying_adjustment(self) -> None:
         """"""
-        if not self.atm_price:
+        if not self.atm_price or not self.atm_index:
             return
 
         atm_call: OptionData = self.calls[self.atm_index]
@@ -507,6 +509,9 @@ class ChainData:
 
     def update_synthetic_price(self) -> None:
         """"""
+        if not self.atm_index:
+            return
+
         call: OptionData = self.calls[self.atm_index]
         put: OptionData = self.puts[self.atm_index]
 

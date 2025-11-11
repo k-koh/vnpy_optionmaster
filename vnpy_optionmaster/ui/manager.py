@@ -285,57 +285,63 @@ class ElectronicEyeMonitor(QtWidgets.QTableWidget):
             )
 
             for index in chain.indexes:
-                call: OptionData = chain.calls[index]
-                put: OptionData = chain.puts[index]
+                call: OptionData = chain.calls.get(index)
+                put: OptionData = chain.puts.get(index)
+
+                if not call and not put:
+                    continue
 
                 current_row += 1
 
                 # Call cells
-                call_cells: dict = {}
+                if call:
+                    call_cells: dict = {}
 
-                for column, d in enumerate(self.headers):
-                    cell_type = d["cell"]
+                    for column, d in enumerate(self.headers):
+                        cell_type = d["cell"]
 
-                    if issubclass(cell_type, QtWidgets.QPushButton):
-                        cell = cell_type(call.vt_symbol, self)
-                    else:
-                        cell = cell_type()
+                        if issubclass(cell_type, QtWidgets.QPushButton):
+                            cell = cell_type(call.vt_symbol, self)
+                        else:
+                            cell = cell_type()
 
-                    call_cells[d["name"]] = cell
+                        call_cells[d["name"]] = cell
 
-                    if isinstance(cell, QtWidgets.QTableWidgetItem):
-                        self.setItem(current_row, column, cell)
-                    else:
-                        self.setCellWidget(current_row, column, cell)
+                        if isinstance(cell, QtWidgets.QTableWidgetItem):
+                            self.setItem(current_row, column, cell)
+                        else:
+                            self.setCellWidget(current_row, column, cell)
 
-                self.cells[call.vt_symbol] = call_cells
+                    self.cells[call.vt_symbol] = call_cells
 
                 # Put cells
-                put_cells: dict = {}
-                put_headers: list = copy(self.headers)
-                put_headers.reverse()
+                if put:
+                    put_cells: dict = {}
+                    put_headers: list = copy(self.headers)
+                    put_headers.reverse()
 
-                for column, d in enumerate(put_headers):
-                    column += (strike_column + 1)
+                    for column, d in enumerate(put_headers):
+                        column += (strike_column + 1)
 
-                    cell_type = d["cell"]
+                        cell_type = d["cell"]
 
-                    if issubclass(cell_type, QtWidgets.QPushButton):
-                        cell = cell_type(put.vt_symbol, self)
-                    else:
-                        cell = cell_type()
+                        if issubclass(cell_type, QtWidgets.QPushButton):
+                            cell = cell_type(put.vt_symbol, self)
+                        else:
+                            cell = cell_type()
 
-                    put_cells[d["name"]] = cell
+                        put_cells[d["name"]] = cell
 
-                    if isinstance(cell, QtWidgets.QTableWidgetItem):
-                        self.setItem(current_row, column, cell)
-                    else:
-                        self.setCellWidget(current_row, column, cell)
+                        if isinstance(cell, QtWidgets.QTableWidgetItem):
+                            self.setItem(current_row, column, cell)
+                        else:
+                            self.setCellWidget(current_row, column, cell)
 
-                self.cells[put.vt_symbol] = put_cells
+                    self.cells[put.vt_symbol] = put_cells
 
                 # Strike cell
-                index_cell: IndexCell = IndexCell(str(call.chain_index))
+                strike_price = call.chain_index if call else put.chain_index
+                index_cell: IndexCell = IndexCell(str(strike_price))
                 self.setItem(current_row, strike_column, index_cell)
 
             # Move to next row
@@ -855,17 +861,28 @@ class PricingVolatilityManager(QtWidgets.QWidget):
         chain: ChainData = self.portfolio.get_chain(chain_symbol)
         atm_index: str = chain.atm_index
 
+        if not atm_index:
+            return
+
         for index in chain.indexes:
-            call: OptionData = chain.calls[index]
-            put: OptionData = chain.puts[index]
+            call: OptionData = chain.calls.get(index)
+            put: OptionData = chain.puts.get(index)
 
             if index >= atm_index:
                 otm: OptionData = call
             else:
                 otm = put
 
-            call.pricing_impv = otm.mid_impv
-            put.pricing_impv = otm.mid_impv
+            if not otm:
+                otm = call or put
+
+            if not otm:
+                continue
+
+            if call:
+                call.pricing_impv = otm.mid_impv
+            if put:
+                put.pricing_impv = otm.mid_impv
 
         self.update_pricing_impv(chain_symbol)
 
@@ -876,32 +893,59 @@ class PricingVolatilityManager(QtWidgets.QWidget):
         chain: ChainData = self.portfolio.get_chain(chain_symbol)
         atm_index: str = chain.atm_index
 
+        if not atm_index:
+            return
+
         strike_prices: list = []
         pricing_impvs: list = []
 
         for index in chain.indexes:
-            call: OptionData = chain.calls[index]
-            put: OptionData = chain.puts[index]
             cells: dict = self.cells[(chain_symbol, index)]
 
-            if not cells["check"].isChecked():
-                if index >= atm_index:
-                    otm: OptionData = call
-                else:
-                    otm = put
+            if cells["check"].isChecked():
+                continue
 
-                strike_prices.append(otm.strike_price)
-                pricing_impvs.append(otm.pricing_impv)
+            call: OptionData = chain.calls.get(index)
+            put: OptionData = chain.puts.get(index)
+
+            if index >= atm_index:
+                otm: OptionData = call
+            else:
+                otm = put
+
+            if not otm:
+                otm = call or put
+
+            if not otm:
+                continue
+
+            strike_prices.append(otm.strike_price)
+            pricing_impvs.append(otm.pricing_impv)
+
+        if len(strike_prices) < 2:
+            return
 
         cs: interpolate.CubicSpline = interpolate.CubicSpline(strike_prices, pricing_impvs)
 
         for index in chain.indexes:
-            call = chain.calls[index]
-            put = chain.puts[index]
+            call: OptionData = chain.calls.get(index)
+            put: OptionData = chain.puts.get(index)
 
-            new_impv: float = float(cs(call.strike_price))
-            call.pricing_impv = new_impv
-            put.pricing_impv = new_impv
+            strike_price = 0
+            if call:
+                strike_price = call.strike_price
+            elif put:
+                strike_price = put.strike_price
+
+            if not strike_price:
+                continue
+
+            new_impv: float = float(cs(strike_price))
+
+            if call:
+                call.pricing_impv = new_impv
+            if put:
+                put.pricing_impv = new_impv
 
         self.update_pricing_impv(chain_symbol)
 
@@ -933,22 +977,36 @@ class PricingVolatilityManager(QtWidgets.QWidget):
 
         chain: ChainData = self.portfolio.get_chain(chain_symbol)
 
-        call: OptionData = chain.calls[index]
-        call.pricing_impv = new_impv
+        call: OptionData = chain.calls.get(index)
+        if call:
+            call.pricing_impv = new_impv
 
-        put: OptionData = chain.puts[index]
-        put.pricing_impv = new_impv
+        put: OptionData = chain.puts.get(index)
+        if put:
+            put.pricing_impv = new_impv
 
     def update_pricing_impv(self, chain_symbol: str) -> None:
         """"""
         chain: ChainData = self.portfolio.get_chain(chain_symbol)
         atm_index: str = chain.atm_index
 
+        if not atm_index:
+            return
+
         for index in chain.indexes:
+            call: OptionData = chain.calls.get(index)
+            put: OptionData = chain.puts.get(index)
+
             if index >= atm_index:
-                otm: OptionData = chain.calls[index]
+                otm: OptionData = call
             else:
-                otm = chain.puts[index]
+                otm = put
+
+            if not otm:
+                otm = call or put
+
+            if not otm:
+                continue
 
             value: float = round(otm.pricing_impv * 100, 1)
 
@@ -962,18 +1020,36 @@ class PricingVolatilityManager(QtWidgets.QWidget):
         chain: ChainData = self.portfolio.get_chain(chain_symbol)
         atm_index: str = chain.atm_index
 
+        if not atm_index:
+            return
+
         for index in chain.indexes:
-            call: OptionData = chain.calls[index]
-            put: OptionData = chain.puts[index]
+            call: OptionData = chain.calls.get(index)
+            put: OptionData = chain.puts.get(index)
+
             if index >= atm_index:
                 otm: OptionData = call
             else:
                 otm = put
 
+            if not otm:
+                otm = call or put
+
+            if not otm:
+                continue
+
             cells: dict = self.cells[(chain_symbol, index)]
             cells["otm_impv"].setText(f"{otm.mid_impv:.1%}")
-            cells["call_impv"].setText(f"{call.mid_impv:.1%}")
-            cells["put_impv"].setText(f"{put.mid_impv:.1%}")
+
+            if call:
+                cells["call_impv"].setText(f"{call.mid_impv:.1%}")
+            else:
+                cells["call_impv"].setText("")
+
+            if put:
+                cells["put_impv"].setText(f"{put.mid_impv:.1%}")
+            else:
+                cells["put_impv"].setText("")
 
         current_atm_index: str = self.chain_atm_index.get(chain_symbol, "")
         if current_atm_index == atm_index:
@@ -981,15 +1057,15 @@ class PricingVolatilityManager(QtWidgets.QWidget):
         self.chain_atm_index[chain_symbol] = atm_index
 
         if current_atm_index:
-            old_cells: dict = self.cells[(chain_symbol, current_atm_index)]
-
-            for field in ["otm_impv", "call_impv", "put_impv"]:
-                old_cells[field].setForeground(COLOR_WHITE)
-                old_cells[field].setBackground(self.default_background)
+            old_cells: dict = self.cells.get((chain_symbol, current_atm_index))
+            if old_cells:
+                for field in ["otm_impv", "call_impv", "put_impv"]:
+                    old_cells[field].setForeground(COLOR_WHITE)
+                    old_cells[field].setBackground(self.default_background)
 
         if atm_index:
-            new_cells: dict = self.cells[(chain_symbol, atm_index)]
-
-            for field in ["otm_impv", "call_impv", "put_impv"]:
-                new_cells[field].setForeground(COLOR_BLACK)
-                new_cells[field].setBackground(COLOR_WHITE)
+            new_cells: dict = self.cells.get((chain_symbol, atm_index))
+            if new_cells:
+                for field in ["otm_impv", "call_impv", "put_impv"]:
+                    new_cells[field].setForeground(COLOR_BLACK)
+                    new_cells[field].setBackground(COLOR_WHITE)
