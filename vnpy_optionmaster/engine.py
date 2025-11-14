@@ -14,7 +14,7 @@ from vnpy.trader.event import (
     EVENT_TIMER, EVENT_ORDER
 )
 from vnpy.trader.constant import (
-    Product, Offset, Direction, OrderType, Exchange, Status
+    Product, Offset, Direction, OrderType, Exchange, Status, OptionType
 )
 from vnpy.trader.converter import OffsetConverter, PositionHolding
 from vnpy.trader.utility import extract_vt_symbol, round_to, save_json, load_json
@@ -343,6 +343,33 @@ class OptionEngine(BaseEngine):
         """"""
         instrument: InstrumentData | OptionData | UnderlyingData | None = self.instruments.get(vt_symbol)
         return instrument
+
+    def get_option_data_by_kabus_symbol(self, kabus_symbol: str) -> OptionData | None:
+        """"""
+        parts = kabus_symbol.split('-')
+        if len(parts) != 4:
+            return None
+        
+        underlying_prefix = f"{parts[0]}-{parts[1]}" # nk-2512
+        option_type_str = parts[2] # C or P
+        strike_price = float(parts[3]) # 45000
+
+        option_type = None
+        if option_type_str == 'C':
+            option_type = 1
+        elif option_type_str == 'P':
+            option_type = -1
+        else:
+            return None
+
+        for instrument in self.instruments.values():
+            if isinstance(instrument, OptionData):
+                option_data: OptionData = instrument
+                if (option_data.underlying.symbol == underlying_prefix and
+                    option_data.option_type == option_type and
+                    option_data.strike_price == strike_price):
+                    return option_data
+        return None
 
     def set_timer_trigger(self, timer_trigger: int) -> None:
         """"""
