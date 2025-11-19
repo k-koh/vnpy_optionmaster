@@ -340,9 +340,9 @@ class ChainData:
         self.atm_impv: float | None = None
 
         self.eris_p_iv: float | None = None
-        self.eris_p_strike: float | None = None
+        self.eris_p_strike: int | None = None
         self.eris_c_iv: float | None = None
-        self.eris_c_strike: float | None = None
+        self.eris_c_strike: int | None = None
 
     def add_option(self, option: OptionData) -> None:
         """"""
