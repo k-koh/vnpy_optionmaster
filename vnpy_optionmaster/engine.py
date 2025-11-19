@@ -98,15 +98,15 @@ class OptionEngine(BaseEngine):
             portfolio_name: str = portfolio.name
 
             # Load underlying adjustment from setting
-            # chain_adjustments: dict = data.get("chain_adjustments", {})
-            # chain_adjustment_data: dict = chain_adjustments.get(portfolio_name, {})
+            chain_adjustments: dict = data.get("chain_adjustments", {})
+            chain_adjustment_data: dict = chain_adjustments.get(portfolio_name, {})
 
-            # if chain_adjustment_data:
-            #     for chain in portfolio.chains.values():
-            #         if not chain.use_synthetic:
-            #             chain.underlying_adjustment = chain_adjustment_data.get(
-            #                 chain.chain_symbol, 0
-            #             )
+            if chain_adjustment_data:
+                for chain in portfolio.chains.values():
+                    if not chain.use_synthetic:
+                        chain.underlying_adjustment = chain_adjustment_data.get(
+                            chain.chain_symbol, 0
+                        )
 
             # Load pricing impv from setting
             pricing_impvs: dict = data.get("pricing_impvs", {})

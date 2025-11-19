@@ -337,6 +337,7 @@ class ChainData:
         self.days_to_expiry: int = 0
 
         self.use_synthetic: bool = False
+        self.atm_impv: float = 0
 
     def add_option(self, option: OptionData) -> None:
         """"""
@@ -492,6 +493,26 @@ class ChainData:
 
         self.atm_price = atm_price
         self.atm_index = atm_index
+
+        self.calculate_atm_impv()
+
+    def calculate_atm_impv(self) -> None:
+        """"""
+        if not self.atm_index:
+            self.atm_impv = 0
+            return
+
+        atm_call: OptionData = self.calls.get(self.atm_index)
+        atm_put: OptionData = self.puts.get(self.atm_index)
+
+        if atm_call and atm_put:
+            self.atm_impv = (atm_call.mid_impv + atm_put.mid_impv) / 2
+        elif atm_call:
+            self.atm_impv = atm_call.mid_impv
+        elif atm_put:
+            self.atm_impv = atm_put.mid_impv
+        else:
+            self.atm_impv = 0
 
     def calculate_underlying_adjustment(self) -> None:
         """"""

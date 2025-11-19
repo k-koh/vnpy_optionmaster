@@ -759,6 +759,7 @@ class PricingVolatilityManager(QtWidgets.QWidget):
                 "OTM隐波",
                 "CALL隐波",
                 "PUT隐波",
+                "ATM隐波",
                 "定价隐波",
                 "执行拟合"
             ]
@@ -770,6 +771,7 @@ class PricingVolatilityManager(QtWidgets.QWidget):
                 otm_impv_cell: MonitorCell = MonitorCell("")
                 call_impv_cell: MonitorCell = MonitorCell("")
                 put_impv_cell: MonitorCell = MonitorCell("")
+                atm_impv_cell: MonitorCell = MonitorCell("")
 
                 set_func = partial(
                     self.set_pricing_impv,
@@ -793,13 +795,15 @@ class PricingVolatilityManager(QtWidgets.QWidget):
                 table.setItem(row, 1, otm_impv_cell)
                 table.setItem(row, 2, call_impv_cell)
                 table.setItem(row, 3, put_impv_cell)
-                table.setCellWidget(row, 4, pricing_impv_spin)
-                table.setCellWidget(row, 5, check_widget)
+                table.setItem(row, 4, atm_impv_cell)
+                table.setCellWidget(row, 5, pricing_impv_spin)
+                table.setCellWidget(row, 6, check_widget)
 
                 cells: dict = {
                     "otm_impv": otm_impv_cell,
                     "call_impv": call_impv_cell,
                     "put_impv": put_impv_cell,
+                    "atm_impv": atm_impv_cell,
                     "pricing_impv": pricing_impv_spin,
                     "check": check
                 }
@@ -1051,6 +1055,11 @@ class PricingVolatilityManager(QtWidgets.QWidget):
             else:
                 cells["put_impv"].setText("")
 
+            if chain.atm_impv:
+                cells["atm_impv"].setText(f"{chain.atm_impv:.1%}")
+            else:
+                cells["atm_impv"].setText("")
+
         current_atm_index: str = self.chain_atm_index.get(chain_symbol, "")
         if current_atm_index == atm_index:
             return
@@ -1059,13 +1068,13 @@ class PricingVolatilityManager(QtWidgets.QWidget):
         if current_atm_index:
             old_cells: dict = self.cells.get((chain_symbol, current_atm_index))
             if old_cells:
-                for field in ["otm_impv", "call_impv", "put_impv"]:
+                for field in ["otm_impv", "call_impv", "put_impv", "atm_impv"]:
                     old_cells[field].setForeground(COLOR_WHITE)
                     old_cells[field].setBackground(self.default_background)
 
         if atm_index:
             new_cells: dict = self.cells.get((chain_symbol, atm_index))
             if new_cells:
-                for field in ["otm_impv", "call_impv", "put_impv"]:
+                for field in ["otm_impv", "call_impv", "put_impv", "atm_impv"]:
                     new_cells[field].setForeground(COLOR_BLACK)
                     new_cells[field].setBackground(COLOR_WHITE)
