@@ -337,7 +337,7 @@ class ChainData:
         self.days_to_expiry: int = 0
 
         self.use_synthetic: bool = False
-        self.atm_impv: float = 0
+        self.atm_impv: float | None = None
 
         self.eris_p_iv: float | None = None
         self.eris_p_strike: float | None = None
