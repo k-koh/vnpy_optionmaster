@@ -134,7 +134,7 @@ class OptionData(InstrumentData):
 
     def calculate_option_impv(self) -> None:
         """"""
-        if not self.tick or not self.underlying:
+        if not self.tick or not hasattr(self, "underlying") or not self.underlying:
             return
 
         underlying_price: float = self.underlying.mid_price
@@ -183,7 +183,7 @@ class OptionData(InstrumentData):
 
     def calculate_theo_greeks(self) -> None:
         """"""
-        if not self.underlying:
+        if not hasattr(self, "underlying") or not self.underlying:
             return
 
         underlying_price: float = self.underlying.mid_price
