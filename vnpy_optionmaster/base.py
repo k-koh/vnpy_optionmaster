@@ -187,16 +187,24 @@ class OptionData(InstrumentData):
             return
 
         underlying_price: float = self.underlying.mid_price
-        if not underlying_price or not self.mid_impv:
+        if not underlying_price:
             return
         underlying_price += self.underlying_adjustment
+
+        # Determine volatility to use for greeks calculation
+        pricing_impv: float = self.mid_impv
+        if not pricing_impv:
+            pricing_impv = self.chain.atm_impv
+
+        if not pricing_impv:
+            return
 
         _, delta, gamma, theta, vega = self.calculate_greeks(
             underlying_price,
             self.strike_price,
             self.interest_rate,
             self.time_to_expiry,
-            self.mid_impv,
+            pricing_impv,
             self.option_type
         )
 
