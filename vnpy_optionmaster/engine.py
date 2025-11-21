@@ -1,11 +1,13 @@
 from copy import copy
 from collections import defaultdict
+from datetime import timedelta, datetime
 from typing import cast
 
+from vnpy.trader.database import DB_TZ, BaseDatabase, get_database
 from vnpy.trader.object import (
     LogData, ContractData, TickData,
     OrderData, TradeData, PositionData,
-    SubscribeRequest, OrderRequest, CancelRequest
+    SubscribeRequest, OrderRequest, CancelRequest, BarData
 )
 from vnpy.event import Event, EventEngine
 from vnpy.trader.engine import BaseEngine, MainEngine
@@ -14,10 +16,12 @@ from vnpy.trader.event import (
     EVENT_TIMER, EVENT_ORDER
 )
 from vnpy.trader.constant import (
-    Product, Offset, Direction, OrderType, Exchange, Status, OptionType
+    Product, Offset, Direction, OrderType, Exchange, Status, OptionType, Interval
 )
 from vnpy.trader.converter import OffsetConverter, PositionHolding
 from vnpy.trader.utility import extract_vt_symbol, round_to, save_json, load_json
+
+from vnpy_mysql.mysql_database import MysqlDatabase # ADDED
 
 from .base import (
     APP_NAME,
@@ -71,14 +75,49 @@ class OptionEngine(BaseEngine):
         self.risk_engine: OptionRiskEngine = OptionRiskEngine(self)
 
         self.setting: dict = {}
+        self.historical_option_data: dict[str, BarData] = {} # ADDED
 
         self.load_setting()
         self.register_event()
+        self.load_prev_session_option_data() # ADDED
 
     def close(self) -> None:
         """"""
         self.save_setting()
         self.save_data()
+    
+    def load_prev_session_option_data(self) -> None:
+        """
+        Load option data from the previous session.
+        """
+        print("开始加载上一交易日期权数据")
+
+        now: datetime = datetime.now(DB_TZ)
+        session_start: datetime = now.replace(hour=17, minute=0, second=0, microsecond=0)
+        if now.hour < 17:
+            session_start = session_start - timedelta(days=1)
+        prev_session_start = session_start - timedelta(days=0)
+
+        # Assuming MySQL database is configured and available
+        database: BaseDatabase = get_database()
+
+        # Load option data for Interval.DAILY
+        bars = database.load_option_data(
+            symbol="", # Placeholder, as it's ignored now
+            exchange=Exchange.JPX, # Assuming a specific exchange, adjust as needed
+            interval=Interval.DAILY,
+            start=prev_session_start,
+            end=prev_session_start
+        )
+
+        if not bars:
+            print("未加载到上一交易日期权数据")
+            return
+
+        for bar in bars:
+            self.historical_option_data[bar.vt_symbol] = bar
+        
+        print(f"成功加载{len(self.historical_option_data)}条上一交易日期权数据")
 
     def load_setting(self) -> None:
         """"""
