@@ -763,6 +763,7 @@ class PreviousDayOptionData:
         self.eris_p_iv: float | None = None
         self.eris_c_iv: float | None = None
         self.atm_iv: float | None = None
+        self.datetime : datetime | None = None
 
     def add_bar(self, bar: BarData) -> None:
         if not bar.vt_symbol in self.bars:
@@ -770,6 +771,7 @@ class PreviousDayOptionData:
         # DBから複数日のデータ取得する場合、昨日と近い最新のバーを取得する
         elif bar.datetime > self.bars[bar.vt_symbol].datetime:
             self.bars[bar.vt_symbol] = bar
+            self.datetime = bar.datetime
 
     def calculate_eris_data(self) -> None:
         """
@@ -873,14 +875,14 @@ class PreviousDayOptionData:
         put_iv: float = 0.0
         call_iv: float = 0.0
         atm_iv: float = 0.0
-        if prev_iv_type == OptionPrevIvType.MATCH_DELTA:
+        if prev_iv_type == OptionPrevIvType.SAME_DELTA:
             if self.eris_p_iv:
                 put_iv = self.eris_p_iv
             if self.eris_c_iv:
                 call_iv = self.eris_c_iv
             if self.atm_iv:
                 atm_iv = self.atm_iv
-        elif prev_iv_type == OptionPrevIvType.MATCH_STRIKE:
+        elif prev_iv_type == OptionPrevIvType.SAME_STRIKE:
             if put_strike is not None and call_strike is not None:
                 c_strike = int(call_strike)
                 p_strike = int(put_strike)

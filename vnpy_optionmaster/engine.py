@@ -120,7 +120,7 @@ class OptionEngine(BaseEngine):
         self.prev_day_option.calculate_eris_data()
         self.prev_day_option.calculate_atm_iv()
         
-        print(f"成功加载{len(self.prev_day_option.bars)}条上一交易日期权数据")
+        print(f"成功加载{len(self.prev_day_option.bars)}条上一交易日期权数据. 结束时间: {self.prev_day_option.datetime.strftime('%Y-%m-%d %H:%M:%S')}")
 
     def load_setting(self) -> None:
         """"""
