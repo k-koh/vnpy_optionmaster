@@ -16,7 +16,7 @@ from vnpy.trader.event import (
     EVENT_TIMER, EVENT_ORDER
 )
 from vnpy.trader.constant import (
-    Product, Offset, Direction, OrderType, Exchange, Status, OptionType, Interval
+    Product, Offset, Direction, OrderType, Exchange, Status, OptionType, Interval, OptionPrevIvType
 )
 from vnpy.trader.converter import OffsetConverter, PositionHolding
 from vnpy.trader.utility import extract_vt_symbol, round_to, save_json, load_json
@@ -32,7 +32,7 @@ from .base import (
     EVENT_OPTION_ALGO_LOG,
     EVENT_OPTION_RISK_NOTICE,
     InstrumentData, PortfolioData, OptionData, UnderlyingData,
-    get_underlying_prefix
+    get_underlying_prefix, PreviousDayOptionData
 )
 try:
     from .pricing import black_76_cython as black_76                # type: ignore
@@ -75,18 +75,18 @@ class OptionEngine(BaseEngine):
         self.risk_engine: OptionRiskEngine = OptionRiskEngine(self)
 
         self.setting: dict = {}
-        self.historical_option_data: dict[str, BarData] = {} # ADDED
+        self.prev_day_option: PreviousDayOptionData = PreviousDayOptionData() # ADDED
 
         self.load_setting()
         self.register_event()
-        self.load_prev_session_option_data() # ADDED
+        self.load_prev_day_option_data() # ADDED
 
     def close(self) -> None:
         """"""
         self.save_setting()
         self.save_data()
     
-    def load_prev_session_option_data(self) -> None:
+    def load_prev_day_option_data(self) -> None:
         """
         Load option data from the previous session.
         """
@@ -96,7 +96,8 @@ class OptionEngine(BaseEngine):
         session_start: datetime = now.replace(hour=17, minute=0, second=0, microsecond=0)
         if now.hour < 17:
             session_start = session_start - timedelta(days=1)
-        prev_session_start = session_start - timedelta(days=0)
+        prev_day_end = session_start - timedelta(days=1)
+        prev_day_start = prev_day_end - timedelta(days=3) # Load 3 days to ensure data availability
 
         # Assuming MySQL database is configured and available
         database: BaseDatabase = get_database()
@@ -106,8 +107,8 @@ class OptionEngine(BaseEngine):
             symbol="", # Placeholder, as it's ignored now
             exchange=Exchange.JPX, # Assuming a specific exchange, adjust as needed
             interval=Interval.DAILY,
-            start=prev_session_start,
-            end=prev_session_start
+            start=prev_day_start,
+            end=prev_day_end
         )
 
         if not bars:
@@ -115,9 +116,11 @@ class OptionEngine(BaseEngine):
             return
 
         for bar in bars:
-            self.historical_option_data[bar.vt_symbol] = bar
+            self.prev_day_option.add_bar(bar)
+        self.prev_day_option.calculate_eris_data()
+        self.prev_day_option.calculate_atm_iv()
         
-        print(f"成功加载{len(self.historical_option_data)}条上一交易日期权数据")
+        print(f"成功加载{len(self.prev_day_option.bars)}条上一交易日期权数据")
 
     def load_setting(self) -> None:
         """"""
@@ -409,6 +412,10 @@ class OptionEngine(BaseEngine):
                     option_data.strike_price == strike_price):
                     return option_data
         return None
+
+    def get_prev_day_option_iv(self, op_month: str, prev_iv_type: OptionPrevIvType, put_strike: int, call_strike: int,
+                               atm_strike: int) -> tuple[float, float, float]:
+        return self.prev_day_option.get_prev_day_option_iv(op_month, prev_iv_type, put_strike, call_strike, atm_strike)
 
     def set_timer_trigger(self, timer_trigger: int) -> None:
         """"""

@@ -6,8 +6,8 @@ from functools import lru_cache
 from vnpy.event import EventEngine
 from vnpy.event.engine import Event
 from vnpy.trader.event import EVENT_TICK, EVENT_ATM
-from vnpy.trader.object import ContractData, TickData, TradeData
-from vnpy.trader.constant import Exchange, OptionType, Direction, Offset
+from vnpy.trader.object import ContractData, TickData, TradeData, BarData
+from vnpy.trader.constant import Exchange, OptionType, Direction, Offset, OptionPrevIvType
 from vnpy.trader.converter import PositionHolding
 from vnpy.trader.utility import extract_vt_symbol
 
@@ -753,6 +753,167 @@ class PortfolioData:
         """"""
         for chain in self.chains.values():
             chain.calculate_atm_price()
+
+
+# 前日比用のOptionData
+class PreviousDayOptionData:
+    """"""
+    def __init__(self) -> None:
+        self.bars: dict[str, BarData] = {}
+        self.eris_p_iv: float | None = None
+        self.eris_c_iv: float | None = None
+        self.atm_iv: float | None = None
+
+    def add_bar(self, bar: BarData) -> None:
+        if not bar.vt_symbol in self.bars:
+            self.bars[bar.vt_symbol] = bar
+        # DBから複数日のデータ取得する場合、昨日と近い最新のバーを取得する
+        elif bar.datetime > self.bars[bar.vt_symbol].datetime:
+            self.bars[bar.vt_symbol] = bar
+
+    def calculate_eris_data(self) -> None:
+        """
+        Calculate ERIS IVs from stored bars.
+        """
+        # Find put with delta closest to -0.1
+        min_put_delta_diff = 100.0
+        eris_put_bar = None
+
+        for bar in self.bars.values():
+            if not hasattr(bar, 'delta'):
+                continue
+
+            option_delta = bar.delta
+            delta_diff = abs(option_delta - (-0.1))
+
+            if delta_diff < min_put_delta_diff:
+                min_put_delta_diff = delta_diff
+                eris_put_bar = bar
+
+        if eris_put_bar and hasattr(eris_put_bar, 'iv'):
+            self.eris_p_iv = eris_put_bar.iv
+        else:
+            self.eris_p_iv = None
+
+        # Find call with delta closest to +0.1
+        min_call_delta_diff = 100.0
+        eris_call_bar = None
+
+        for bar in self.bars.values():
+            if not hasattr(bar, 'delta'):
+                continue
+
+            option_delta = bar.delta
+            delta_diff = abs(option_delta - 0.1)
+
+            if delta_diff < min_call_delta_diff:
+                min_call_delta_diff = delta_diff
+                eris_call_bar = bar
+
+        if eris_call_bar and hasattr(eris_call_bar, 'iv'):
+            self.eris_c_iv = eris_call_bar.iv
+        else:
+            self.eris_c_iv = None
+
+    def calculate_atm_iv(self) -> None:
+        # Find put with delta closest to -0.5
+        min_put_delta_diff = 100.0
+        atm_put_bar = None
+        atm_put_iv = None
+
+        for bar in self.bars.values():
+            if not hasattr(bar, 'delta'):
+                continue
+
+            option_delta = bar.delta
+            delta_diff = abs(option_delta - (-0.5))
+
+            if delta_diff < min_put_delta_diff:
+                min_put_delta_diff = delta_diff
+                atm_put_bar = bar
+
+        if atm_put_bar and hasattr(atm_put_bar, 'iv'):
+            atm_put_iv = atm_put_bar.iv
+        else:
+            atm_put_iv = None
+
+        # Find call with delta closest to +0.5
+        min_call_delta_diff = 100.0
+        atm_call_bar = None
+        atm_call_iv = None
+
+        for bar in self.bars.values():
+            if not hasattr(bar, 'delta'):
+                continue
+
+            option_delta = bar.delta
+            delta_diff = abs(option_delta - 0.5)
+
+            if delta_diff < min_call_delta_diff:
+                min_call_delta_diff = delta_diff
+                atm_call_bar = bar
+
+        if atm_call_bar and hasattr(atm_call_bar, 'iv'):
+            atm_call_iv = atm_call_bar.iv
+        else:
+            atm_call_iv = None
+
+        if atm_put_iv is not None and atm_call_iv is not None:
+            self.atm_iv = (atm_put_iv + atm_call_iv) / 2
+        elif atm_put_iv is not None:
+            self.atm_iv = atm_put_iv
+        elif atm_call_iv is not None:
+            self.atm_iv = atm_call_iv
+        else:
+            self.atm_iv = None
+
+    def get_prev_day_option_iv(self, op_month: str, prev_iv_type: OptionPrevIvType, put_strike: int, call_strike: int,
+                               atm_strike: int) -> tuple[float, float, float]:
+        """"""
+        put_iv: float = 0.0
+        call_iv: float = 0.0
+        atm_iv: float = 0.0
+        if prev_iv_type == OptionPrevIvType.MATCH_DELTA:
+            if self.eris_p_iv:
+                put_iv = self.eris_p_iv
+            if self.eris_c_iv:
+                call_iv = self.eris_c_iv
+            if self.atm_iv:
+                atm_iv = self.atm_iv
+        elif prev_iv_type == OptionPrevIvType.MATCH_STRIKE:
+            if put_strike is not None and call_strike is not None:
+                c_strike = int(call_strike)
+                p_strike = int(put_strike)
+                a_strike = int(atm_strike)
+                put_vt_symbol = f"{op_month}-P-{p_strike}.JPX"
+                call_vt_symbol = f"{op_month}-C-{c_strike}.JPX"
+                atm_call_vt_symbol = f"{op_month}-C-{a_strike}.JPX"
+                atm_put_vt_symbol = f"{op_month}-P-{a_strike}.JPX"
+                # Get Put IV
+                if put_vt_symbol in self.bars:
+                    bar = self.bars[put_vt_symbol]
+                    if hasattr(bar, 'iv'):
+                        put_iv = bar.iv
+                # Get Call IV
+                if call_vt_symbol in self.bars:
+                    bar = self.bars[call_vt_symbol]
+                    if hasattr(bar, 'iv'):
+                        call_iv = bar.iv
+                # Calculate ATM IV
+                if atm_call_vt_symbol in self.bars and atm_put_vt_symbol in self.bars:
+                    call_bar = self.bars[atm_call_vt_symbol]
+                    put_bar = self.bars[atm_put_vt_symbol]
+                    if hasattr(call_bar, 'iv') and hasattr(put_bar, 'iv'):
+                        atm_iv = (call_bar.iv + put_bar.iv) / 2
+                elif atm_call_vt_symbol in self.bars:
+                    call_bar = self.bars[atm_call_vt_symbol]
+                    if hasattr(call_bar, 'iv'):
+                        atm_iv = call_bar.iv
+                elif atm_put_vt_symbol in self.bars:
+                    put_bar = self.bars[atm_put_vt_symbol]
+                    if hasattr(put_bar, 'iv'):
+                        atm_iv = put_bar.iv
+        return put_iv, call_iv, atm_iv
 
 
 @lru_cache(maxsize=100)
