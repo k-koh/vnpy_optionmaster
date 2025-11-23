@@ -46,6 +46,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.call_ask_curves: dict[str, pg.PlotCurveItem] = {}
         self.call_mid_curves: dict[str, pg.PlotCurveItem] = {}
         self.pricing_curves: dict[str, pg.PlotCurveItem] = {}
+        self.eris_p_strike_lines: dict[str, pg.InfiniteLine] = {}
+        self.eris_c_strike_lines: dict[str, pg.InfiniteLine] = {}
 
         self.colors: list = [
             (255, 0, 0),
@@ -178,6 +180,29 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             symbolBrush=color
         )
 
+        p_line_pen = pg.mkPen(color=(255, 0, 0), width=1, style=QtCore.Qt.DotLine) # Red dotted for Put
+        c_line_pen = pg.mkPen(color=(0, 0, 255), width=1, style=QtCore.Qt.DotLine) # Blue dotted for Call
+
+        self.eris_p_strike_lines[chain_symbol] = pg.InfiniteLine(
+            angle=90,
+            movable=False,
+            pen=p_line_pen,
+            label=symbol + " 看跌ERIS",
+            labelOpts={'position': 0.95, 'color': (255,0,0), 'fill': (200,200,200,50), 'movable': False}
+        )
+        self.eris_c_strike_lines[chain_symbol] = pg.InfiniteLine(
+            angle=90,
+            movable=False,
+            pen=c_line_pen,
+            label=symbol + " 看涨ERIS",
+            labelOpts={'position': 0.05, 'color': (0,0,255), 'fill': (200,200,200,50), 'movable': False}
+        )
+        self.impv_chart.addItem(self.eris_p_strike_lines[chain_symbol])
+        self.impv_chart.addItem(self.eris_c_strike_lines[chain_symbol])
+
+        self.eris_p_strike_lines[chain_symbol].hide()
+        self.eris_c_strike_lines[chain_symbol].hide()
+
     def update_curve_data(self) -> None:
         """"""
         portfolio: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
@@ -245,27 +270,55 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 x=call_strikes
             )
 
+            # Update ERIS strike lines
+            if chain.eris_p_strike is not None:
+                self.eris_p_strike_lines[chain.chain_symbol].setPos(chain.eris_p_strike)
+                self.eris_p_strike_lines[chain.chain_symbol].show()
+            else:
+                self.eris_p_strike_lines[chain.chain_symbol].hide()
+
+            if chain.eris_c_strike is not None:
+                self.eris_c_strike_lines[chain.chain_symbol].setPos(chain.eris_c_strike)
+                self.eris_c_strike_lines[chain.chain_symbol].show()
+            else:
+                self.eris_c_strike_lines[chain.chain_symbol].hide()
+
     def update_curve_visible(self) -> None:
         """"""
-        self.impv_chart.clear()
-
         for chain_symbol, checkbox in self.chain_checks.items():
-            if checkbox.isChecked():
-                call_mid_curve: pg.PlotCurveItem = self.call_mid_curves[chain_symbol]
-                call_bid_curve: pg.PlotCurveItem = self.call_bid_curves[chain_symbol]
-                call_ask_curve: pg.PlotCurveItem = self.call_ask_curves[chain_symbol]
-                put_mid_curve: pg.PlotCurveItem = self.put_mid_curves[chain_symbol]
-                put_bid_curve: pg.PlotCurveItem = self.put_bid_curves[chain_symbol]
-                put_ask_curve: pg.PlotCurveItem = self.put_ask_curves[chain_symbol]
-                pricing_curve: pg.PlotCurveItem = self.pricing_curves[chain_symbol]
+            call_mid_curve: pg.PlotCurveItem = self.call_mid_curves[chain_symbol]
+            call_bid_curve: pg.PlotCurveItem = self.call_bid_curves[chain_symbol]
+            call_ask_curve: pg.PlotCurveItem = self.call_ask_curves[chain_symbol]
+            put_mid_curve: pg.PlotCurveItem = self.put_mid_curves[chain_symbol]
+            put_bid_curve: pg.PlotCurveItem = self.put_bid_curves[chain_symbol]
+            put_ask_curve: pg.PlotCurveItem = self.put_ask_curves[chain_symbol]
+            pricing_curve: pg.PlotCurveItem = self.pricing_curves[chain_symbol]
+            p_line = self.eris_p_strike_lines[chain_symbol]
+            c_line = self.eris_c_strike_lines[chain_symbol]
 
-                self.impv_chart.addItem(call_mid_curve)
-                self.impv_chart.addItem(call_bid_curve)
-                self.impv_chart.addItem(call_ask_curve)
-                self.impv_chart.addItem(put_mid_curve)
-                self.impv_chart.addItem(put_bid_curve)
-                self.impv_chart.addItem(put_ask_curve)
-                self.impv_chart.addItem(pricing_curve)
+            if checkbox.isChecked():
+                call_mid_curve.show()
+                call_bid_curve.show()
+                call_ask_curve.show()
+                put_mid_curve.show()
+                put_bid_curve.show()
+                put_ask_curve.show()
+                pricing_curve.show()
+                
+                if self.eris_p_strike_lines[chain_symbol].value() != 0:
+                    p_line.show()
+                if self.eris_c_strike_lines[chain_symbol].value() != 0:
+                    c_line.show()
+            else:
+                call_mid_curve.hide()
+                call_bid_curve.hide()
+                call_ask_curve.hide()
+                put_mid_curve.hide()
+                put_bid_curve.hide()
+                put_ask_curve.hide()
+                pricing_curve.hide()
+                p_line.hide()
+                c_line.hide()
 
 
 class ScenarioAnalysisChart(QtWidgets.QWidget):
@@ -433,9 +486,9 @@ class ScenarioAnalysisChart(QtWidgets.QWidget):
 
                 pnl_buf.append(portfolio_pnl)
                 delta_buf.append(portfolio_delta)
-                gamma_buf.append(portfolio_gamma)
-                theta_buf.append(portfolio_theta)
-                vega_buf.append(portfolio_vega)
+                gamma_buf.append(gamma_buf)
+                theta_buf.append(theta_buf)
+                vega_buf.append(vega_buf)
 
             pnls.append(pnl_buf)
             deltas.append(delta_buf)
