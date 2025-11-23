@@ -48,6 +48,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.pricing_curves: dict[str, pg.PlotCurveItem] = {}
         self.eris_p_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.eris_c_strike_lines: dict[str, pg.InfiniteLine] = {}
+        self.call_volume_bars: dict[str, pg.BarGraphItem] = {}
+        self.put_volume_bars: dict[str, pg.BarGraphItem] = {}
 
         self.colors: list = [
             (255, 0, 0),
@@ -92,13 +94,25 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         pg.setConfigOptions(antialias=True)
 
         graphics_window: pg.GraphicsLayoutWidget = pg.GraphicsLayoutWidget()
-        self.impv_chart = graphics_window.addPlot(title="隐含波动率曲线")
+        self.impv_chart = graphics_window.addPlot(row=0, col=0, title="隐含波动率曲线")
         self.impv_chart.showGrid(x=True, y=True)
         self.impv_chart.setLabel("left", "波动率")
         self.impv_chart.setLabel("bottom", "行权价")
         self.impv_chart.addLegend()
         self.impv_chart.setMenuEnabled(False)
         self.impv_chart.setMouseEnabled(False, False)
+
+        graphics_window.nextRow()
+
+        self.volume_chart = graphics_window.addPlot(row=1, col=0, title="成交量")
+        self.volume_chart.showGrid(x=True, y=True)
+        self.volume_chart.setLabel("left", "成交量")
+        self.volume_chart.setLabel("bottom", "行权价")
+        self.volume_chart.setXLink(self.impv_chart)
+        self.volume_chart.addLegend()
+        self.volume_chart.setMenuEnabled(False)
+        self.volume_chart.setMouseEnabled(False, False)
+        self.volume_chart.setMaximumHeight(200)
 
         for chain_symbol in chain_symbols:
             self.add_impv_curve(chain_symbol)
@@ -203,6 +217,23 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.eris_p_strike_lines[chain_symbol].hide()
         self.eris_c_strike_lines[chain_symbol].hide()
 
+        self.call_volume_bars[chain_symbol] = pg.BarGraphItem(
+            x=[],
+            height=[],
+            width=1.0,
+            brush=pg.mkBrush(color=(0, 255, 0, 100)),
+            name=symbol + " 看涨成交量"
+        )
+        self.put_volume_bars[chain_symbol] = pg.BarGraphItem(
+            x=[],
+            height=[],
+            width=1.0,
+            brush=pg.mkBrush(color=(255, 0, 0, 100)),
+            name=symbol + " 看跌成交量"
+        )
+        self.volume_chart.addItem(self.call_volume_bars[chain_symbol])
+        self.volume_chart.addItem(self.put_volume_bars[chain_symbol])
+
     def update_curve_data(self) -> None:
         """"""
         portfolio: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
@@ -214,6 +245,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             call_ask_impv: list = []
             pricing_impv: list = []
             call_strikes: list = []
+            call_volumes: list = []
 
             calls: list[OptionData] = list(chain.calls.values())
             calls.sort(key=lambda x: x.strike_price)
@@ -225,11 +257,17 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 pricing_impv.append(call.pricing_impv * 100)
                 call_strikes.append(call.strike_price)
 
+                if call.tick:
+                    call_volumes.append(call.tick.volume)
+                else:
+                    call_volumes.append(0)
+
             # Get put data
             put_mid_impv: list = []
             put_bid_impv: list = []
             put_ask_impv: list = []
             put_strikes: list = []
+            put_volumes: list = []
 
             puts: list[OptionData] = list(chain.puts.values())
             puts.sort(key=lambda x: x.strike_price)
@@ -239,6 +277,11 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 put_bid_impv.append(put.bid_impv * 100)
                 put_ask_impv.append(put.ask_impv * 100)
                 put_strikes.append(put.strike_price)
+
+                if put.tick:
+                    put_volumes.append(put.tick.volume)
+                else:
+                    put_volumes.append(0)
 
             # Plot curves
             self.call_mid_curves[chain.chain_symbol].setData(
@@ -283,6 +326,22 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             else:
                 self.eris_c_strike_lines[chain.chain_symbol].hide()
 
+            # Update volume bars
+            strike_step = 0
+            if len(call_strikes) > 1:
+                strike_step = call_strikes[1] - call_strikes[0]
+            elif len(put_strikes) > 1:
+                strike_step = put_strikes[1] - put_strikes[0]
+
+            bar_width = strike_step * 0.4 if strike_step else 100
+
+            self.call_volume_bars[chain.chain_symbol].setOpts(
+                x=[s - bar_width/2 for s in call_strikes], height=call_volumes, width=bar_width
+            )
+            self.put_volume_bars[chain.chain_symbol].setOpts(
+                x=[s + bar_width/2 for s in put_strikes], height=put_volumes, width=bar_width
+            )
+
     def update_curve_visible(self) -> None:
         """"""
         for chain_symbol, checkbox in self.chain_checks.items():
@@ -295,6 +354,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             pricing_curve: pg.PlotCurveItem = self.pricing_curves[chain_symbol]
             p_line = self.eris_p_strike_lines[chain_symbol]
             c_line = self.eris_c_strike_lines[chain_symbol]
+            call_volume_bar = self.call_volume_bars[chain_symbol]
+            put_volume_bar = self.put_volume_bars[chain_symbol]
 
             if checkbox.isChecked():
                 call_mid_curve.show()
@@ -304,11 +365,10 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 put_bid_curve.show()
                 put_ask_curve.show()
                 pricing_curve.show()
-                
-                if self.eris_p_strike_lines[chain_symbol].value() != 0:
-                    p_line.show()
-                if self.eris_c_strike_lines[chain_symbol].value() != 0:
-                    c_line.show()
+                p_line.show()
+                c_line.show()
+                call_volume_bar.show()
+                put_volume_bar.show()
             else:
                 call_mid_curve.hide()
                 call_bid_curve.hide()
@@ -319,6 +379,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 pricing_curve.hide()
                 p_line.hide()
                 c_line.hide()
+                call_volume_bar.hide()
+                put_volume_bar.hide()
 
 
 class ScenarioAnalysisChart(QtWidgets.QWidget):
