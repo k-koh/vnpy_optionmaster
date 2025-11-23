@@ -38,8 +38,13 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.timer_trigger: int = 3
 
         self.chain_checks: dict[str, QtWidgets.QCheckBox] = {}
-        self.put_curves: dict[str, pg.PlotCurveItem] = {}
-        self.call_curves: dict[str, pg.PlotCurveItem] = {}
+        self.put_bid_curves: dict[str, pg.PlotCurveItem] = {}
+        self.put_ask_curves: dict[str, pg.PlotCurveItem] = {}
+        self.put_mid_curves: dict[str, pg.PlotCurveItem] = {}
+
+        self.call_bid_curves: dict[str, pg.PlotCurveItem] = {}
+        self.call_ask_curves: dict[str, pg.PlotCurveItem] = {}
+        self.call_mid_curves: dict[str, pg.PlotCurveItem] = {}
         self.pricing_curves: dict[str, pg.PlotCurveItem] = {}
 
         self.colors: list = [
@@ -123,26 +128,53 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         symbol: str = chain_symbol.split(".")[0]
         color: tuple = self.colors.pop(0)
         pen: QtGui.QPen = pg.mkPen(color, width=2)
+        pen_dot: QtGui.QPen = pg.mkPen(color, style=QtCore.Qt.DotLine)
 
-        self.call_curves[chain_symbol] = self.impv_chart.plot(
-            symbolSize=symbol_size,
-            symbol="t1",
+        self.call_mid_curves[chain_symbol] = self.impv_chart.plot(
+            symbolSize=0,
             name=symbol + " 看涨",
             pen=pen,
-            symbolBrush=color
         )
-        self.put_curves[chain_symbol] = self.impv_chart.plot(
-            symbolSize=symbol_size,
-            symbol="t",
+        self.put_mid_curves[chain_symbol] = self.impv_chart.plot(
+            symbolSize=0,
             name=symbol + " 看跌",
             pen=pen,
+        )
+
+        self.call_bid_curves[chain_symbol] = self.impv_chart.plot(
+            pen=None,
+            symbolSize=symbol_size,
+            symbol="t1",
+            name=symbol + " 看涨买",
             symbolBrush=color
         )
+        self.call_ask_curves[chain_symbol] = self.impv_chart.plot(
+            pen=None,
+            symbolSize=symbol_size,
+            symbol="t1",
+            name=symbol + " 看涨卖",
+            symbolBrush=color
+        )
+        self.put_bid_curves[chain_symbol] = self.impv_chart.plot(
+            pen=None,
+            symbolSize=symbol_size,
+            symbol="t",
+            name=symbol + " 看跌买",
+            symbolBrush=color
+        )
+        self.put_ask_curves[chain_symbol] = self.impv_chart.plot(
+            pen=None,
+            symbolSize=symbol_size,
+            symbol="t",
+            name=symbol + " 看跌卖",
+            symbolBrush=color
+        )
+
         self.pricing_curves[chain_symbol] = self.impv_chart.plot(
             symbolSize=symbol_size,
             symbol="o",
             name=symbol + " 定价",
-            pen=pen,
+            pen=pen_dot,
             symbolBrush=color
         )
 
@@ -152,7 +184,9 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
         for chain in portfolio.chains.values():
             # Get call data
-            call_impv: list = []
+            call_mid_impv: list = []
+            call_bid_impv: list = []
+            call_ask_impv: list = []
             pricing_impv: list = []
             call_strikes: list = []
 
@@ -160,28 +194,50 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             calls.sort(key=lambda x: x.strike_price)
 
             for call in calls:
-                call_impv.append(call.mid_impv * 100)
+                call_mid_impv.append(call.mid_impv * 100)
+                call_bid_impv.append(call.bid_impv * 100)
+                call_ask_impv.append(call.ask_impv * 100)
                 pricing_impv.append(call.pricing_impv * 100)
                 call_strikes.append(call.strike_price)
 
             # Get put data
-            put_impv: list = []
+            put_mid_impv: list = []
+            put_bid_impv: list = []
+            put_ask_impv: list = []
             put_strikes: list = []
 
             puts: list[OptionData] = list(chain.puts.values())
             puts.sort(key=lambda x: x.strike_price)
 
             for put in puts:
-                put_impv.append(put.mid_impv * 100)
+                put_mid_impv.append(put.mid_impv * 100)
+                put_bid_impv.append(put.bid_impv * 100)
+                put_ask_impv.append(put.ask_impv * 100)
                 put_strikes.append(put.strike_price)
 
             # Plot curves
-            self.call_curves[chain.chain_symbol].setData(
-                y=call_impv,
+            self.call_mid_curves[chain.chain_symbol].setData(
+                y=call_mid_impv,
                 x=call_strikes
             )
-            self.put_curves[chain.chain_symbol].setData(
-                y=put_impv,
+            self.call_bid_curves[chain.chain_symbol].setData(
+                y=call_bid_impv,
+                x=call_strikes
+            )
+            self.call_ask_curves[chain.chain_symbol].setData(
+                y=call_ask_impv,
+                x=call_strikes
+            )
+            self.put_mid_curves[chain.chain_symbol].setData(
+                y=put_mid_impv,
+                x=put_strikes
+            )
+            self.put_bid_curves[chain.chain_symbol].setData(
+                y=put_bid_impv,
+                x=put_strikes
+            )
+            self.put_ask_curves[chain.chain_symbol].setData(
+                y=put_ask_impv,
                 x=put_strikes
             )
             self.pricing_curves[chain.chain_symbol].setData(
@@ -195,12 +251,20 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
         for chain_symbol, checkbox in self.chain_checks.items():
             if checkbox.isChecked():
-                call_curve: pg.PlotCurveItem = self.call_curves[chain_symbol]
-                put_curve: pg.PlotCurveItem = self.put_curves[chain_symbol]
+                call_mid_curve: pg.PlotCurveItem = self.call_mid_curves[chain_symbol]
+                call_bid_curve: pg.PlotCurveItem = self.call_bid_curves[chain_symbol]
+                call_ask_curve: pg.PlotCurveItem = self.call_ask_curves[chain_symbol]
+                put_mid_curve: pg.PlotCurveItem = self.put_mid_curves[chain_symbol]
+                put_bid_curve: pg.PlotCurveItem = self.put_bid_curves[chain_symbol]
+                put_ask_curve: pg.PlotCurveItem = self.put_ask_curves[chain_symbol]
                 pricing_curve: pg.PlotCurveItem = self.pricing_curves[chain_symbol]
 
-                self.impv_chart.addItem(call_curve)
-                self.impv_chart.addItem(put_curve)
+                self.impv_chart.addItem(call_mid_curve)
+                self.impv_chart.addItem(call_bid_curve)
+                self.impv_chart.addItem(call_ask_curve)
+                self.impv_chart.addItem(put_mid_curve)
+                self.impv_chart.addItem(put_bid_curve)
+                self.impv_chart.addItem(put_ask_curve)
                 self.impv_chart.addItem(pricing_curve)
 
 
