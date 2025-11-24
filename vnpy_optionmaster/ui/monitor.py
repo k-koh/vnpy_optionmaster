@@ -12,7 +12,10 @@ from vnpy.trader.object import TickData, TradeData, PositionData
 from vnpy.trader.utility import round_to
 
 from ..engine import OptionEngine
-from ..base import UnderlyingData, OptionData, ChainData, PortfolioData, InstrumentData
+from ..base import (
+    UnderlyingData, OptionData, ChainData, PortfolioData, InstrumentData,
+    EVENT_OPTION_INSTRUMENT_ADD
+)
 
 
 COLOR_WHITE = QtGui.QColor("white")
@@ -114,6 +117,7 @@ class OptionMarketMonitor(MonitorTable):
     signal_tick: QtCore.Signal = QtCore.Signal(Event)
     signal_trade: QtCore.Signal = QtCore.Signal(Event)
     signal_position: QtCore.Signal = QtCore.Signal(Event)
+    signal_instrument_add: QtCore.Signal = QtCore.Signal(Event)
 
     headers: list[dict] = [
         {"name": "symbol", "display": "代码", "cell": MonitorCell},
@@ -152,13 +156,24 @@ class OptionMarketMonitor(MonitorTable):
         self.setWindowTitle("T型报价")
         self.verticalHeader().setVisible(False)
         self.setEditTriggers(self.EditTrigger.NoEditTriggers)
+        self.build_table()
+
+    def build_table(self) -> None:
+        """
+        Build the table UI.
+        """
+        self.clearContents()
+        self.cells.clear()
+        self.option_symbols.clear()
+        self.underlying_option_map.clear()
 
         # Store option and underlying symbols
         portfolio: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
 
         for option in portfolio.options.values():
             self.option_symbols.add(option.vt_symbol)
-            self.underlying_option_map[option.underlying.vt_symbol].append(option.vt_symbol)
+            if hasattr(option, "underlying"):
+                self.underlying_option_map[option.underlying.vt_symbol].append(option.vt_symbol)
 
         # Get greeks decimals precision
         self.greeks_precision: str = f"{portfolio.precision}f"
@@ -249,10 +264,20 @@ class OptionMarketMonitor(MonitorTable):
         self.signal_tick.connect(self.process_tick_event)
         self.signal_trade.connect(self.process_trade_event)
         self.signal_position.connect(self.process_position_event)
+        self.signal_instrument_add.connect(self.process_instrument_add_event)
 
         self.event_engine.register(EVENT_TICK, self.signal_tick.emit)
         self.event_engine.register(EVENT_TRADE, self.signal_trade.emit)
         self.event_engine.register(EVENT_POSITION, self.signal_position.emit)
+        self.event_engine.register(
+            EVENT_OPTION_INSTRUMENT_ADD, self.signal_instrument_add.emit
+        )
+
+    def process_instrument_add_event(self, event: Event) -> None:
+        """"""
+        option: OptionData = event.data
+        if option.portfolio.name == self.portfolio_name:
+            self.build_table()
 
     def process_tick_event(self, event: Event) -> None:
         """"""

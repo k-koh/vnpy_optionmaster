@@ -22,6 +22,7 @@ EVENT_OPTION_ALGO_TRADING = "eOptionAlgoTrading"
 EVENT_OPTION_ALGO_STATUS = "eOptionAlgoStatus"
 EVENT_OPTION_ALGO_LOG = "eOptionAlgoLog"
 EVENT_OPTION_RISK_NOTICE = "eOptionRiskNotice"
+EVENT_OPTION_INSTRUMENT_ADD = "eOptionInstrumentAdd"
 
 
 class InstrumentData:

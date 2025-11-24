@@ -31,6 +31,7 @@ from .base import (
     EVENT_OPTION_ALGO_STATUS,
     EVENT_OPTION_ALGO_LOG,
     EVENT_OPTION_RISK_NOTICE,
+    EVENT_OPTION_INSTRUMENT_ADD,
     InstrumentData, PortfolioData, OptionData, UnderlyingData,
     get_underlying_prefix, PreviousDayOptionData
 )
@@ -266,6 +267,9 @@ class OptionEngine(BaseEngine):
             holding: PositionHolding = converter.get_position_holding(contract.vt_symbol)
             if holding:
                 option.update_holding(holding)
+
+        # Fire event to notify UI update
+        self.event_engine.put(Event(EVENT_OPTION_INSTRUMENT_ADD, option))
 
     def process_timer_event(self, event: Event) -> None:
         """"""
