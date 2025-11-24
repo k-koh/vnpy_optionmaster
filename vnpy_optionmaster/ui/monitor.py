@@ -509,6 +509,25 @@ class OptionGreeksMonitor(MonitorTable):
     def update_row(self, row_name: str, type_name: str, row_data: ROW_DATA) -> None:
         """"""
         row_key: tuple = (row_name, type_name)
+
+        if row_key not in self.cells:
+            row_count: int = self.rowCount()
+            self.insertRow(row_count)
+
+            type_cell: MonitorCell = MonitorCell(type_name)
+            self.setItem(row_count, 0, type_cell)
+
+            name: str = row_name.split(".")[0]
+            name_cell: MonitorCell = MonitorCell(name)
+            self.setItem(row_count, 1, name_cell)
+
+            row_cells: dict = {}
+            for column, d in enumerate(self.headers):
+                cell: MonitorCell = d["cell"]()
+                self.setItem(row_count, column + 2, cell)
+                row_cells[d["name"]] = cell
+            self.cells[row_key] = row_cells
+
         row_cells: dict = self.cells[row_key]
         row: int = self.row(row_cells["long_pos"])
 

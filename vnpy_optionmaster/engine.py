@@ -231,12 +231,41 @@ class OptionEngine(BaseEngine):
         """"""
         contract: ContractData = event.data
 
-        if contract.product == Product.OPTION:
-            exchange_name: str = contract.exchange.value
-            portfolio_name: str = f"{contract.option_portfolio}.{exchange_name}"
+        if contract.product != Product.OPTION:
+            return
 
-            portfolio: PortfolioData = self.get_portfolio(portfolio_name)
-            portfolio.add_option(contract)
+        # Discover and create portfolio object. This should always run.
+        exchange_name: str = contract.exchange.value
+        portfolio_name: str = f"{contract.option_portfolio}.{exchange_name}"
+        portfolio: PortfolioData = self.get_portfolio(portfolio_name)
+        portfolio.add_option(contract)
+
+        # Activate contract only if its portfolio is active.
+        if portfolio_name not in self.active_portfolios:
+            return
+
+        # Return if instrument already activated
+        if contract.vt_symbol in self.instruments:
+            return
+
+        option: OptionData = portfolio._options[contract.vt_symbol]
+
+        # Return if option initialization failed
+        if not hasattr(option, "underlying"):
+            return
+
+        # Add to active data structures
+        portfolio.options[contract.vt_symbol] = option
+        self.instruments[contract.vt_symbol] = option
+
+        # Subscribe to market data and update position
+        self.subscribe_data(contract.vt_symbol)
+
+        converter: OffsetConverter = self.main_engine.get_converter(contract.gateway_name)
+        if converter:
+            holding: PositionHolding = converter.get_position_holding(contract.vt_symbol)
+            if holding:
+                option.update_holding(holding)
 
     def process_timer_event(self, event: Event) -> None:
         """"""

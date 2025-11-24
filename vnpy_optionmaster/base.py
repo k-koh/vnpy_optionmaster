@@ -624,6 +624,9 @@ class PortfolioData:
         self.name: str = name
         self.event_engine: EventEngine = event_engine
 
+        self.pricing_model: ModuleType | None = None
+        self.interest_rate: float = 0.0
+
         self.long_pos: int = 0
         self.short_pos: int = 0
         self.net_pos: int = 0
@@ -697,11 +700,13 @@ class PortfolioData:
 
     def set_interest_rate(self, interest_rate: float) -> None:
         """"""
+        self.interest_rate = interest_rate
         for chain in self.chains.values():
             chain.set_interest_rate(interest_rate)
 
     def set_pricing_model(self, pricing_model: ModuleType) -> None:
         """"""
+        self.pricing_model = pricing_model
         for chain in self.chains.values():
             chain.set_pricing_model(pricing_model)
 
@@ -739,15 +744,30 @@ class PortfolioData:
 
     def add_option(self, contract: ContractData) -> None:
         """"""
+        # Return if option already exists
+        if contract.vt_symbol in self._options:
+            return
+
         option: OptionData = OptionData(contract)
         option.set_portfolio(self)
         self._options[contract.vt_symbol] = option
 
+        # Set model and rate if portfolio has them
+        if self.pricing_model:
+            option.set_pricing_model(self.pricing_model)
+        if self.interest_rate:
+            option.set_interest_rate(self.interest_rate)
+
+        # Get chain and link it to option
         exchange_name: str = contract.exchange.value
         chain_symbol: str = f"{contract.option_underlying}.{exchange_name}"
 
         chain: ChainData = self.get_chain(chain_symbol)
         chain.add_option(option)
+
+        # Link underlying to option if chain is already linked to an underlying
+        if hasattr(chain, "underlying"):
+            option.set_underlying(chain.underlying)
 
     def calculate_atm_price(self) -> None:
         """"""

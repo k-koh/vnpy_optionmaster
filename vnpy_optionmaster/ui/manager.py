@@ -725,6 +725,7 @@ class PricingVolatilityManager(QtWidgets.QWidget):
         self.portfolio: PortfolioData = option_engine.get_portfolio(portfolio_name)
 
         self.cells: dict[tuple, dict] = {}
+        self.tables: dict[str, QtWidgets.QTableWidget] = {}
         self.chain_symbols: list[str] = []
         self.chain_atm_index: dict[str, str] = {}
 
@@ -747,6 +748,7 @@ class PricingVolatilityManager(QtWidgets.QWidget):
             chain: ChainData = self.portfolio.get_chain(chain_symbol)
 
             table: QtWidgets.QTableWidget = QtWidgets.QTableWidget()
+            self.tables[chain_symbol] = table
             table.setEditTriggers(table.EditTrigger.NoEditTriggers)
             table.verticalHeader().setVisible(False)
             table.setRowCount(len(chain.indexes))
@@ -1028,6 +1030,54 @@ class PricingVolatilityManager(QtWidgets.QWidget):
             return
 
         for index in chain.indexes:
+            key: tuple = (chain_symbol, index)
+            if key not in self.cells:
+                table: QtWidgets.QTableWidget = self.tables[chain_symbol]
+                row: int = table.rowCount()
+                table.insertRow(row)
+
+                index_cell: IndexCell = IndexCell(index)
+                otm_impv_cell: MonitorCell = MonitorCell("")
+                call_impv_cell: MonitorCell = MonitorCell("")
+                put_impv_cell: MonitorCell = MonitorCell("")
+                atm_impv_cell: MonitorCell = MonitorCell("")
+
+                set_func = partial(
+                    self.set_pricing_impv,
+                    chain_symbol=chain_symbol,
+                    index=index
+                )
+                pricing_impv_spin: VolatilityDoubleSpinBox = VolatilityDoubleSpinBox()
+                pricing_impv_spin.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                pricing_impv_spin.valueChanged.connect(set_func)
+
+                check: QtWidgets.QCheckBox = QtWidgets.QCheckBox()
+
+                check_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+                check_hbox.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                check_hbox.addWidget(check)
+
+                check_widget: QtWidgets.QWidget = QtWidgets.QWidget()
+                check_widget.setLayout(check_hbox)
+
+                table.setItem(row, 0, index_cell)
+                table.setItem(row, 1, otm_impv_cell)
+                table.setItem(row, 2, call_impv_cell)
+                table.setItem(row, 3, put_impv_cell)
+                table.setItem(row, 4, atm_impv_cell)
+                table.setCellWidget(row, 5, pricing_impv_spin)
+                table.setCellWidget(row, 6, check_widget)
+
+                cells: dict = {
+                    "otm_impv": otm_impv_cell,
+                    "call_impv": call_impv_cell,
+                    "put_impv": put_impv_cell,
+                    "atm_impv": atm_impv_cell,
+                    "pricing_impv": pricing_impv_spin,
+                    "check": check
+                }
+                self.cells[key] = cells
+
             call: OptionData = chain.calls.get(index)
             put: OptionData = chain.puts.get(index)
 
