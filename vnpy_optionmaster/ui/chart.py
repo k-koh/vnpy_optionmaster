@@ -194,22 +194,22 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             symbolBrush=color
         )
 
-        p_line_pen = pg.mkPen(color=(255, 0, 0), width=1, style=QtCore.Qt.DotLine) # Red dotted for Put
-        c_line_pen = pg.mkPen(color=(0, 0, 255), width=1, style=QtCore.Qt.DotLine) # Blue dotted for Call
+        p_line_pen = pg.mkPen(color=(160, 255, 160), width=2, style=QtCore.Qt.DotLine) # Red dotted for Put
+        c_line_pen = pg.mkPen(color=(255, 174, 201), width=2, style=QtCore.Qt.DotLine) # Blue dotted for Call
 
         self.eris_p_strike_lines[chain_symbol] = pg.InfiniteLine(
             angle=90,
             movable=False,
             pen=p_line_pen,
             label=symbol + " 看跌ERIS",
-            labelOpts={'position': 0.95, 'color': (255,0,0), 'fill': (200,200,200,50), 'movable': False}
+            labelOpts={'position': 0.95, 'color': (160, 255, 160), 'fill': (200,200,200,50), 'movable': False}
         )
         self.eris_c_strike_lines[chain_symbol] = pg.InfiniteLine(
             angle=90,
             movable=False,
             pen=c_line_pen,
             label=symbol + " 看涨ERIS",
-            labelOpts={'position': 0.05, 'color': (0,0,255), 'fill': (200,200,200,50), 'movable': False}
+            labelOpts={'position': 0.05, 'color': (255, 174, 201), 'fill': (200,200,200,50), 'movable': False}
         )
         self.impv_chart.addItem(self.eris_p_strike_lines[chain_symbol])
         self.impv_chart.addItem(self.eris_c_strike_lines[chain_symbol])
@@ -221,14 +221,14 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             x=[],
             height=[],
             width=1.0,
-            brush=pg.mkBrush(color=(0, 255, 0, 100)),
+            brush=pg.mkBrush(color=(255, 174, 201, 100)),
             name=symbol + " 看涨成交量"
         )
         self.put_volume_bars[chain_symbol] = pg.BarGraphItem(
             x=[],
             height=[],
             width=1.0,
-            brush=pg.mkBrush(color=(255, 0, 0, 100)),
+            brush=pg.mkBrush(color=(160, 255, 160, 100)),
             name=symbol + " 看跌成交量"
         )
         self.volume_chart.addItem(self.call_volume_bars[chain_symbol])
