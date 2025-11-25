@@ -48,6 +48,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.pricing_curves: dict[str, pg.PlotCurveItem] = {}
         self.eris_p_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.eris_c_strike_lines: dict[str, pg.InfiniteLine] = {}
+        self.atm_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.call_volume_bars: dict[str, pg.BarGraphItem] = {}
         self.put_volume_bars: dict[str, pg.BarGraphItem] = {}
 
@@ -194,8 +195,9 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             symbolBrush=color
         )
 
-        p_line_pen = pg.mkPen(color=(160, 255, 160), width=2, style=QtCore.Qt.DotLine) # Red dotted for Put
-        c_line_pen = pg.mkPen(color=(255, 174, 201), width=2, style=QtCore.Qt.DotLine) # Blue dotted for Call
+        p_line_pen = pg.mkPen(color=(160, 255, 160), width=2, style=QtCore.Qt.DotLine)
+        c_line_pen = pg.mkPen(color=(255, 174, 201), width=2, style=QtCore.Qt.DotLine)
+        atm_line_pen = pg.mkPen(color=(255, 255, 0), width=2, style=QtCore.Qt.DotLine)
 
         self.eris_p_strike_lines[chain_symbol] = pg.InfiniteLine(
             angle=90,
@@ -211,11 +213,21 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             label=symbol + " 看涨ERIS",
             labelOpts={'position': 0.05, 'color': (255, 174, 201), 'fill': (200,200,200,50), 'movable': False}
         )
+        self.atm_strike_lines[chain_symbol] = pg.InfiniteLine(
+            angle=90,
+            movable=False,
+            pen=atm_line_pen,
+            label=symbol + " ATM",
+            labelOpts={'position': 0.5, 'color': (255, 255, 0), 'fill': (200,200,200,50), 'movable': False}
+        )
+
         self.impv_chart.addItem(self.eris_p_strike_lines[chain_symbol])
         self.impv_chart.addItem(self.eris_c_strike_lines[chain_symbol])
+        self.impv_chart.addItem(self.atm_strike_lines[chain_symbol])
 
         self.eris_p_strike_lines[chain_symbol].hide()
         self.eris_c_strike_lines[chain_symbol].hide()
+        self.atm_strike_lines[chain_symbol].hide()
 
         self.call_volume_bars[chain_symbol] = pg.BarGraphItem(
             x=[],
@@ -326,6 +338,13 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             else:
                 self.eris_c_strike_lines[chain.chain_symbol].hide()
 
+            # Update ATM strike line
+            if chain.atm_price:
+                self.atm_strike_lines[chain.chain_symbol].setPos(chain.atm_price)
+                self.atm_strike_lines[chain.chain_symbol].show()
+            else:
+                self.atm_strike_lines[chain.chain_symbol].hide()
+
             # Update volume bars
             strike_step = 0
             if len(call_strikes) > 1:
@@ -354,6 +373,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             pricing_curve: pg.PlotCurveItem = self.pricing_curves[chain_symbol]
             p_line = self.eris_p_strike_lines[chain_symbol]
             c_line = self.eris_c_strike_lines[chain_symbol]
+            atm_line = self.atm_strike_lines[chain_symbol]
             call_volume_bar = self.call_volume_bars[chain_symbol]
             put_volume_bar = self.put_volume_bars[chain_symbol]
 
@@ -367,6 +387,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 pricing_curve.show()
                 p_line.show()
                 c_line.show()
+                atm_line.show()
                 call_volume_bar.show()
                 put_volume_bar.show()
             else:
@@ -379,6 +400,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 pricing_curve.hide()
                 p_line.hide()
                 c_line.hide()
+                atm_line.hide()
                 call_volume_bar.hide()
                 put_volume_bar.hide()
 
