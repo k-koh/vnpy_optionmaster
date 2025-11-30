@@ -94,11 +94,10 @@ class OptionEngine(BaseEngine):
         print("开始加载上一交易日期权数据")
 
         now: datetime = datetime.now(DB_TZ)
-        session_start: datetime = now.replace(hour=17, minute=0, second=0, microsecond=0)
-        if now.hour < 17:
-            session_start = session_start - timedelta(days=1)
-        prev_day_end = session_start - timedelta(days=1)
-        prev_day_start = prev_day_end - timedelta(days=3) # Load 3 days to ensure data availability
+        session_end: datetime = now.replace(hour=15, minute=45, second=0, microsecond=0)
+        if now.hour >= 17:
+            session_end = session_end + timedelta(days=1)
+        prev_days_start = session_end - timedelta(days=5) # Load 3 days to ensure data availability
 
         # Assuming MySQL database is configured and available
         database: BaseDatabase = get_database()
@@ -108,8 +107,8 @@ class OptionEngine(BaseEngine):
             symbol="", # Placeholder, as it's ignored now
             exchange=Exchange.JPX, # Assuming a specific exchange, adjust as needed
             interval=Interval.DAILY,
-            start=prev_day_start,
-            end=prev_day_end
+            start=prev_days_start,
+            end=session_end
         )
 
         if not bars:
@@ -118,10 +117,13 @@ class OptionEngine(BaseEngine):
 
         for bar in bars:
             self.prev_day_option.add_bar(bar)
+        self.prev_day_option.sort_bar_datetime()
         self.prev_day_option.calculate_eris_data()
         self.prev_day_option.calculate_atm_iv()
-        
-        print(f"成功加载{len(self.prev_day_option.bars)}条上一交易日期权数据. 结束时间: {self.prev_day_option.datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        dt: datetime = datetime.now(DB_TZ)
+        prev_day_dt = self.prev_day_option.get_prev_day_datetime(dt)
+        print(f"成功加载{len(self.prev_day_option.bars)}条上一交易日期权数据. 结束时间: {prev_day_dt.strftime('%Y-%m-%d %H:%M:%S')}")
 
     def load_setting(self) -> None:
         """"""
@@ -447,8 +449,8 @@ class OptionEngine(BaseEngine):
         return None
 
     def get_prev_day_option_iv(self, op_month: str, prev_iv_type: OptionPrevIvType, put_strike: int, call_strike: int,
-                               atm_strike: int) -> tuple[float, float, float]:
-        return self.prev_day_option.get_prev_day_option_iv(op_month, prev_iv_type, put_strike, call_strike, atm_strike)
+                               atm_strike: int, dt: datetime) -> tuple[float, float, float]:
+        return self.prev_day_option.get_prev_day_option_iv(op_month, prev_iv_type, put_strike, call_strike, atm_strike, dt)
 
     def set_timer_trigger(self, timer_trigger: int) -> None:
         """"""

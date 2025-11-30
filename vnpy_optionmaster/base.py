@@ -780,131 +780,172 @@ class PortfolioData:
 class PreviousDayOptionData:
     """"""
     def __init__(self) -> None:
-        self.bars: dict[str, BarData] = {}
-        self.eris_p_iv: float | None = None
-        self.eris_c_iv: float | None = None
-        self.atm_iv: float | None = None
-        self.datetime : datetime | None = None
+        self.bars: dict[datetime, dict[str, BarData]] = {}
+        self.eris_p_iv: dict[str, float | None] = {}
+        self.eris_c_iv: dict[str, float | None] = {}
+        self.atm_iv: dict[str, float | None] = {}
+        self.datetime: dict[int, datetime | None] = {}
+        self.sorted_dates: list[datetime] = []
+        self.op_months: set[str] = set()
+
+    def sort_bar_datetime(self) -> None:
+        """"""
+        self.sorted_dates = sorted(self.bars.keys(), reverse=True)
+
+    def get_prev_day_datetime(self, dt: datetime) -> datetime | None:
+        """"""
+        for i, date in enumerate(self.sorted_dates):
+            if date < dt:
+                return date
+        return None
 
     def add_bar(self, bar: BarData) -> None:
-        if not bar.vt_symbol in self.bars:
-            self.bars[bar.vt_symbol] = bar
-        # DBから複数日のデータ取得する場合、昨日と近い最新のバーを取得する
-        elif bar.datetime > self.bars[bar.vt_symbol].datetime:
-            self.bars[bar.vt_symbol] = bar
-            self.datetime = bar.datetime
+        day_datetime = bar.datetime
+        day_bars     = self.bars.setdefault(day_datetime, {})
+        if not bar.vt_symbol in day_bars:
+            day_bars[bar.vt_symbol] = bar
+        symbols = bar.vt_symbol.split("-")
+        self.op_months.add(symbols[0] + "-" + symbols[1])
 
     def calculate_eris_data(self) -> None:
         """
         Calculate ERIS IVs from stored bars.
         """
-        # Find put with delta closest to -0.1
-        min_put_delta_diff = 100.0
-        eris_put_bar = None
+        bar_dates = list(self.bars.keys())
+        for dt in bar_dates:
+            day_bars = self.bars.get(dt, {})
+            for op_month in self.op_months:
+                # get bars for the specific option month
+                month_bars = {k: v for k, v in day_bars.items() if k.startswith(op_month)}
+                dt_str = dt.strftime("%Y-%m-%d-%H-%M-%S")
+                dt_op_month = dt_str + "_" + op_month
+                # Find put with delta closest to -0.1
+                min_put_delta_diff = 100.0
+                eris_put_bar = None
 
-        for bar in self.bars.values():
-            if not hasattr(bar, 'delta'):
-                continue
+                for bar in month_bars.values():
+                    if not hasattr(bar, 'delta'):
+                        continue
 
-            option_delta = bar.delta
-            delta_diff = abs(option_delta - (-0.1))
+                    option_delta = bar.delta
+                    delta_diff = abs(option_delta - (-0.1))
 
-            if delta_diff < min_put_delta_diff:
-                min_put_delta_diff = delta_diff
-                eris_put_bar = bar
+                    if delta_diff < min_put_delta_diff:
+                        min_put_delta_diff = delta_diff
+                        eris_put_bar = bar
 
-        if eris_put_bar and hasattr(eris_put_bar, 'iv'):
-            self.eris_p_iv = eris_put_bar.iv
-        else:
-            self.eris_p_iv = None
+                if eris_put_bar and hasattr(eris_put_bar, 'iv'):
+                    self.eris_p_iv[dt_op_month] = eris_put_bar.iv
+                else:
+                    self.eris_p_iv[dt_op_month] = 0
 
-        # Find call with delta closest to +0.1
-        min_call_delta_diff = 100.0
-        eris_call_bar = None
+                # Find call with delta closest to +0.1
+                min_call_delta_diff = 100.0
+                eris_call_bar = None
 
-        for bar in self.bars.values():
-            if not hasattr(bar, 'delta'):
-                continue
+                for bar in month_bars.values():
+                    if not hasattr(bar, 'delta'):
+                        continue
 
-            option_delta = bar.delta
-            delta_diff = abs(option_delta - 0.1)
+                    option_delta = bar.delta
+                    delta_diff = abs(option_delta - 0.1)
 
-            if delta_diff < min_call_delta_diff:
-                min_call_delta_diff = delta_diff
-                eris_call_bar = bar
+                    if delta_diff < min_call_delta_diff:
+                        min_call_delta_diff = delta_diff
+                        eris_call_bar = bar
 
-        if eris_call_bar and hasattr(eris_call_bar, 'iv'):
-            self.eris_c_iv = eris_call_bar.iv
-        else:
-            self.eris_c_iv = None
+                if eris_call_bar and hasattr(eris_call_bar, 'iv'):
+                    self.eris_c_iv[dt_op_month] = eris_call_bar.iv
+                else:
+                    self.eris_c_iv[dt_op_month] = 0
 
     def calculate_atm_iv(self) -> None:
         # Find put with delta closest to -0.5
-        min_put_delta_diff = 100.0
-        atm_put_bar = None
-        atm_put_iv = None
+        bar_dates = list(self.bars.keys())
+        for dt in bar_dates:
+            day_bars = self.bars.get(dt, {})
+            for op_month in self.op_months:
+                # get bars for the specific option month
+                month_bars = {k: v for k, v in day_bars.items() if k.startswith(op_month)}
+                dt_str = dt.strftime("%Y-%m-%d-%H-%M-%S")
+                dt_op_month = dt_str + "_" + op_month
 
-        for bar in self.bars.values():
-            if not hasattr(bar, 'delta'):
-                continue
+                min_put_delta_diff = 100.0
+                atm_put_bar = None
+                atm_put_iv = None
 
-            option_delta = bar.delta
-            delta_diff = abs(option_delta - (-0.5))
+                for bar in month_bars.values():
+                    if not hasattr(bar, 'delta'):
+                        continue
 
-            if delta_diff < min_put_delta_diff:
-                min_put_delta_diff = delta_diff
-                atm_put_bar = bar
+                    option_delta = bar.delta
+                    delta_diff = abs(option_delta - (-0.5))
 
-        if atm_put_bar and hasattr(atm_put_bar, 'iv'):
-            atm_put_iv = atm_put_bar.iv
-        else:
-            atm_put_iv = None
+                    if delta_diff < min_put_delta_diff:
+                        min_put_delta_diff = delta_diff
+                        atm_put_bar = bar
 
-        # Find call with delta closest to +0.5
-        min_call_delta_diff = 100.0
-        atm_call_bar = None
-        atm_call_iv = None
+                if atm_put_bar and hasattr(atm_put_bar, 'iv'):
+                    atm_put_iv = atm_put_bar.iv
+                else:
+                    atm_put_iv = None
 
-        for bar in self.bars.values():
-            if not hasattr(bar, 'delta'):
-                continue
+                # Find call with delta closest to +0.5
+                min_call_delta_diff = 100.0
+                atm_call_bar = None
+                atm_call_iv = None
 
-            option_delta = bar.delta
-            delta_diff = abs(option_delta - 0.5)
+                for bar in month_bars.values():
+                    if not hasattr(bar, 'delta'):
+                        continue
 
-            if delta_diff < min_call_delta_diff:
-                min_call_delta_diff = delta_diff
-                atm_call_bar = bar
+                    option_delta = bar.delta
+                    delta_diff = abs(option_delta - 0.5)
 
-        if atm_call_bar and hasattr(atm_call_bar, 'iv'):
-            atm_call_iv = atm_call_bar.iv
-        else:
-            atm_call_iv = None
+                    if delta_diff < min_call_delta_diff:
+                        min_call_delta_diff = delta_diff
+                        atm_call_bar = bar
 
-        if atm_put_iv is not None and atm_call_iv is not None:
-            self.atm_iv = (atm_put_iv + atm_call_iv) / 2
-        elif atm_put_iv is not None:
-            self.atm_iv = atm_put_iv
-        elif atm_call_iv is not None:
-            self.atm_iv = atm_call_iv
-        else:
-            self.atm_iv = None
+                if atm_call_bar and hasattr(atm_call_bar, 'iv'):
+                    atm_call_iv = atm_call_bar.iv
+                else:
+                    atm_call_iv = None
 
-    def get_prev_day_option_iv(self, op_month: str, prev_iv_type: OptionPrevIvType, put_strike: int, call_strike: int,
-                               atm_strike: int) -> tuple[float, float, float]:
+                if atm_put_iv is not None and atm_call_iv is not None:
+                    self.atm_iv[dt_op_month] = (atm_put_iv + atm_call_iv) / 2
+                elif atm_put_iv is not None:
+                    self.atm_iv[dt_op_month] = atm_put_iv
+                elif atm_call_iv is not None:
+                    self.atm_iv[dt_op_month] = atm_call_iv
+                else:
+                    self.atm_iv[dt_op_month] = 0
+
+    def get_prev_day_option_iv(
+        self,
+        op_month: str,
+        prev_iv_type: OptionPrevIvType,
+        put_strike: int,
+        call_strike: int,
+        atm_strike: int,
+        dt: datetime
+    ) -> tuple[float, float, float]:
         """"""
         put_iv: float = 0.0
         call_iv: float = 0.0
         atm_iv: float = 0.0
+
+        prev_date = self.get_prev_day_datetime(dt)
+        if not prev_date:
+            return put_iv, call_iv, atm_iv
+
         if prev_iv_type == OptionPrevIvType.SAME_DELTA:
-            if self.eris_p_iv:
-                put_iv = self.eris_p_iv
-            if self.eris_c_iv:
-                call_iv = self.eris_c_iv
-            if self.atm_iv:
-                atm_iv = self.atm_iv
+            dt_op_month = prev_date.strftime("%Y-%m-%d-%H-%M-%S") + "_" + op_month
+            put_iv = self.eris_p_iv.get(dt_op_month, 0.0)
+            call_iv = self.eris_c_iv.get(dt_op_month, 0.0)
+            atm_iv = self.atm_iv.get(dt_op_month, 0.0)
         elif prev_iv_type == OptionPrevIvType.SAME_STRIKE:
             if put_strike is not None and call_strike is not None:
+                day_bars = self.bars.get(prev_date, {})
                 c_strike = int(call_strike)
                 p_strike = int(put_strike)
                 a_strike = int(atm_strike)
@@ -913,29 +954,28 @@ class PreviousDayOptionData:
                 atm_call_vt_symbol = f"{op_month}-C-{a_strike}.JPX"
                 atm_put_vt_symbol = f"{op_month}-P-{a_strike}.JPX"
                 # Get Put IV
-                if put_vt_symbol in self.bars:
-                    bar = self.bars[put_vt_symbol]
+                if put_vt_symbol in day_bars:
+                    bar = day_bars[put_vt_symbol]
                     if hasattr(bar, 'iv'):
                         put_iv = bar.iv
                 # Get Call IV
-                if call_vt_symbol in self.bars:
-                    bar = self.bars[call_vt_symbol]
+                if call_vt_symbol in day_bars:
+                    bar = day_bars[call_vt_symbol]
                     if hasattr(bar, 'iv'):
                         call_iv = bar.iv
                 # Calculate ATM IV
-                if atm_call_vt_symbol in self.bars and atm_put_vt_symbol in self.bars:
-                    call_bar = self.bars[atm_call_vt_symbol]
-                    put_bar = self.bars[atm_put_vt_symbol]
-                    if hasattr(call_bar, 'iv') and hasattr(put_bar, 'iv'):
-                        atm_iv = (call_bar.iv + put_bar.iv) / 2
-                elif atm_call_vt_symbol in self.bars:
-                    call_bar = self.bars[atm_call_vt_symbol]
-                    if hasattr(call_bar, 'iv'):
-                        atm_iv = call_bar.iv
-                elif atm_put_vt_symbol in self.bars:
-                    put_bar = self.bars[atm_put_vt_symbol]
-                    if hasattr(put_bar, 'iv'):
-                        atm_iv = put_bar.iv
+                atm_call_bar = day_bars.get(atm_call_vt_symbol, None)
+                atm_put_bar = day_bars.get(atm_put_vt_symbol, None)
+
+                atm_call_iv = getattr(atm_call_bar, "iv", None)
+                atm_put_iv = getattr(atm_put_bar, "iv", None)
+
+                if atm_call_iv is not None and atm_put_iv is not None:
+                    atm_iv = (atm_call_iv + atm_put_iv) / 2
+                elif atm_call_iv is not None:
+                    atm_iv = atm_call_iv
+                elif atm_put_iv is not None:
+                    atm_iv = atm_put_iv
         return put_iv, call_iv, atm_iv
 
 
