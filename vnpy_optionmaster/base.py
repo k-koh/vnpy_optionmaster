@@ -978,6 +978,33 @@ class PreviousDayOptionData:
                     atm_iv = atm_put_iv
         return put_iv, call_iv, atm_iv
 
+    def get_prev_day_iv_curve(
+        self,
+        dt: datetime,
+        chain: "ChainData"
+    ) -> tuple[dict[float, float], dict[float, float]]:
+        """"""
+        put_ivs: dict[float, float] = {}
+        call_ivs: dict[float, float] = {}
+
+        prev_date = self.get_prev_day_datetime(dt)
+        if not prev_date:
+            return put_ivs, call_ivs
+
+        day_bars = self.bars.get(prev_date, {})
+
+        for call in chain.calls.values():
+            bar = day_bars.get(call.vt_symbol)
+            if bar and hasattr(bar, "iv"):
+                call_ivs[call.strike_price] = bar.iv
+
+        for put in chain.puts.values():
+            bar = day_bars.get(put.vt_symbol)
+            if bar and hasattr(bar, "iv"):
+                put_ivs[put.strike_price] = bar.iv
+
+        return call_ivs, put_ivs
+
 
 @lru_cache(maxsize=100)
 def get_underlying_prefix(portfolio_name: str) -> str:

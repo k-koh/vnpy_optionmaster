@@ -1,10 +1,12 @@
+from datetime import datetime
 import pyqtgraph as pg
 from typing import cast
 
 from vnpy.trader.ui import QtWidgets, QtCore, QtGui
 from vnpy.trader.event import EVENT_TIMER
+from vnpy.trader.database import DB_TZ
 
-from ..base import PortfolioData, OptionData
+from ..base import PortfolioData, OptionData, PreviousDayOptionData
 from ..engine import OptionEngine, Event, EventEngine
 from ..time import ANNUAL_DAYS
 
@@ -51,6 +53,12 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.atm_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.call_volume_bars: dict[str, pg.BarGraphItem] = {}
         self.put_volume_bars: dict[str, pg.BarGraphItem] = {}
+
+        self.prev_call_curves: dict[str, pg.PlotCurveItem] = {}
+        self.prev_put_curves: dict[str, pg.PlotCurveItem] = {}
+
+        self.iv_diff_pos_bars: dict[str, pg.BarGraphItem] = {}
+        self.iv_diff_neg_bars: dict[str, pg.BarGraphItem] = {}
 
         self.colors: list = [
             (255, 0, 0),
@@ -115,6 +123,18 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.volume_chart.setMouseEnabled(False, False)
         self.volume_chart.setMaximumHeight(200)
 
+        graphics_window.nextRow()
+
+        self.iv_diff_chart = graphics_window.addPlot(row=2, col=0, title="前日比IV")
+        self.iv_diff_chart.showGrid(x=True, y=True)
+        self.iv_diff_chart.setLabel("left", "IV差值")
+        self.iv_diff_chart.setLabel("bottom", "行权价")
+        self.iv_diff_chart.setXLink(self.impv_chart)
+        self.iv_diff_chart.addLegend()
+        self.iv_diff_chart.setMenuEnabled(False)
+        self.iv_diff_chart.setMouseEnabled(False, False)
+        self.iv_diff_chart.setMaximumHeight(200)
+
         for chain_symbol in chain_symbols:
             self.add_impv_curve(chain_symbol)
 
@@ -146,6 +166,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         color: tuple = self.colors.pop(0)
         pen: QtGui.QPen = pg.mkPen(color, width=2)
         pen_dot: QtGui.QPen = pg.mkPen(color, style=QtCore.Qt.DotLine)
+        pen_prev_day: QtGui.QPen = pg.mkPen(color, style=QtCore.Qt.DashLine)
 
         self.call_mid_curves[chain_symbol] = self.impv_chart.plot(
             symbolSize=0,
@@ -193,6 +214,17 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             name=symbol + " 定价",
             pen=pen_dot,
             symbolBrush=color
+        )
+
+        self.prev_call_curves[chain_symbol] = self.impv_chart.plot(
+            symbolSize=0,
+            name=symbol + " 前日看涨",
+            pen=pen_prev_day,
+        )
+        self.prev_put_curves[chain_symbol] = self.impv_chart.plot(
+            symbolSize=0,
+            name=symbol + " 前日看跌",
+            pen=pen_prev_day,
         )
 
         p_line_pen = pg.mkPen(color=(160, 255, 160), width=2, style=QtCore.Qt.DotLine)
@@ -246,9 +278,27 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.volume_chart.addItem(self.call_volume_bars[chain_symbol])
         self.volume_chart.addItem(self.put_volume_bars[chain_symbol])
 
+        self.iv_diff_pos_bars[chain_symbol] = pg.BarGraphItem(
+            x=[],
+            height=[],
+            width=1.0,
+            brush=pg.mkBrush(color=(0, 255, 0, 100)),
+            name=symbol + " IV diff pos"
+        )
+        self.iv_diff_neg_bars[chain_symbol] = pg.BarGraphItem(
+            x=[],
+            height=[],
+            width=1.0,
+            brush=pg.mkBrush(color=(255, 0, 0, 100)),
+            name=symbol + " IV diff neg"
+        )
+        self.iv_diff_chart.addItem(self.iv_diff_pos_bars[chain_symbol])
+        self.iv_diff_chart.addItem(self.iv_diff_neg_bars[chain_symbol])
+
     def update_curve_data(self) -> None:
         """"""
         portfolio: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
+        prev_day_data: PreviousDayOptionData = self.option_engine.prev_day_option
 
         for chain in portfolio.chains.values():
             # Get call data
@@ -295,6 +345,83 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 else:
                     put_volumes.append(0)
 
+            # Get previous day iv
+            prev_call_ivs: list = []
+            prev_put_ivs: list = []
+            if prev_day_data:
+                dt: datetime = datetime.now(DB_TZ)
+
+                prev_call_data, prev_put_data = prev_day_data.get_prev_day_iv_curve(dt, chain)
+
+                for strike in call_strikes:
+                    iv = prev_call_data.get(strike, 0)
+                    prev_call_ivs.append(iv * 100)
+
+                for strike in put_strikes:
+                    iv = prev_put_data.get(strike, 0)
+                    prev_put_ivs.append(iv * 100)
+
+            # Calculate IV difference
+            iv_diff_strikes = []
+            iv_diff_heights = []
+
+            all_strikes = sorted(list(set(call_strikes + put_strikes)))
+            prev_call_iv_map = {s: v for s, v in zip(call_strikes, prev_call_ivs)}
+            prev_put_iv_map = {s: v for s, v in zip(put_strikes, prev_put_ivs)}
+            call_mid_impv_map = {s: v for s, v in zip(call_strikes, call_mid_impv)}
+            put_mid_impv_map = {s: v for s, v in zip(put_strikes, put_mid_impv)}
+
+            for strike in all_strikes:
+                call_iv = call_mid_impv_map.get(strike, 0)
+                put_iv = put_mid_impv_map.get(strike, 0)
+                prev_call_iv = prev_call_iv_map.get(strike, 0)
+                prev_put_iv = prev_put_iv_map.get(strike, 0)
+
+                has_call = call_iv > 0
+                has_put = put_iv > 0
+
+                current_iv = 0
+                prev_iv = 0
+
+                if has_call and has_put:
+                    current_iv = (call_iv + put_iv) / 2.0
+
+                    p_count = 0
+                    p_sum = 0
+                    if prev_call_iv > 0:
+                        p_sum += prev_call_iv
+                        p_count += 1
+                    if prev_put_iv > 0:
+                        p_sum += prev_put_iv
+                        p_count += 1
+                    if p_count > 0:
+                        prev_iv = p_sum / p_count
+
+                elif has_call:
+                    current_iv = call_iv
+                    prev_iv = prev_call_iv
+                elif has_put:
+                    current_iv = put_iv
+                    prev_iv = prev_put_iv
+                else:
+                    continue
+
+                iv_diff_strikes.append(strike)
+                iv_diff_heights.append(current_iv - prev_iv)
+
+            pos_strikes = []
+            pos_heights = []
+            neg_strikes = []
+            neg_heights = []
+
+            for strike, height in zip(iv_diff_strikes, iv_diff_heights):
+                if height >= 0:
+                    pos_strikes.append(strike)
+                    pos_heights.append(height)
+                else:
+                    neg_strikes.append(strike)
+                    neg_heights.append(height)
+
             # Plot curves
             self.call_mid_curves[chain.chain_symbol].setData(
                 y=call_mid_impv,
@@ -324,6 +451,16 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 y=pricing_impv,
                 x=call_strikes
             )
+
+            if prev_call_ivs and prev_put_ivs:
+                self.prev_call_curves[chain.chain_symbol].setData(
+                    y=prev_call_ivs,
+                    x=call_strikes
+                )
+                self.prev_put_curves[chain.chain_symbol].setData(
+                    y=prev_put_ivs,
+                    x=put_strikes
+                )
 
             # Update ERIS strike lines
             if chain.eris_p_strike is not None:
@@ -361,6 +498,10 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 x=[s + bar_width/2 for s in put_strikes], height=put_volumes, width=bar_width
             )
 
+            bar_width_diff = bar_width * 0.8
+            self.iv_diff_pos_bars[chain.chain_symbol].setOpts(x=pos_strikes, height=pos_heights, width=bar_width_diff)
+            self.iv_diff_neg_bars[chain.chain_symbol].setOpts(x=neg_strikes, height=neg_heights, width=bar_width_diff)
+
     def update_curve_visible(self) -> None:
         """"""
         for chain_symbol, checkbox in self.chain_checks.items():
@@ -371,11 +512,15 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             put_bid_curve: pg.PlotCurveItem = self.put_bid_curves[chain_symbol]
             put_ask_curve: pg.PlotCurveItem = self.put_ask_curves[chain_symbol]
             pricing_curve: pg.PlotCurveItem = self.pricing_curves[chain_symbol]
+            prev_call_curve: pg.PlotCurveItem = self.prev_call_curves[chain_symbol]
+            prev_put_curve: pg.PlotCurveItem = self.prev_put_curves[chain_symbol]
             p_line = self.eris_p_strike_lines[chain_symbol]
             c_line = self.eris_c_strike_lines[chain_symbol]
             atm_line = self.atm_strike_lines[chain_symbol]
             call_volume_bar = self.call_volume_bars[chain_symbol]
             put_volume_bar = self.put_volume_bars[chain_symbol]
+            iv_diff_pos_bar = self.iv_diff_pos_bars[chain_symbol]
+            iv_diff_neg_bar = self.iv_diff_neg_bars[chain_symbol]
 
             if checkbox.isChecked():
                 call_mid_curve.show()
@@ -385,11 +530,15 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 put_bid_curve.show()
                 put_ask_curve.show()
                 pricing_curve.show()
+                prev_call_curve.show()
+                prev_put_curve.show()
                 p_line.show()
                 c_line.show()
                 atm_line.show()
                 call_volume_bar.show()
                 put_volume_bar.show()
+                iv_diff_pos_bar.show()
+                iv_diff_neg_bar.show()
             else:
                 call_mid_curve.hide()
                 call_bid_curve.hide()
@@ -398,11 +547,15 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 put_bid_curve.hide()
                 put_ask_curve.hide()
                 pricing_curve.hide()
+                prev_call_curve.hide()
+                prev_put_curve.hide()
                 p_line.hide()
                 c_line.hide()
                 atm_line.hide()
                 call_volume_bar.hide()
                 put_volume_bar.hide()
+                iv_diff_pos_bar.hide()
+                iv_diff_neg_bar.hide()
 
 
 class ScenarioAnalysisChart(QtWidgets.QWidget):
