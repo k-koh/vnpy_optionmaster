@@ -406,8 +406,9 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 else:
                     continue
 
-                iv_diff_strikes.append(strike)
-                iv_diff_heights.append(current_iv - prev_iv)
+                if prev_iv != 0:
+                    iv_diff_strikes.append(strike)
+                    iv_diff_heights.append(current_iv - prev_iv)
 
             pos_strikes = []
             pos_heights = []
