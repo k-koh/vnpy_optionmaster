@@ -51,8 +51,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.eris_p_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.eris_c_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.atm_strike_lines: dict[str, pg.InfiniteLine] = {}
-        self.call_volume_bars: dict[str, pg.BarGraphItem] = {}
-        self.put_volume_bars: dict[str, pg.BarGraphItem] = {}
+        self.total_volume_bars: dict[str, pg.BarGraphItem] = {}
 
         self.prev_call_curves: dict[str, pg.PlotCurveItem] = {}
         self.prev_put_curves: dict[str, pg.PlotCurveItem] = {}
@@ -227,30 +226,30 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             pen=pen_prev_day,
         )
 
-        p_line_pen = pg.mkPen(color=(160, 255, 160), width=2, style=QtCore.Qt.DotLine)
-        c_line_pen = pg.mkPen(color=(255, 174, 201), width=2, style=QtCore.Qt.DotLine)
-        atm_line_pen = pg.mkPen(color=(255, 255, 0), width=2, style=QtCore.Qt.DotLine)
+        p_line_pen = pg.mkPen(color=color, width=2, style=QtCore.Qt.DotLine)
+        c_line_pen = pg.mkPen(color=color, width=2, style=QtCore.Qt.DotLine)
+        atm_line_pen = pg.mkPen(color=(255, 174, 201), width=2, style=QtCore.Qt.DotLine)
 
         self.eris_p_strike_lines[chain_symbol] = pg.InfiniteLine(
             angle=90,
             movable=False,
             pen=p_line_pen,
             label=symbol + " 看跌ERIS",
-            labelOpts={'position': 0.95, 'color': (160, 255, 160), 'fill': (200,200,200,50), 'movable': False}
+            labelOpts={'position': 0.95, 'color': color, 'fill': (200,200,200,50), 'movable': False}
         )
         self.eris_c_strike_lines[chain_symbol] = pg.InfiniteLine(
             angle=90,
             movable=False,
             pen=c_line_pen,
             label=symbol + " 看涨ERIS",
-            labelOpts={'position': 0.05, 'color': (255, 174, 201), 'fill': (200,200,200,50), 'movable': False}
+            labelOpts={'position': 0.05, 'color': color, 'fill': (200,200,200,50), 'movable': False}
         )
         self.atm_strike_lines[chain_symbol] = pg.InfiniteLine(
             angle=90,
             movable=False,
             pen=atm_line_pen,
             label=symbol + " ATM",
-            labelOpts={'position': 0.5, 'color': (255, 255, 0), 'fill': (200,200,200,50), 'movable': False}
+            labelOpts={'position': 0.5, 'color': (255, 174, 201), 'fill': (200,200,200,50), 'movable': False}
         )
 
         self.impv_chart.addItem(self.eris_p_strike_lines[chain_symbol])
@@ -261,35 +260,27 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.eris_c_strike_lines[chain_symbol].hide()
         self.atm_strike_lines[chain_symbol].hide()
 
-        self.call_volume_bars[chain_symbol] = pg.BarGraphItem(
+        self.total_volume_bars[chain_symbol] = pg.BarGraphItem(
             x=[],
             height=[],
             width=1.0,
-            brush=pg.mkBrush(color=(255, 174, 201, 100)),
-            name=symbol + " 看涨成交量"
+            brush=pg.mkBrush(color=color), # Use a neutral color for combined volume
+            name=symbol + " 总成交量"
         )
-        self.put_volume_bars[chain_symbol] = pg.BarGraphItem(
-            x=[],
-            height=[],
-            width=1.0,
-            brush=pg.mkBrush(color=(160, 255, 160, 100)),
-            name=symbol + " 看跌成交量"
-        )
-        self.volume_chart.addItem(self.call_volume_bars[chain_symbol])
-        self.volume_chart.addItem(self.put_volume_bars[chain_symbol])
+        self.volume_chart.addItem(self.total_volume_bars[chain_symbol])
 
         self.iv_diff_pos_bars[chain_symbol] = pg.BarGraphItem(
             x=[],
             height=[],
             width=1.0,
-            brush=pg.mkBrush(color=(0, 255, 0, 100)),
+            brush=pg.mkBrush(color=color),
             name=symbol + " IV diff pos"
         )
         self.iv_diff_neg_bars[chain_symbol] = pg.BarGraphItem(
             x=[],
             height=[],
             width=1.0,
-            brush=pg.mkBrush(color=(255, 0, 0, 100)),
+            brush=pg.mkBrush(color=color + (100,)),
             name=symbol + " IV diff neg"
         )
         self.iv_diff_chart.addItem(self.iv_diff_pos_bars[chain_symbol])
@@ -410,12 +401,15 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                     iv_diff_strikes.append(strike)
                     iv_diff_heights.append(current_iv - prev_iv)
 
+            iv_diff_data = list(zip(iv_diff_strikes, iv_diff_heights))
+            iv_diff_data.sort(key=lambda item: abs(item[1]), reverse=True)
+
             pos_strikes = []
             pos_heights = []
             neg_strikes = []
             neg_heights = []
 
-            for strike, height in zip(iv_diff_strikes, iv_diff_heights):
+            for strike, height in iv_diff_data:
                 if height >= 0:
                     pos_strikes.append(strike)
                     pos_heights.append(height)
@@ -484,22 +478,31 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 self.atm_strike_lines[chain.chain_symbol].hide()
 
             # Update volume bars
+            volume_strikes = sorted(list(set(call_strikes + put_strikes)))
+            call_volume_map = {s: v for s, v in zip(call_strikes, call_volumes)}
+            put_volume_map = {s: v for s, v in zip(put_strikes, put_volumes)}
+
+            total_volumes = []
+            for s in volume_strikes:
+                total_vol = call_volume_map.get(s, 0) + put_volume_map.get(s, 0)
+                total_volumes.append(total_vol)
+
+            volume_data = list(zip(volume_strikes, total_volumes))
+            volume_data.sort(key=lambda item: item[1], reverse=True)
+            sorted_volume_strikes = [item[0] for item in volume_data]
+            sorted_total_volumes = [item[1] for item in volume_data]
+
             strike_step = 0
-            if len(call_strikes) > 1:
-                strike_step = call_strikes[1] - call_strikes[0]
-            elif len(put_strikes) > 1:
-                strike_step = put_strikes[1] - put_strikes[0]
+            if len(volume_strikes) > 1:
+                strike_step = volume_strikes[1] - volume_strikes[0]
 
-            bar_width = strike_step * 0.4 if strike_step else 100
+            bar_width = strike_step * 0.5 if strike_step else 100
 
-            self.call_volume_bars[chain.chain_symbol].setOpts(
-                x=[s - bar_width/2 for s in call_strikes], height=call_volumes, width=bar_width
-            )
-            self.put_volume_bars[chain.chain_symbol].setOpts(
-                x=[s + bar_width/2 for s in put_strikes], height=put_volumes, width=bar_width
+            self.total_volume_bars[chain.chain_symbol].setOpts(
+                x=sorted_volume_strikes, height=sorted_total_volumes, width=bar_width
             )
 
-            bar_width_diff = bar_width * 0.8
+            bar_width_diff = bar_width
             self.iv_diff_pos_bars[chain.chain_symbol].setOpts(x=pos_strikes, height=pos_heights, width=bar_width_diff)
             self.iv_diff_neg_bars[chain.chain_symbol].setOpts(x=neg_strikes, height=neg_heights, width=bar_width_diff)
 
@@ -518,8 +521,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             p_line = self.eris_p_strike_lines[chain_symbol]
             c_line = self.eris_c_strike_lines[chain_symbol]
             atm_line = self.atm_strike_lines[chain_symbol]
-            call_volume_bar = self.call_volume_bars[chain_symbol]
-            put_volume_bar = self.put_volume_bars[chain_symbol]
+            total_volume_bar = self.total_volume_bars[chain_symbol]
             iv_diff_pos_bar = self.iv_diff_pos_bars[chain_symbol]
             iv_diff_neg_bar = self.iv_diff_neg_bars[chain_symbol]
 
@@ -536,8 +538,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 p_line.show()
                 c_line.show()
                 atm_line.show()
-                call_volume_bar.show()
-                put_volume_bar.show()
+                total_volume_bar.show()
                 iv_diff_pos_bar.show()
                 iv_diff_neg_bar.show()
             else:
@@ -553,8 +554,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 p_line.hide()
                 c_line.hide()
                 atm_line.hide()
-                call_volume_bar.hide()
-                put_volume_bar.hide()
+                total_volume_bar.hide()
                 iv_diff_pos_bar.hide()
                 iv_diff_neg_bar.hide()
 
