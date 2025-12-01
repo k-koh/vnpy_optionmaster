@@ -236,6 +236,10 @@ def calculate_impv(
     if not meet:
         return 0
 
+    # Handle case of time to expiry is zero
+    if not t:
+        return 0
+
     # Calculate implied volatility with Newton's method
     v = abs(price / f) * 2          # Initial guess of volatility
     v = min(max(v, 0.2), 1)         # Limit guess in range 0.2 to 1
@@ -245,8 +249,9 @@ def calculate_impv(
         p = calculate_price(f, k, r, t, v, cp, n)
         vega = calculate_vega(f, k, r, t, v, cp, n)
 
-        # Break loop if vega too close to 0
+        # Break loop if vega too close to 0, and return 0
         if not vega:
+            v = 0
             break
 
         # Calculate error value
@@ -257,7 +262,10 @@ def calculate_impv(
             break
 
         # Calculate guessed implied volatility of next round
+        dx = max(-0.5, min(0.5, dx))
         v += dx
+        if v <= 0:
+            v = 0.0001
 
         # Check new volatility to be non-negative
         if v <= 0:
