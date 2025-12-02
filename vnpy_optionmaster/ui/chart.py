@@ -47,7 +47,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.call_bid_curves: dict[str, pg.PlotCurveItem] = {}
         self.call_ask_curves: dict[str, pg.PlotCurveItem] = {}
         self.call_mid_curves: dict[str, pg.PlotCurveItem] = {}
-        self.pricing_curves: dict[str, pg.PlotCurveItem] = {}
+        # self.pricing_curves: dict[str, pg.PlotCurveItem] = {}
         self.eris_p_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.eris_c_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.atm_strike_lines: dict[str, pg.InfiniteLine] = {}
@@ -121,7 +121,9 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.volume_chart.setLabel("left", "成交量")
         self.volume_chart.setLabel("bottom", "行权价")
         self.volume_chart.setXLink(self.impv_chart)
-        self.volume_chart.addLegend()
+        volume_legend = self.volume_chart.addLegend(colCount=2)
+        volume_legend.anchor((0, 1), (0, 1)) # Anchor top-left of legend to top-left of plot
+        volume_legend.setOffset((1, 1)) # Add padding (10 right, 10 down)
         self.volume_chart.setMenuEnabled(False)
         self.volume_chart.setMouseEnabled(False, False)
         self.volume_chart.setMaximumHeight(200)
@@ -133,7 +135,9 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.iv_diff_chart.setLabel("left", "IV差值")
         self.iv_diff_chart.setLabel("bottom", "行权价")
         self.iv_diff_chart.setXLink(self.impv_chart)
-        self.iv_diff_chart.addLegend()
+        iv_diff_legend = self.iv_diff_chart.addLegend(colCount=4) # Changed colCount from 4 to 2 for consistency
+        iv_diff_legend.anchor((0, 1), (0, 1)) # Anchor top-left of legend to top-left of plot
+        iv_diff_legend.setOffset((1, 1)) # Add padding (10 right, 10 down)
         self.iv_diff_chart.setMenuEnabled(False)
         self.iv_diff_chart.setMouseEnabled(False, False)
         self.iv_diff_chart.setMaximumHeight(200)
@@ -213,13 +217,13 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             symbolBrush=color
         )
 
-        self.pricing_curves[chain_symbol] = self.impv_chart.plot(
-            symbolSize=symbol_size,
-            symbol="o",
-            name=symbol + " 定价",
-            pen=pen_dot,
-            symbolBrush=color
-        )
+        # self.pricing_curves[chain_symbol] = self.impv_chart.plot(
+        #     symbolSize=symbol_size,
+        #     symbol="o",
+        #     name=symbol + " 定价",
+        #     pen=pen_dot,
+        #     symbolBrush=color
+        # )
 
         self.prev_call_curves[chain_symbol] = self.impv_chart.plot(
             symbolSize=0,
@@ -271,7 +275,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             height=[],
             width=1.0,
             brush=pg.mkBrush(color=color), # Use a neutral color for combined volume
-            name=symbol + " 总成交量"
+            name=symbol
         )
         self.volume_chart.addItem(self.total_volume_bars[chain_symbol])
 
@@ -280,14 +284,14 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             height=[],
             width=1.0,
             brush=pg.mkBrush(color=color),
-            name=symbol + " IV diff pos"
+            name=symbol
         )
         self.iv_diff_neg_bars[chain_symbol] = pg.BarGraphItem(
             x=[],
             height=[],
             width=1.0,
             brush=pg.mkBrush(color=color + (100,)),
-            name=symbol + " IV diff neg"
+            name=symbol
         )
         self.iv_diff_chart.addItem(self.iv_diff_pos_bars[chain_symbol])
         self.iv_diff_chart.addItem(self.iv_diff_neg_bars[chain_symbol])
@@ -320,7 +324,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             call_mid_impv: list = []
             call_bid_impv: list = []
             call_ask_impv: list = []
-            pricing_impv: list = []
+            # pricing_impv: list = []
             call_strikes: list = []
             call_volumes: list = []
 
@@ -331,7 +335,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 call_mid_impv.append(call.mid_impv * 100)
                 call_bid_impv.append(call.bid_impv * 100)
                 call_ask_impv.append(call.ask_impv * 100)
-                pricing_impv.append(call.pricing_impv * 100)
+                # pricing_impv.append(call.pricing_impv * 100)
                 call_strikes.append(call.strike_price)
 
                 if call.tick:
@@ -466,10 +470,10 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 y=put_ask_impv,
                 x=put_strikes
             )
-            self.pricing_curves[chain.chain_symbol].setData(
-                y=pricing_impv,
-                x=call_strikes
-            )
+            # self.pricing_curves[chain.chain_symbol].setData(
+            #     y=pricing_impv,
+            #     x=call_strikes
+            # )
 
             if prev_call_ivs and prev_put_ivs:
                 self.prev_call_curves[chain.chain_symbol].setData(
@@ -595,7 +599,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             put_mid_curve: pg.PlotCurveItem = self.put_mid_curves[chain_symbol]
             put_bid_curve: pg.PlotCurveItem = self.put_bid_curves[chain_symbol]
             put_ask_curve: pg.PlotCurveItem = self.put_ask_curves[chain_symbol]
-            pricing_curve: pg.PlotCurveItem = self.pricing_curves[chain_symbol]
+            # pricing_curve: pg.PlotCurveItem = self.pricing_curves[chain_symbol]
             prev_call_curve: pg.PlotCurveItem = self.prev_call_curves[chain_symbol]
             prev_put_curve: pg.PlotCurveItem = self.prev_put_curves[chain_symbol]
             p_line = self.eris_p_strike_lines[chain_symbol]
@@ -612,7 +616,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 put_mid_curve.show()
                 put_bid_curve.show()
                 put_ask_curve.show()
-                pricing_curve.show()
+                # pricing_curve.show()
                 prev_call_curve.show()
                 prev_put_curve.show()
                 total_volume_bar.show()
@@ -631,7 +635,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 put_mid_curve.hide()
                 put_bid_curve.hide()
                 put_ask_curve.hide()
-                pricing_curve.hide()
+                # pricing_curve.hide()
                 prev_call_curve.hide()
                 prev_put_curve.hide()
                 p_line.hide()
