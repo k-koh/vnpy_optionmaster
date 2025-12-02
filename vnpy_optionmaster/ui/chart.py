@@ -58,6 +58,10 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
         self.iv_diff_pos_bars: dict[str, pg.BarGraphItem] = {}
         self.iv_diff_neg_bars: dict[str, pg.BarGraphItem] = {}
+        self.iv_diff_pos_text_items: dict[str, list[pg.TextItem]] = {} # Added for IV diff text
+        self.iv_diff_neg_text_items: dict[str, list[pg.TextItem]] = {} # Added for IV diff text
+        self.total_volume_text_items: dict[str, list[pg.TextItem]] = {} # Added for Volume text
+        self.chain_colors: dict[str, tuple] = {} # Added to store color for each chain
 
         self.colors: list = [
             (255, 0, 0),
@@ -157,12 +161,14 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.timer_trigger = 0
 
         self.update_curve_data()
+        self.update_curve_visible() # Ensure visibility is updated for newly created items
 
     def add_impv_curve(self, chain_symbol: str) -> None:
         """"""
         symbol_size: int = 14
         symbol: str = chain_symbol.split(".")[0]
         color: tuple = self.colors.pop(0)
+        self.chain_colors[chain_symbol] = color # Store the color for this chain
         pen: QtGui.QPen = pg.mkPen(color, width=2)
         pen_dot: QtGui.QPen = pg.mkPen(color, style=QtCore.Qt.DotLine)
         pen_prev_day: QtGui.QPen = pg.mkPen(color, style=QtCore.Qt.DashLine)
@@ -286,12 +292,30 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.iv_diff_chart.addItem(self.iv_diff_pos_bars[chain_symbol])
         self.iv_diff_chart.addItem(self.iv_diff_neg_bars[chain_symbol])
 
+        self.iv_diff_pos_text_items[chain_symbol] = [] # Initialize list for text items
+        self.iv_diff_neg_text_items[chain_symbol] = []
+        self.total_volume_text_items[chain_symbol] = []
+
     def update_curve_data(self) -> None:
         """"""
         portfolio: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
         prev_day_data: PreviousDayOptionData = self.option_engine.prev_day_option
 
         for chain in portfolio.chains.values():
+            # Clear previous text items for IV diff chart
+            for text_item in self.iv_diff_pos_text_items[chain.chain_symbol]:
+                self.iv_diff_chart.removeItem(text_item)
+            self.iv_diff_pos_text_items[chain.chain_symbol].clear()
+
+            for text_item in self.iv_diff_neg_text_items[chain.chain_symbol]:
+                self.iv_diff_chart.removeItem(text_item)
+            self.iv_diff_neg_text_items[chain.chain_symbol].clear()
+
+            # Clear previous text items for Volume chart
+            for text_item in self.total_volume_text_items[chain.chain_symbol]:
+                self.volume_chart.removeItem(text_item)
+            self.total_volume_text_items[chain.chain_symbol].clear()
+
             # Get call data
             call_mid_impv: list = []
             call_bid_impv: list = []
@@ -477,6 +501,12 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             else:
                 self.atm_strike_lines[chain.chain_symbol].hide()
 
+            # Calculate strike_step
+            strike_step = 0
+            if len(all_strikes) > 1:
+                all_strikes.sort() # Ensure sorted to correctly calculate step
+                strike_step = all_strikes[1] - all_strikes[0]
+
             # Update volume bars
             volume_strikes = sorted(list(set(call_strikes + put_strikes)))
             call_volume_map = {s: v for s, v in zip(call_strikes, call_volumes)}
@@ -492,19 +522,69 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             sorted_volume_strikes = [item[0] for item in volume_data]
             sorted_total_volumes = [item[1] for item in volume_data]
 
-            strike_step = 0
-            if len(volume_strikes) > 1:
-                strike_step = volume_strikes[1] - volume_strikes[0]
-
             bar_width = strike_step * 0.5 if strike_step else 100
 
             self.total_volume_bars[chain.chain_symbol].setOpts(
                 x=sorted_volume_strikes, height=sorted_total_volumes, width=bar_width
             )
 
+            # Add text labels for Volume bars
+            chain_color = self.chain_colors[chain.chain_symbol]
+            font = QtGui.QFont()
+            font.setPointSize(8)
+
+            # Calculate dynamic offset based on the maximum volume
+            if sorted_total_volumes:
+                max_volume = max(sorted_total_volumes)
+                # Use 10% of the max volume as offset, with a minimum of 10
+                volume_text_offset = max(max_volume * 0.1, 20)
+            else:
+                volume_text_offset = 20 # Default offset
+
+            for strike, volume in zip(sorted_volume_strikes, sorted_total_volumes):
+                if volume == 0:
+                    continue
+                text_item = pg.TextItem(
+                    text=f"{volume:.0f}",
+                    color=chain_color,
+                    anchor=(0.5, 0)
+                )
+                text_item.setFont(font)
+                text_item.setPos(strike, volume + volume_text_offset) # Position with dynamic offset
+                self.volume_chart.addItem(text_item)
+                self.total_volume_text_items[chain.chain_symbol].append(text_item)
+
             bar_width_diff = bar_width
             self.iv_diff_pos_bars[chain.chain_symbol].setOpts(x=pos_strikes, height=pos_heights, width=bar_width_diff)
             self.iv_diff_neg_bars[chain.chain_symbol].setOpts(x=neg_strikes, height=neg_heights, width=bar_width_diff)
+
+            # Add text labels for IV diff bars
+            chain_color = self.chain_colors[chain.chain_symbol]
+            font = QtGui.QFont()
+            font.setPointSize(8) # Smaller font size for better fit
+            IV_TEXT_OFFSET = 0.5 # Offset for text above/below the bar
+
+            for strike, height in zip(pos_strikes, pos_heights):
+                text_item = pg.TextItem(
+                    text=f"{height:.2f}%",
+                    color=chain_color,
+                    anchor=(0.5, 0) # Center above the bar
+                )
+                text_item.setFont(font)
+                text_item.setPos(strike, height + IV_TEXT_OFFSET)
+                self.iv_diff_chart.addItem(text_item)
+                self.iv_diff_pos_text_items[chain.chain_symbol].append(text_item)
+
+            for strike, height in zip(neg_strikes, neg_heights):
+                text_item = pg.TextItem(
+                    text=f"{height:.2f}%",
+                    color=chain_color,
+                    anchor=(0.5, 1) # Center below the bar
+                )
+                text_item.setFont(font)
+                text_item.setPos(strike, height - IV_TEXT_OFFSET)
+                self.iv_diff_chart.addItem(text_item)
+                self.iv_diff_neg_text_items[chain.chain_symbol].append(text_item)
 
     def update_curve_visible(self) -> None:
         """"""
@@ -541,6 +621,12 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 total_volume_bar.show()
                 iv_diff_pos_bar.show()
                 iv_diff_neg_bar.show()
+                for text_item in self.iv_diff_pos_text_items[chain_symbol]:
+                    text_item.show()
+                for text_item in self.iv_diff_neg_text_items[chain_symbol]:
+                    text_item.show()
+                for text_item in self.total_volume_text_items[chain_symbol]:
+                    text_item.show()
             else:
                 call_mid_curve.hide()
                 call_bid_curve.hide()
@@ -557,6 +643,12 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 total_volume_bar.hide()
                 iv_diff_pos_bar.hide()
                 iv_diff_neg_bar.hide()
+                for text_item in self.iv_diff_pos_text_items[chain_symbol]:
+                    text_item.hide()
+                for text_item in self.iv_diff_neg_text_items[chain_symbol]:
+                    text_item.hide()
+                for text_item in self.total_volume_text_items[chain_symbol]:
+                    text_item.hide()
 
 
 class ScenarioAnalysisChart(QtWidgets.QWidget):
