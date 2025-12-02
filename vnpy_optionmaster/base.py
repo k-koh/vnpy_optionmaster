@@ -6,7 +6,7 @@ from functools import lru_cache
 from vnpy.event import EventEngine
 from vnpy.event.engine import Event
 from vnpy.trader.event import EVENT_TICK, EVENT_ATM
-from vnpy.trader.object import ContractData, TickData, TradeData, BarData
+from vnpy.trader.object import ContractData, TickData, TradeData, BarData, AtmData
 from vnpy.trader.constant import Exchange, OptionType, Direction, Offset, OptionPrevIvType
 from vnpy.trader.converter import PositionHolding
 from vnpy.trader.utility import extract_vt_symbol
@@ -471,9 +471,9 @@ class ChainData:
         for option in self.options.values():
             option.set_portfolio(portfolio)
 
-    def put_atm_event(self, atm_index: str) -> None:
+    def put_atm_event(self, atm: AtmData) -> None:
         """"""
-        event: Event = Event(EVENT_ATM, atm_index)
+        event: Event = Event(EVENT_ATM, atm)
         self.event_engine.put(event)
 
     def calculate_atm_price(self) -> None:
@@ -509,7 +509,9 @@ class ChainData:
         self.atm_index = atm_index
         if self.pre_atm_index != self.atm_index:
             self.pre_atm_index = self.atm_index
-            self.put_atm_event(self.atm_index)
+            if atm_index:
+                atm: AtmData = AtmData(chain_symbol=self.chain_symbol, atm_strike=int(float(self.atm_index)))
+                self.put_atm_event(atm)
 
         self.calculate_atm_impv()
 
