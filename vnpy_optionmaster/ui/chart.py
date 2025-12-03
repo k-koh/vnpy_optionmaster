@@ -143,7 +143,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         iv_diff_legend.setOffset((1, 1)) # Add padding (10 right, 10 down)
         self.iv_diff_chart.setMenuEnabled(False)
         self.iv_diff_chart.setMouseEnabled(False, False)
-        self.iv_diff_chart.setMaximumHeight(200)
+        self.iv_diff_chart.setMaximumHeight(400)
 
         for chain_symbol in chain_symbols:
             self.add_impv_curve(chain_symbol)
@@ -571,7 +571,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             if sorted_total_volumes:
                 max_volume = max(sorted_total_volumes)
                 # Use 10% of the max volume as offset, with a minimum of 10
-                volume_text_offset = max(max_volume * 0.1, 20)
+                volume_text_offset = max(max_volume * 0.3, 50)
             else:
                 volume_text_offset = 20 # Default offset
 
