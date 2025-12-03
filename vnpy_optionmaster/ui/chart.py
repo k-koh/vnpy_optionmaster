@@ -346,9 +346,14 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             calls.sort(key=lambda x: x.strike_price)
 
             for call in calls:
-                call_mid_impv.append(call.mid_impv * 100)
-                call_bid_impv.append(call.bid_impv * 100)
-                call_ask_impv.append(call.ask_impv * 100)
+                mid_impv = call.mid_impv * 100
+                bid_impv = call.bid_impv * 100
+                ask_impv = call.ask_impv * 100
+
+                call_mid_impv.append(mid_impv if mid_impv else np.nan)
+                call_bid_impv.append(bid_impv if bid_impv else np.nan)
+                call_ask_impv.append(ask_impv if ask_impv else np.nan)
+
                 # pricing_impv.append(call.pricing_impv * 100)
                 call_strikes.append(call.strike_price)
 
@@ -368,9 +373,13 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             puts.sort(key=lambda x: x.strike_price)
 
             for put in puts:
-                put_mid_impv.append(put.mid_impv * 100)
-                put_bid_impv.append(put.bid_impv * 100)
-                put_ask_impv.append(put.ask_impv * 100)
+                mid_impv = put.mid_impv * 100
+                bid_impv = put.bid_impv * 100
+                ask_impv = put.ask_impv * 100
+
+                put_mid_impv.append(mid_impv if mid_impv else np.nan)
+                put_bid_impv.append(bid_impv if bid_impv else np.nan)
+                put_ask_impv.append(ask_impv if ask_impv else np.nan)
                 put_strikes.append(put.strike_price)
 
                 if put.tick:
