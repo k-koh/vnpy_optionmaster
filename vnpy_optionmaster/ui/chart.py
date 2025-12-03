@@ -469,30 +469,19 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                     neg_heights.append(height)
 
             # Plot curves
-            self.call_mid_curves[chain.chain_symbol].setData(
-                y=call_mid_impv,
-                x=call_strikes
-            )
-            self.call_bid_curves[chain.chain_symbol].setData(
-                y=call_bid_impv,
-                x=call_strikes
-            )
-            self.call_ask_curves[chain.chain_symbol].setData(
-                y=call_ask_impv,
-                x=call_strikes
-            )
-            self.put_mid_curves[chain.chain_symbol].setData(
-                y=put_mid_impv,
-                x=put_strikes
-            )
-            self.put_bid_curves[chain.chain_symbol].setData(
-                y=put_bid_impv,
-                x=put_strikes
-            )
-            self.put_ask_curves[chain.chain_symbol].setData(
-                y=put_ask_impv,
-                x=put_strikes
-            )
+            def set_curve_data(curve, x_data, y_data):
+                if not y_data or np.all(np.isnan(np.array(y_data, dtype=float))):
+                    curve.setData(x=[], y=[])
+                else:
+                    curve.setData(x=x_data, y=y_data)
+
+            set_curve_data(self.call_mid_curves[chain.chain_symbol], call_strikes, call_mid_impv)
+            set_curve_data(self.call_bid_curves[chain.chain_symbol], call_strikes, call_bid_impv)
+            set_curve_data(self.call_ask_curves[chain.chain_symbol], call_strikes, call_ask_impv)
+            set_curve_data(self.put_mid_curves[chain.chain_symbol], put_strikes, put_mid_impv)
+            set_curve_data(self.put_bid_curves[chain.chain_symbol], put_strikes, put_bid_impv)
+            set_curve_data(self.put_ask_curves[chain.chain_symbol], put_strikes, put_ask_impv)
+
             # self.pricing_curves[chain.chain_symbol].setData(
             #     y=pricing_impv,
             #     x=call_strikes
