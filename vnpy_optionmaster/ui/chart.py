@@ -51,6 +51,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.eris_p_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.eris_c_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.atm_strike_lines: dict[str, pg.InfiniteLine] = {}
+        self.underlying_price_lines: dict[str, pg.InfiniteLine] = {}
         self.total_volume_bars: dict[str, pg.BarGraphItem] = {}
 
         self.prev_call_curves: dict[str, pg.PlotCurveItem] = {}
@@ -62,6 +63,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.iv_diff_neg_text_items: dict[str, list[pg.TextItem]] = {} # Added for IV diff text
         self.total_volume_text_items: dict[str, list[pg.TextItem]] = {} # Added for Volume text
         self.chain_colors: dict[str, tuple] = {} # Added to store color for each chain
+
+        self.underlying_line_positions: list[float] = [0.4, 0.3, 0.6, 0.2, 0.7, 0.1, 0.8, 0.9, 0.15]
 
         self.colors: list = [
             (255, 0, 0),
@@ -239,6 +242,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         p_line_pen = pg.mkPen(color=color, width=2, style=QtCore.Qt.DotLine)
         c_line_pen = pg.mkPen(color=color, width=2, style=QtCore.Qt.DotLine)
         atm_line_pen = pg.mkPen(color=(255, 174, 201), width=2, style=QtCore.Qt.DotLine)
+        underlying_line_pen = pg.mkPen(color=(0, 255, 255), width=2, style=QtCore.Qt.DotLine)
+        position = self.underlying_line_positions.pop(0)
 
         self.eris_p_strike_lines[chain_symbol] = pg.InfiniteLine(
             angle=90,
@@ -261,14 +266,23 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             label=symbol + " ATM",
             labelOpts={'position': 0.5, 'color': (255, 174, 201), 'fill': (200,200,200,50), 'movable': False}
         )
+        self.underlying_price_lines[chain_symbol] = pg.InfiniteLine(
+            angle=90,
+            movable=False,
+            pen=underlying_line_pen,
+            label=symbol + " 先物",
+            labelOpts={'position': position, 'color': (0, 255, 255), 'fill': (200, 200, 200, 50), 'movable': False}
+        )
 
         self.impv_chart.addItem(self.eris_p_strike_lines[chain_symbol])
         self.impv_chart.addItem(self.eris_c_strike_lines[chain_symbol])
         self.impv_chart.addItem(self.atm_strike_lines[chain_symbol])
+        self.impv_chart.addItem(self.underlying_price_lines[chain_symbol])
 
         self.eris_p_strike_lines[chain_symbol].hide()
         self.eris_c_strike_lines[chain_symbol].hide()
         self.atm_strike_lines[chain_symbol].hide()
+        self.underlying_price_lines[chain_symbol].hide()
 
         self.total_volume_bars[chain_symbol] = pg.BarGraphItem(
             x=[],
@@ -505,6 +519,22 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             else:
                 self.atm_strike_lines[chain.chain_symbol].hide()
 
+            # Update underlying price line
+            underlying_price = None
+            if calls:
+                underlying_price = calls[0].underlying.mid_price
+            elif puts:
+                underlying_price = puts[0].underlying.mid_price
+
+            if underlying_price:
+                line = self.underlying_price_lines[chain.chain_symbol]
+                line.setPos(underlying_price)
+                symbol = chain.chain_symbol.split(".")[0]
+                line.label.setText(f"{symbol} 先物: {underlying_price:.0f}")
+                line.show()
+            else:
+                self.underlying_price_lines[chain.chain_symbol].hide()
+
             # Calculate strike_step
             strike_step = 0
             if len(all_strikes) > 1:
@@ -605,6 +635,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             p_line = self.eris_p_strike_lines[chain_symbol]
             c_line = self.eris_c_strike_lines[chain_symbol]
             atm_line = self.atm_strike_lines[chain_symbol]
+            underlying_line = self.underlying_price_lines[chain_symbol]
             total_volume_bar = self.total_volume_bars[chain_symbol]
             iv_diff_pos_bar = self.iv_diff_pos_bars[chain_symbol]
             iv_diff_neg_bar = self.iv_diff_neg_bars[chain_symbol]
@@ -641,6 +672,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 p_line.hide()
                 c_line.hide()
                 atm_line.hide()
+                underlying_line.hide()
                 total_volume_bar.hide()
                 iv_diff_pos_bar.hide()
                 iv_diff_neg_bar.hide()
