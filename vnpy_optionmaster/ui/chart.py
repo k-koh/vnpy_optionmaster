@@ -554,7 +554,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             sorted_volume_strikes = [item[0] for item in volume_data]
             sorted_total_volumes = [item[1] for item in volume_data]
 
-            bar_width = strike_step * 0.5 if strike_step else 100
+            bar_width = strike_step * 0.25 if strike_step else 100
 
             self.total_volume_bars[chain.chain_symbol].setOpts(
                 x=sorted_volume_strikes, height=sorted_total_volumes, width=bar_width
