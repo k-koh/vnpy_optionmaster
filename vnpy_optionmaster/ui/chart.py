@@ -397,11 +397,11 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
                 for strike in call_strikes:
                     iv = prev_call_data.get(strike, 0)
-                    prev_call_ivs.append(iv * 100)
+                    prev_call_ivs.append(iv * 100 if iv else np.nan)
 
                 for strike in put_strikes:
                     iv = prev_put_data.get(strike, 0)
-                    prev_put_ivs.append(iv * 100)
+                    prev_put_ivs.append(iv * 100 if iv else np.nan)
 
             # Calculate IV difference
             iv_diff_strikes = []
