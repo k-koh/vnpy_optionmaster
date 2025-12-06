@@ -63,6 +63,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.iv_diff_neg_text_items: dict[str, list[pg.TextItem]] = {} # Added for IV diff text
         self.total_volume_text_items: dict[str, list[pg.TextItem]] = {} # Added for Volume text
         self.chain_colors: dict[str, tuple] = {} # Added to store color for each chain
+        self.max_volume: float = 0.0
 
         self.underlying_line_positions: list[float] = [0.4, 0.3, 0.6, 0.2, 0.7, 0.1, 0.8, 0.9, 0.15]
 
@@ -319,7 +320,12 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         portfolio: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
         prev_day_data: PreviousDayOptionData = self.option_engine.prev_day_option
 
+        max_iv_diff_pos: float = 0.0
+        min_iv_diff_neg: float = 0.0
+        text_offset_scale: float = 6.0/15.0
+
         for chain in portfolio.chains.values():
+            text_offset_scale = text_offset_scale - 1.0/15.0
             # Clear previous text items for IV diff chart
             for text_item in self.iv_diff_pos_text_items[chain.chain_symbol]:
                 self.iv_diff_chart.removeItem(text_item)
@@ -568,8 +574,9 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             # Calculate dynamic offset based on the maximum volume
             if sorted_total_volumes:
                 max_volume = max(sorted_total_volumes)
+                self.max_volume = max(self.max_volume, max_volume)
                 # Use 10% of the max volume as offset, with a minimum of 10
-                volume_text_offset = max(max_volume * 0.3, 50)
+                volume_text_offset = self.max_volume * text_offset_scale
             else:
                 volume_text_offset = 20 # Default offset
 
@@ -597,24 +604,30 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             IV_TEXT_OFFSET = 0.5 # Offset for text above/below the bar
 
             for strike, height in zip(pos_strikes, pos_heights):
+                max_height = max(pos_heights)
+                max_iv_diff_pos = max(max_iv_diff_pos, max_height)
+                iv_text_offset = max_iv_diff_pos * text_offset_scale
                 text_item = pg.TextItem(
                     text=f"{height:.2f}%",
                     color=chain_color,
                     anchor=(0.5, 0) # Center above the bar
                 )
                 text_item.setFont(font)
-                text_item.setPos(strike, height + IV_TEXT_OFFSET)
+                text_item.setPos(strike, height + iv_text_offset)
                 self.iv_diff_chart.addItem(text_item)
                 self.iv_diff_pos_text_items[chain.chain_symbol].append(text_item)
 
             for strike, height in zip(neg_strikes, neg_heights):
+                min_height = min(neg_heights)
+                min_iv_diff_neg = min(min_iv_diff_neg, min_height)
+                iv_text_offset = abs(min_iv_diff_neg) * text_offset_scale
                 text_item = pg.TextItem(
                     text=f"{height:.2f}%",
                     color=chain_color,
                     anchor=(0.5, 1) # Center below the bar
                 )
                 text_item.setFont(font)
-                text_item.setPos(strike, height - IV_TEXT_OFFSET)
+                text_item.setPos(strike, height - iv_text_offset)
                 self.iv_diff_chart.addItem(text_item)
                 self.iv_diff_neg_text_items[chain.chain_symbol].append(text_item)
 
