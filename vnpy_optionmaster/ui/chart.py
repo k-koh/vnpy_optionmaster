@@ -84,7 +84,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
     def init_ui(self) -> None:
         """"""
-        self.setWindowTitle("波动率曲线")
+        self.setWindowTitle("インプライド・ボラティリティ・カーブ（IV）")
 
         # Create checkbox for each chain
         hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
@@ -110,20 +110,20 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         pg.setConfigOptions(antialias=True)
 
         graphics_window: pg.GraphicsLayoutWidget = pg.GraphicsLayoutWidget()
-        self.impv_chart = graphics_window.addPlot(row=0, col=0, title="隐含波动率曲线")
+        self.impv_chart = graphics_window.addPlot(row=0, col=0, title="インプライド・ボラティリティ・カーブ")
         self.impv_chart.showGrid(x=True, y=True)
-        self.impv_chart.setLabel("left", "波动率")
-        self.impv_chart.setLabel("bottom", "行权价")
+        self.impv_chart.setLabel("left", "インプライド・ボラティリティ")
+        self.impv_chart.setLabel("bottom", "権利行使価格")
         self.impv_chart.addLegend()
         self.impv_chart.setMenuEnabled(False)
         self.impv_chart.setMouseEnabled(False, False)
 
         graphics_window.nextRow()
 
-        self.volume_chart = graphics_window.addPlot(row=1, col=0, title="成交量")
+        self.volume_chart = graphics_window.addPlot(row=1, col=0, title="出来高")
         self.volume_chart.showGrid(x=True, y=True)
-        self.volume_chart.setLabel("left", "成交量")
-        self.volume_chart.setLabel("bottom", "行权价")
+        self.volume_chart.setLabel("left", "出来高")
+        self.volume_chart.setLabel("bottom", "権利行使価格")
         self.volume_chart.setXLink(self.impv_chart)
         volume_legend = self.volume_chart.addLegend(colCount=2)
         volume_legend.anchor((0, 1), (0, 1)) # Anchor top-left of legend to top-left of plot
@@ -136,8 +136,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
         self.iv_diff_chart = graphics_window.addPlot(row=2, col=0, title="前日比IV")
         self.iv_diff_chart.showGrid(x=True, y=True)
-        self.iv_diff_chart.setLabel("left", "IV差值")
-        self.iv_diff_chart.setLabel("bottom", "行权价")
+        self.iv_diff_chart.setLabel("left", "IV前日比")
+        self.iv_diff_chart.setLabel("bottom", "権利行使価格")
         self.iv_diff_chart.setXLink(self.impv_chart)
         iv_diff_legend = self.iv_diff_chart.addLegend(colCount=4) # Changed colCount from 4 to 2 for consistency
         iv_diff_legend.anchor((0, 1), (0, 1)) # Anchor top-left of legend to top-left of plot
@@ -183,12 +183,12 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
         self.call_mid_curves[chain_symbol] = self.impv_chart.plot(
             symbolSize=0,
-            name=symbol + " 看涨",
+            name=symbol + " コール",
             pen=pen,
         )
         self.put_mid_curves[chain_symbol] = self.impv_chart.plot(
             symbolSize=0,
-            name=symbol + " 看跌",
+            name=symbol + " プット",
             pen=pen,
         )
 
@@ -196,28 +196,28 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             pen=None,
             symbolSize=symbol_size,
             symbol="t1",
-            name=symbol + " 看涨买",
+            name=symbol + " コール買",
             symbolBrush=color
         )
         self.call_ask_curves[chain_symbol] = self.impv_chart.plot(
             pen=None,
             symbolSize=symbol_size,
             symbol="t1",
-            name=symbol + " 看涨卖",
+            name=symbol + " コール売",
             symbolBrush=color
         )
         self.put_bid_curves[chain_symbol] = self.impv_chart.plot(
             pen=None,
             symbolSize=symbol_size,
             symbol="t",
-            name=symbol + " 看跌买",
+            name=symbol + " プット買",
             symbolBrush=color
         )
         self.put_ask_curves[chain_symbol] = self.impv_chart.plot(
             pen=None,
             symbolSize=symbol_size,
             symbol="t",
-            name=symbol + " 看跌卖",
+            name=symbol + " プット売",
             symbolBrush=color
         )
 
@@ -231,12 +231,12 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
         self.prev_call_curves[chain_symbol] = self.impv_chart.plot(
             symbolSize=0,
-            name=symbol + " 前日看涨",
+            name=symbol + " 前日コール",
             pen=pen_prev_day,
         )
         self.prev_put_curves[chain_symbol] = self.impv_chart.plot(
             symbolSize=0,
-            name=symbol + " 前日看跌",
+            name=symbol + " 前日プット",
             pen=pen_prev_day,
         )
 
@@ -250,14 +250,14 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             angle=90,
             movable=False,
             pen=p_line_pen,
-            label=symbol + " 看跌ERIS",
+            label=symbol + " プットOTM",
             labelOpts={'position': 0.95, 'color': color, 'fill': (200,200,200,50), 'movable': False}
         )
         self.eris_c_strike_lines[chain_symbol] = pg.InfiniteLine(
             angle=90,
             movable=False,
             pen=c_line_pen,
-            label=symbol + " 看涨ERIS",
+            label=symbol + " コールOTM",
             labelOpts={'position': 0.05, 'color': color, 'fill': (200,200,200,50), 'movable': False}
         )
         self.atm_strike_lines[chain_symbol] = pg.InfiniteLine(
