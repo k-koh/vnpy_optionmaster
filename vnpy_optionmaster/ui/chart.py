@@ -63,7 +63,6 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.iv_diff_neg_text_items: dict[str, list[pg.TextItem]] = {} # Added for IV diff text
         self.total_volume_text_items: dict[str, list[pg.TextItem]] = {} # Added for Volume text
         self.chain_colors: dict[str, tuple] = {} # Added to store color for each chain
-        self.max_volume: float = 0.0
 
         self.underlying_line_positions: list[float] = [0.4, 0.3, 0.6, 0.2, 0.7, 0.1, 0.8, 0.9, 0.15]
 
@@ -320,8 +319,93 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         portfolio: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
         prev_day_data: PreviousDayOptionData = self.option_engine.prev_day_option
 
+        max_volumes: float = 0.0
         max_iv_diff_pos: float = 0.0
         min_iv_diff_neg: float = 0.0
+
+        # First, calculate max values from selected chains for text label offsetting
+        for chain in portfolio.chains.values():
+            if not self.chain_checks[chain.chain_symbol].isChecked():
+                continue
+
+            calls: list[OptionData] = list(chain.calls.values())
+            calls.sort(key=lambda x: x.strike_price)
+            call_strikes = [c.strike_price for c in calls]
+            call_volumes = [c.tick.volume if c.tick else 0 for c in calls]
+            call_mid_impv = [c.mid_impv * 100 for c in calls]
+
+            puts: list[OptionData] = list(chain.puts.values())
+            puts.sort(key=lambda x: x.strike_price)
+            put_strikes = [p.strike_price for p in puts]
+            put_volumes = [p.tick.volume if p.tick else 0 for p in puts]
+            put_mid_impv = [p.mid_impv * 100 for p in puts]
+
+            all_strikes = sorted(list(set(call_strikes + put_strikes)))
+
+            # Calculate total volumes
+            call_volume_map = {s: v for s, v in zip(call_strikes, call_volumes)}
+            put_volume_map = {s: v for s, v in zip(put_strikes, put_volumes)}
+            total_volumes = [call_volume_map.get(s, 0) + put_volume_map.get(s, 0) for s in all_strikes]
+            if total_volumes:
+                max_volumes = max(max_volumes, max(total_volumes))
+
+            # Calculate IV difference
+            prev_call_ivs: list = []
+            prev_put_ivs: list = []
+            if prev_day_data:
+                dt: datetime = datetime.now(DB_TZ)
+                prev_call_data, prev_put_data = prev_day_data.get_prev_day_iv_curve(dt, chain)
+                prev_call_ivs = [prev_call_data.get(s, 0) * 100 for s in call_strikes]
+                prev_put_ivs = [prev_put_data.get(s, 0) * 100 for s in put_strikes]
+
+            prev_call_iv_map = {s: v for s, v in zip(call_strikes, prev_call_ivs)}
+            prev_put_iv_map = {s: v for s, v in zip(put_strikes, prev_put_ivs)}
+            call_mid_impv_map = {s: v for s, v in zip(call_strikes, call_mid_impv)}
+            put_mid_impv_map = {s: v for s, v in zip(put_strikes, put_mid_impv)}
+
+            iv_diff_heights = []
+            for strike in all_strikes:
+                call_iv = call_mid_impv_map.get(strike, 0)
+                put_iv = put_mid_impv_map.get(strike, 0)
+                prev_call_iv = prev_call_iv_map.get(strike, 0)
+                prev_put_iv = prev_put_iv_map.get(strike, 0)
+                has_call = call_iv > 0
+                has_put = put_iv > 0
+                current_iv = 0
+                prev_iv = 0
+
+                if has_call and has_put:
+                    current_iv = (call_iv + put_iv) / 2.0
+                    p_count = 0
+                    p_sum = 0
+                    if prev_call_iv > 0:
+                        p_sum += prev_call_iv
+                        p_count += 1
+                    if prev_put_iv > 0:
+                        p_sum += prev_put_iv
+                        p_count += 1
+                    if p_count > 0:
+                        prev_iv = p_sum / p_count
+                elif has_call:
+                    current_iv = call_iv
+                    prev_iv = prev_call_iv
+                elif has_put:
+                    current_iv = put_iv
+                    prev_iv = prev_put_iv
+                else:
+                    continue
+
+                if prev_iv != 0:
+                    iv_diff_heights.append(current_iv - prev_iv)
+
+            pos_heights = [h for h in iv_diff_heights if h >= 0]
+            neg_heights = [h for h in iv_diff_heights if h < 0]
+
+            if pos_heights:
+                max_iv_diff_pos = max(max_iv_diff_pos, max(pos_heights))
+            if neg_heights:
+                min_iv_diff_neg = min(min_iv_diff_neg, min(neg_heights))
+
         text_offset_scale: float = 6.0/15.0
 
         for chain in portfolio.chains.values():
@@ -494,14 +578,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             # )
 
             if prev_call_ivs and prev_put_ivs:
-                self.prev_call_curves[chain.chain_symbol].setData(
-                    y=prev_call_ivs,
-                    x=call_strikes
-                )
-                self.prev_put_curves[chain.chain_symbol].setData(
-                    y=prev_put_ivs,
-                    x=put_strikes
-                )
+                set_curve_data(self.prev_call_curves[chain.chain_symbol], call_strikes, prev_call_ivs)
+                set_curve_data(self.prev_put_curves[chain.chain_symbol], put_strikes, prev_put_ivs)
 
             # Update ERIS strike lines
             if chain.eris_p_strike is not None:
@@ -572,11 +650,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             font.setPointSize(8)
 
             # Calculate dynamic offset based on the maximum volume
-            if sorted_total_volumes:
-                max_volume = max(sorted_total_volumes)
-                self.max_volume = max(self.max_volume, max_volume)
-                # Use 10% of the max volume as offset, with a minimum of 10
-                volume_text_offset = self.max_volume * text_offset_scale
+            if max_volumes > 0:
+                volume_text_offset = max_volumes * text_offset_scale
             else:
                 volume_text_offset = 20 # Default offset
 
@@ -601,35 +676,55 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             chain_color = self.chain_colors[chain.chain_symbol]
             font = QtGui.QFont()
             font.setPointSize(8) # Smaller font size for better fit
-            IV_TEXT_OFFSET = 0.5 # Offset for text above/below the bar
+
+            if max_iv_diff_pos > 0:
+                iv_text_offset_pos = max_iv_diff_pos * text_offset_scale
+            else:
+                iv_text_offset_pos = 0.5
 
             for strike, height in zip(pos_strikes, pos_heights):
-                max_height = max(pos_heights)
-                max_iv_diff_pos = max(max_iv_diff_pos, max_height)
-                iv_text_offset = max_iv_diff_pos * text_offset_scale
                 text_item = pg.TextItem(
                     text=f"{height:.2f}%",
                     color=chain_color,
                     anchor=(0.5, 0) # Center above the bar
                 )
                 text_item.setFont(font)
-                text_item.setPos(strike, height + iv_text_offset)
+                text_item.setPos(strike, height + iv_text_offset_pos)
                 self.iv_diff_chart.addItem(text_item)
                 self.iv_diff_pos_text_items[chain.chain_symbol].append(text_item)
 
+            if min_iv_diff_neg < 0:
+                iv_text_offset_neg = abs(min_iv_diff_neg) * text_offset_scale
+            else:
+                iv_text_offset_neg = 0.5
+
             for strike, height in zip(neg_strikes, neg_heights):
-                min_height = min(neg_heights)
-                min_iv_diff_neg = min(min_iv_diff_neg, min_height)
-                iv_text_offset = abs(min_iv_diff_neg) * text_offset_scale
                 text_item = pg.TextItem(
                     text=f"{height:.2f}%",
                     color=chain_color,
                     anchor=(0.5, 1) # Center below the bar
                 )
                 text_item.setFont(font)
-                text_item.setPos(strike, height - iv_text_offset)
+                text_item.setPos(strike, height - iv_text_offset_neg)
                 self.iv_diff_chart.addItem(text_item)
                 self.iv_diff_neg_text_items[chain.chain_symbol].append(text_item)
+
+        # Set Y-range for volume chart to provide padding for text labels
+        y_max_volume = max_volumes * 1.5 if max_volumes > 0 else 10
+        self.volume_chart.setYRange(0, y_max_volume)
+
+        # Set Y-range for IV diff chart to provide padding for text labels
+        padding_pos = max_iv_diff_pos * 0.5 if max_iv_diff_pos > 0 else 0.5
+        padding_neg = abs(min_iv_diff_neg * 0.5) if min_iv_diff_neg < 0 else 0.5
+
+        y_max_iv = max_iv_diff_pos + padding_pos
+        y_min_iv = min_iv_diff_neg - padding_neg
+
+        if y_min_iv >= y_max_iv:
+            y_min_iv = -5
+            y_max_iv = 5
+
+        self.iv_diff_chart.setYRange(y_min_iv, y_max_iv)
 
     def update_curve_visible(self) -> None:
         """"""
