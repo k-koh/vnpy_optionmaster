@@ -487,8 +487,8 @@ class ChainData:
             if not put:
                 continue
 
-            if call.strike_price % 1000 != 0:
-                continue
+            # if call.strike_price % 1000 != 0:
+            #     continue
 
             call_tick: TickData = call.tick
             if not call_tick or not call_tick.bid_price_1 or not call_tick.ask_price_1:
@@ -548,8 +548,8 @@ class ChainData:
             if not call.theo_delta or not call.size:
                 continue
 
-            if call.strike_price % 1000 != 0:
-                continue
+            # if call.strike_price % 1000 != 0:
+            #     continue
 
             option_delta = call.theo_delta / call.size
             delta_diff = abs(option_delta - 0.1)
@@ -573,8 +573,8 @@ class ChainData:
             if not put.theo_delta or not put.size:
                 continue
 
-            if put.strike_price % 1000 != 0:
-                continue
+            # if put.strike_price % 1000 != 0:
+            #     continue
 
             option_delta = put.theo_delta / put.size
             delta_diff = abs(option_delta - (-0.1))
