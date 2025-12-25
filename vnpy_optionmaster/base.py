@@ -346,6 +346,10 @@ class ChainData:
         self.eris_p_strike: int | None = None
         self.eris_c_iv: float | None = None
         self.eris_c_strike: int | None = None
+        self.delta022_c_iv: float | None = None      # Call Δ0.22 iv
+        self.delta022_c_strike: float | None = None  # Call Δ0.22 strike
+        self.delta012_p_iv: float | None = None      # Put Δ0.12 iv
+        self.delta012_p_strike: float | None = None  # Put Δ0.12 strike
 
     def add_option(self, option: OptionData) -> None:
         """"""
@@ -487,8 +491,8 @@ class ChainData:
             if not put:
                 continue
 
-            # if call.strike_price % 1000 != 0:
-            #     continue
+            if call.strike_price % 1000 != 0:
+                continue
 
             call_tick: TickData = call.tick
             if not call_tick or not call_tick.bid_price_1 or not call_tick.ask_price_1:
@@ -548,8 +552,8 @@ class ChainData:
             if not call.theo_delta or not call.size:
                 continue
 
-            # if call.strike_price % 1000 != 0:
-            #     continue
+            if call.strike_price % 1000 != 0:
+                continue
 
             option_delta = call.theo_delta / call.size
             delta_diff = abs(option_delta - 0.1)
@@ -573,8 +577,8 @@ class ChainData:
             if not put.theo_delta or not put.size:
                 continue
 
-            # if put.strike_price % 1000 != 0:
-            #     continue
+            if put.strike_price % 1000 != 0:
+                continue
 
             option_delta = put.theo_delta / put.size
             delta_diff = abs(option_delta - (-0.1))
@@ -589,6 +593,56 @@ class ChainData:
         else:
             self.eris_p_iv = None
             self.eris_p_strike = None
+
+        # Find call with delta closest to +0.22
+        min_call_delta_diff = 100.0
+        delta022_call = None
+
+        for call in self.calls.values():
+            if not call.theo_delta or not call.size:
+                continue
+
+            if call.strike_price % 1000 != 0:
+                continue
+
+            option_delta = call.theo_delta / call.size
+            delta_diff = abs(option_delta - 0.22)
+
+            if delta_diff < min_call_delta_diff:
+                min_call_delta_diff = delta_diff
+                delta022_call = call
+
+        if delta022_call:
+            self.delta022_c_iv = delta022_call.mid_impv
+            self.delta022_c_strike = delta022_call.strike_price
+        else:
+            self.delta022_c_iv = None
+            self.delta022_c_strike = None
+
+        # Find put with delta closest to -0.12
+        min_put_delta_diff = 100.0
+        delta012_put = None
+
+        for put in self.puts.values():
+            if not put.theo_delta or not put.size:
+                continue
+
+            if put.strike_price % 1000 != 0:
+                continue
+
+            option_delta = put.theo_delta / put.size
+            delta_diff = abs(option_delta - (-0.12))
+
+            if delta_diff < min_put_delta_diff:
+                min_put_delta_diff = delta_diff
+                delta012_put = put
+
+        if delta012_put:
+            self.delta012_p_iv = delta012_put.mid_impv
+            self.delta012_p_strike = delta012_put.strike_price
+        else:
+            self.delta012_p_iv = None
+            self.delta012_p_strike = None
 
     def calculate_underlying_adjustment(self) -> None:
         """"""
