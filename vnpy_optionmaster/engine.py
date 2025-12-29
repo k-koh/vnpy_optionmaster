@@ -33,7 +33,7 @@ from .base import (
     EVENT_OPTION_RISK_NOTICE,
     EVENT_OPTION_INSTRUMENT_ADD,
     InstrumentData, PortfolioData, OptionData, UnderlyingData,
-    get_underlying_prefix, PreviousDayOptionData
+    get_underlying_prefix, PreviousDayOptionData, PreviousDayViData
 )
 try:
     from .pricing import black_76_cython as black_76                # type: ignore
@@ -77,10 +77,12 @@ class OptionEngine(BaseEngine):
 
         self.setting: dict = {}
         self.prev_day_option: PreviousDayOptionData = PreviousDayOptionData() # ADDED
+        self.prev_day_vi: PreviousDayViData = PreviousDayViData() # ADDED
 
         self.load_setting()
         self.register_event()
         self.load_prev_day_option_data() # ADDED
+        self.load_prev_day_n225_iv_data() # ADDED
 
     def close(self) -> None:
         """"""
@@ -112,7 +114,7 @@ class OptionEngine(BaseEngine):
         )
 
         if not bars:
-            print("未加载到上一交易日期权数据")
+            print("未加载到上一交易日 期权数据")
             return
 
         for bar in bars:
@@ -124,6 +126,40 @@ class OptionEngine(BaseEngine):
         dt: datetime = datetime.now(DB_TZ)
         prev_day_dt = self.prev_day_option.get_prev_day_datetime(dt)
         print(f"成功加载{len(self.prev_day_option.bars)}条上一交易日期权数据. 结束时间: {prev_day_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    def load_prev_day_n225_iv_data(self):
+        print("开始加载上一交易日 日経平均VI指数")
+
+        now: datetime = datetime.now(DB_TZ)
+        session_end: datetime = now.replace(hour=15, minute=45, second=0, microsecond=0)
+        if now.hour >= 17:
+            session_end = session_end + timedelta(days=1)
+        session_end = session_end - timedelta(days=1)
+        prev_days_start = session_end - timedelta(days=5) # Load 3 days to ensure data availability
+
+        # Assuming MySQL database is configured and available
+        database: BaseDatabase = get_database()
+
+        # Load option data for Interval.DAILY
+        bars = database.load_vi_data(
+            symbol="nk-vin1", # Placeholder, as it's ignored now
+            exchange=Exchange.JPX, # Assuming a specific exchange, adjust as needed
+            interval=Interval.MINUTE,
+            start=prev_days_start,
+            end=session_end
+        )
+
+        if not bars:
+            print("未加载到上一交易日 日経平均VI指数")
+            return
+        for bar in bars:
+            self.prev_day_vi.add_bar(bar)
+        self.prev_day_vi.sort_vi_datetime()
+
+        dt: datetime = datetime.now(DB_TZ)
+        prev_day_dt = self.prev_day_vi.get_prev_day_datetime(dt)
+        print(f"成功加载{len(self.prev_day_vi.vis)}条上一交易日 日経平均VI指数. 结束时间: {prev_day_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+
 
     def load_setting(self) -> None:
         """"""
@@ -451,6 +487,9 @@ class OptionEngine(BaseEngine):
     def get_prev_day_option_iv(self, op_month: str, prev_iv_type: OptionPrevIvType, put_strike: int, call_strike: int,
                                atm_strike: int, dt: datetime) -> tuple[float, float, float]:
         return self.prev_day_option.get_prev_day_option_iv(op_month, prev_iv_type, put_strike, call_strike, atm_strike, dt)
+
+    def get_prev_day_n225_vi(self, dt: datetime) -> float | None:
+        return self.prev_day_vi.get_prev_day_vi(dt)
 
     def set_timer_trigger(self, timer_trigger: int) -> None:
         """"""

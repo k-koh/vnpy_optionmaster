@@ -1070,6 +1070,39 @@ class PreviousDayOptionData:
 
         return call_ivs, put_ivs
 
+# 前日比用のVI Data
+class PreviousDayViData:
+    """"""
+    def __init__(self) -> None:
+        self.vis: dict[datetime, float] = {}
+        self.sorted_dates: list[datetime] = []
+
+    def sort_vi_datetime(self) -> None:
+        """"""
+        self.sorted_dates = sorted(self.vis.keys(), reverse=True)
+
+    def get_prev_day_datetime(self, dt: datetime) -> datetime | None:
+        """"""
+        for i, date in enumerate(self.sorted_dates):
+            if date < dt:
+                return date
+        return None
+
+    def add_bar(self, bar: BarData) -> None:
+        day_datetime = bar.datetime
+        if not day_datetime in self.vis:
+            self.vis[day_datetime] = bar.close_price
+
+    def add_vi(self, dt: datetime, vi: float) -> None:
+        self.vis[dt] = vi
+
+    def get_prev_day_vi(self, dt: datetime) -> float | None:
+        """"""
+        prev_date = self.get_prev_day_datetime(dt)
+        if not prev_date:
+            return None
+        return self.vis.get(prev_date, None)
+
 
 @lru_cache(maxsize=100)
 def get_underlying_prefix(portfolio_name: str) -> str:
