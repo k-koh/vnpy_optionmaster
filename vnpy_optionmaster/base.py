@@ -5,8 +5,8 @@ from functools import lru_cache
 
 from vnpy.event import EventEngine
 from vnpy.event.engine import Event
-from vnpy.trader.event import EVENT_TICK, EVENT_ATM
-from vnpy.trader.object import ContractData, TickData, TradeData, BarData, AtmData
+from vnpy.trader.event import EVENT_TICK, EVENT_ATM, EVENT_VI
+from vnpy.trader.object import ContractData, TickData, TradeData, BarData, AtmData, ViData
 from vnpy.trader.constant import Exchange, OptionType, Direction, Offset, OptionPrevIvType
 from vnpy.trader.converter import PositionHolding
 from vnpy.trader.utility import extract_vt_symbol
@@ -1073,9 +1073,10 @@ class PreviousDayOptionData:
 # 前日比用のVI Data
 class PreviousDayViData:
     """"""
-    def __init__(self) -> None:
+    def __init__(self, event_engine: EventEngine) -> None:
         self.vis: dict[datetime, float] = {}
         self.sorted_dates: list[datetime] = []
+        self.event_engine: EventEngine = event_engine
 
     def sort_vi_datetime(self) -> None:
         """"""
@@ -1102,6 +1103,11 @@ class PreviousDayViData:
         if not prev_date:
             return None
         return self.vis.get(prev_date, None)
+
+    def put_vi_event(self, vi: ViData) -> None:
+        """"""
+        event: Event = Event(EVENT_VI, vi)
+        self.event_engine.put(event)
 
 
 @lru_cache(maxsize=100)

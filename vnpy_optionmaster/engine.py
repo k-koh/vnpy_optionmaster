@@ -7,7 +7,7 @@ from vnpy.trader.database import DB_TZ, BaseDatabase, get_database
 from vnpy.trader.object import (
     LogData, ContractData, TickData,
     OrderData, TradeData, PositionData,
-    SubscribeRequest, OrderRequest, CancelRequest, BarData
+    SubscribeRequest, OrderRequest, CancelRequest, BarData, ViData
 )
 from vnpy.event import Event, EventEngine
 from vnpy.trader.engine import BaseEngine, MainEngine
@@ -77,7 +77,7 @@ class OptionEngine(BaseEngine):
 
         self.setting: dict = {}
         self.prev_day_option: PreviousDayOptionData = PreviousDayOptionData() # ADDED
-        self.prev_day_vi: PreviousDayViData = PreviousDayViData() # ADDED
+        self.prev_day_vi: PreviousDayViData = PreviousDayViData(event_engine) # ADDED
 
         self.load_setting()
         self.register_event()
@@ -158,8 +158,10 @@ class OptionEngine(BaseEngine):
 
         dt: datetime = datetime.now(DB_TZ)
         prev_day_dt = self.prev_day_vi.get_prev_day_datetime(dt)
-        print(f"成功加载{len(self.prev_day_vi.vis)}条上一交易日 日経平均VI指数. 结束时间: {prev_day_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-
+        prev_day_iv = self.prev_day_vi.get_prev_day_vi(dt)
+        vi: ViData = ViData(date=prev_day_dt, n225_vi=prev_day_iv)
+        print(f"成功加载{len(self.prev_day_vi.vis)}条上一交易日 日経平均VI指数. 结束时间: {prev_day_dt.strftime('%Y-%m-%d %H:%M:%S')} , VI: {prev_day_iv}")
+        self.prev_day_vi.put_vi_event(vi)
 
     def load_setting(self) -> None:
         """"""
