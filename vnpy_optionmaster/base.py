@@ -347,9 +347,9 @@ class ChainData:
         self.eris_c_iv: float | None = None
         self.eris_c_strike: int | None = None
         self.delta022_c_iv: float | None = None      # Call Δ0.22 iv
-        self.delta022_c_strike: float | None = None  # Call Δ0.22 strike
+        self.delta022_c_strike: int | None = None  # Call Δ0.22 strike
         self.delta012_p_iv: float | None = None      # Put Δ0.12 iv
-        self.delta012_p_strike: float | None = None  # Put Δ0.12 strike
+        self.delta012_p_strike: int | None = None  # Put Δ0.12 strike
 
     def add_option(self, option: OptionData) -> None:
         """"""
