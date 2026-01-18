@@ -487,8 +487,8 @@ class OptionEngine(BaseEngine):
         return None
 
     def get_prev_day_option_iv(self, op_month: str, prev_iv_type: OptionPrevIvType, put_strike: int, call_strike: int,
-                               atm_strike: int, dt: datetime) -> tuple[float, float, float]:
-        return self.prev_day_option.get_prev_day_option_iv(op_month, prev_iv_type, put_strike, call_strike, atm_strike, dt)
+                               delta002_call_strike: int, atm_strike: int, dt: datetime) -> tuple[float, float, float, float]:
+        return self.prev_day_option.get_prev_day_option_iv(op_month, prev_iv_type, put_strike, call_strike, delta002_call_strike, atm_strike, dt)
 
     def get_prev_day_n225_vi(self, dt: datetime) -> float | None:
         return self.prev_day_vi.get_prev_day_vi(dt)
