@@ -23,6 +23,7 @@ EVENT_OPTION_ALGO_STATUS = "eOptionAlgoStatus"
 EVENT_OPTION_ALGO_LOG = "eOptionAlgoLog"
 EVENT_OPTION_RISK_NOTICE = "eOptionRiskNotice"
 EVENT_OPTION_INSTRUMENT_ADD = "eOptionInstrumentAdd"
+EVENT_OPTION_INSTRUMENT_REMOVE = "eOptionInstrumentRemove"
 
 
 class InstrumentData:
@@ -352,6 +353,8 @@ class ChainData:
         self.delta002_c_strike: int | None = None  # Call Δ0.02 strike
         self.delta012_p_iv: float | None = None      # Put Δ0.12 iv
         self.delta012_p_strike: int | None = None  # Put Δ0.12 strike
+        self.delta002_p_iv: float | None = None  # Put Δ0.02 iv
+        self.delta002_p_strike: int | None = None  # Put Δ0.02 strike
 
     def add_option(self, option: OptionData) -> None:
         """"""
@@ -375,6 +378,28 @@ class ChainData:
                 self.indexes.sort()
 
         self.days_to_expiry = option.days_to_expiry
+
+    def remove_option(self, vt_symbol: str) -> None:
+        """"""
+        option = self.options.pop(vt_symbol, None)
+        if not option:
+            return
+
+        if option.option_type > 0:
+            self.calls.pop(option.chain_index, None)
+        else:
+            self.puts.pop(option.chain_index, None)
+
+        if option.chain_index in self.indexes:
+            # check if there is any other option with same index
+            has_other = False
+            for opt in self.options.values():
+                if opt.chain_index == option.chain_index:
+                    has_other = True
+                    break
+            if not has_other:
+                print("Removing option.chain_index:", option.chain_index)
+                self.indexes.remove(option.chain_index)
 
     def calculate_pos_greeks(self) -> None:
         """"""
@@ -621,7 +646,7 @@ class ChainData:
             self.delta022_c_iv = None
             self.delta022_c_strike = None
 
-        # Find call with delta closest to +0.02
+        # Find call with delta closest to +0.022
         min_call_delta_diff = 100.0
         delta002_call = None
 
@@ -633,7 +658,7 @@ class ChainData:
                 continue
 
             option_delta = call.theo_delta / call.size
-            delta_diff = abs(option_delta - 0.02)
+            delta_diff = abs(option_delta - 0.022)
 
             if delta_diff < min_call_delta_diff:
                 min_call_delta_diff = delta_diff
@@ -670,6 +695,31 @@ class ChainData:
         else:
             self.delta012_p_iv = None
             self.delta012_p_strike = None
+
+        # Find put with delta closest to -0.022
+        min_put_delta_diff = 100.0
+        delta002_put = None
+
+        for put in self.puts.values():
+            if not put.theo_delta or not put.size:
+                continue
+
+            if put.strike_price % 1000 != 0:
+                continue
+
+            option_delta = put.theo_delta / put.size
+            delta_diff = abs(option_delta - (-0.022))
+
+            if delta_diff < min_put_delta_diff:
+                min_put_delta_diff = delta_diff
+                delta002_put = put
+
+        if delta002_put:
+            self.delta002_p_iv = delta002_put.mid_impv
+            self.delta002_p_strike = delta002_put.strike_price
+        else:
+            self.delta002_p_iv = None
+            self.delta002_p_strike = None
 
     def calculate_underlying_adjustment(self) -> None:
         """"""
@@ -862,6 +912,22 @@ class PortfolioData:
         if hasattr(chain, "underlying"):
             option.set_underlying(chain.underlying)
 
+    def remove_option(self, vt_symbol: str) -> None:
+        """"""
+        # Remove from active options
+        self.options.pop(vt_symbol, None)
+
+        # Remove from all options
+        option = self._options.pop(vt_symbol, None)
+        if not option:
+            return
+
+        # Remove from chain
+        if hasattr(option, "chain"):
+            chain = option.chain
+            print("Removing option from chain:", vt_symbol)
+            chain.remove_option(vt_symbol)
+
     def calculate_atm_price(self) -> None:
         """"""
         for chain in self.chains.values():
@@ -874,6 +940,7 @@ class PreviousDayOptionData:
     def __init__(self) -> None:
         self.bars: dict[datetime, dict[str, BarData]] = {}
         self.eris_p_iv: dict[str, float | None] = {}
+        self.delta002_p_iv: dict[str, float | None] = {}
         self.eris_c_iv: dict[str, float | None] = {}
         self.delta002_c_iv: dict[str, float | None] = {}
         self.atm_iv: dict[str, float | None] = {}
@@ -1017,27 +1084,30 @@ class PreviousDayOptionData:
         self,
         op_month: str,
         prev_iv_type: OptionPrevIvType,
+        delta002_put_strike: int,
         put_strike: int,
         call_strike: int,
         delta022_call_strike: int,
         atm_strike: int,
         dt: datetime
-    ) -> tuple[float, float, float, float]:
+    ) -> tuple[float, float, float, float, float]:
         """"""
         put_iv: float = 0.0
+        delta002_p_iv: float = 0.0
         call_iv: float = 0.0
-        delta002_call_iv: float = 0.0
+        delta002_c_iv: float = 0.0
         atm_iv: float = 0.0
 
         prev_date = self.get_prev_day_datetime(dt)
         if not prev_date:
-            return put_iv, call_iv, delta002_call_iv, atm_iv
+            return delta002_p_iv, put_iv, call_iv, delta002_c_iv, atm_iv
 
         if prev_iv_type == OptionPrevIvType.SAME_DELTA:
             dt_op_month = prev_date.strftime("%Y-%m-%d-%H-%M-%S") + "_" + op_month
             put_iv = self.eris_p_iv.get(dt_op_month, 0.0)
+            delta002_p_iv = self.delta002_p_iv.get(dt_op_month, 0.0)
             call_iv = self.eris_c_iv.get(dt_op_month, 0.0)
-            delta002_call_iv = self.delta002_c_iv.get(dt_op_month, 0.0)
+            delta002_c_iv = self.delta002_c_iv.get(dt_op_month, 0.0)
             atm_iv = self.atm_iv.get(dt_op_month, 0.0)
         elif prev_iv_type == OptionPrevIvType.SAME_STRIKE:
             if put_strike is not None and call_strike is not None:
@@ -1066,7 +1136,15 @@ class PreviousDayOptionData:
                     if delta002_call_vt_symbol in day_bars:
                         bar = day_bars[delta002_call_vt_symbol]
                         if hasattr(bar, 'iv'):
-                            delta002_call_iv = bar.iv
+                            delta002_c_iv = bar.iv
+                # Get delta002 Put IV
+                if delta002_put_strike is not None:
+                    delta002_p_strike = int(delta002_put_strike)
+                    delta002_p_vt_symbol = f"{op_month}-P-{delta002_p_strike}.JPX"
+                    if delta002_p_vt_symbol in day_bars:
+                        bar = day_bars[delta002_p_vt_symbol]
+                        if hasattr(bar, 'iv'):
+                            delta002_p_iv = bar.iv
                 # Calculate ATM IV
                 atm_call_bar = day_bars.get(atm_call_vt_symbol, None)
                 atm_put_bar = day_bars.get(atm_put_vt_symbol, None)
@@ -1080,7 +1158,7 @@ class PreviousDayOptionData:
                     atm_iv = atm_call_iv
                 elif atm_put_iv is not None:
                     atm_iv = atm_put_iv
-        return put_iv, call_iv, delta002_call_iv, atm_iv
+        return delta002_p_iv, put_iv, call_iv, delta002_c_iv, atm_iv
 
     def get_prev_day_iv_curve(
         self,

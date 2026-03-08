@@ -32,6 +32,7 @@ from .base import (
     EVENT_OPTION_ALGO_LOG,
     EVENT_OPTION_RISK_NOTICE,
     EVENT_OPTION_INSTRUMENT_ADD,
+    EVENT_OPTION_INSTRUMENT_REMOVE,
     InstrumentData, PortfolioData, OptionData, UnderlyingData,
     get_underlying_prefix, PreviousDayOptionData, PreviousDayViData
 )
@@ -239,6 +240,7 @@ class OptionEngine(BaseEngine):
         self.event_engine.register(EVENT_CONTRACT, self.process_contract_event)
         self.event_engine.register(EVENT_TRADE, self.process_trade_event)
         self.event_engine.register(EVENT_TIMER, self.process_timer_event)
+        self.event_engine.register(EVENT_OPTION_INSTRUMENT_REMOVE, self.process_instrument_remove_event)
 
     def process_tick_event(self, event: Event) -> None:
         """"""
@@ -320,6 +322,40 @@ class OptionEngine(BaseEngine):
 
         for portfolio in self.active_portfolios.values():
             portfolio.calculate_atm_price()
+
+    def process_instrument_remove_event(self, event: Event) -> None:
+        """"""
+        vt_symbol: str = event.data
+
+        print(f"Processing Removing of instrument {vt_symbol}")
+
+        # Remove from active instrument dict
+        instrument: InstrumentData = self.instruments.pop(vt_symbol, None)
+        if not instrument:
+            return
+
+        # Remove from portfolio
+        portfolio: PortfolioData = instrument.portfolio
+        print(f"Removing instrument {vt_symbol} from portfolio {portfolio.name}")
+        portfolio.remove_option(vt_symbol)
+
+        # Unsubscribe from market data
+        contract: ContractData = self.main_engine.get_contract(vt_symbol)
+        if contract:
+            req: SubscribeRequest = SubscribeRequest(
+                symbol=contract.symbol,
+                exchange=contract.exchange
+            )
+            print(f"Removing market data for {vt_symbol}")
+            gateway = self.main_engine.get_gateway(contract.gateway_name)
+            if gateway:
+                try:
+                    gateway.unsubscribe(req)
+                except AttributeError:
+                    print(f"Gateway {contract.gateway_name} does not support unsubscribe method.")
+
+        # Fire event to notify UI update
+        self.event_engine.put(Event(EVENT_OPTION_INSTRUMENT_REMOVE, vt_symbol))
 
     def get_portfolio(self, portfolio_name: str) -> PortfolioData:
         """"""
@@ -486,9 +522,9 @@ class OptionEngine(BaseEngine):
                     return option_data
         return None
 
-    def get_prev_day_option_iv(self, op_month: str, prev_iv_type: OptionPrevIvType, put_strike: int, call_strike: int,
-                               delta002_call_strike: int, atm_strike: int, dt: datetime) -> tuple[float, float, float, float]:
-        return self.prev_day_option.get_prev_day_option_iv(op_month, prev_iv_type, put_strike, call_strike, delta002_call_strike, atm_strike, dt)
+    def get_prev_day_option_iv(self, op_month: str, prev_iv_type: OptionPrevIvType, delta002_put_strike: int, put_strike: int, call_strike: int,
+                               delta002_call_strike: int, atm_strike: int, dt: datetime) -> tuple[float, float, float, float, float]:
+        return self.prev_day_option.get_prev_day_option_iv(op_month, prev_iv_type, delta002_put_strike, put_strike, call_strike, delta002_call_strike, atm_strike, dt)
 
     def get_prev_day_n225_vi(self, dt: datetime) -> float | None:
         return self.prev_day_vi.get_prev_day_vi(dt)

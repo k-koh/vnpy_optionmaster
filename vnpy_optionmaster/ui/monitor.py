@@ -311,6 +311,8 @@ class OptionMarketMonitor(MonitorTable):
             return
 
         option: OptionData = cast(OptionData, self.option_engine.get_instrument(vt_symbol))
+        if not option:
+            return
         option_cells["net_pos"].setText(str(option.net_pos))
 
     def update_price(self, vt_symbol: str) -> None:
@@ -320,6 +322,9 @@ class OptionMarketMonitor(MonitorTable):
             return
 
         option: OptionData = cast(OptionData, self.option_engine.get_instrument(vt_symbol))
+        if not option:
+            return
+
         tick: TickData = option.tick
         option_cells["bid_price"].setText(f'{tick.bid_price_1:0.4f}')
         option_cells["bid_volume"].setText(str(tick.bid_volume_1))
@@ -335,6 +340,9 @@ class OptionMarketMonitor(MonitorTable):
             return
 
         option: OptionData = cast(OptionData, self.option_engine.get_instrument(vt_symbol))
+        if not option:
+            return
+
         option_cells["bid_impv"].setText(f"{option.bid_impv * 100:.2f}")
         option_cells["ask_impv"].setText(f"{option.ask_impv * 100:.2f}")
 
@@ -345,6 +353,8 @@ class OptionMarketMonitor(MonitorTable):
             return
 
         option: OptionData = cast(OptionData, self.option_engine.get_instrument(vt_symbol))
+        if not option:
+            return
 
         option_cells["theo_delta"].setText(f"{option.theo_delta:.{self.greeks_precision}}")
         option_cells["theo_gamma"].setText(f"{option.theo_gamma:.{self.greeks_precision}}")
