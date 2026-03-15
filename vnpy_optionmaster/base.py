@@ -345,12 +345,15 @@ class ChainData:
 
         self.eris_p_iv: float | None = None
         self.eris_p_strike: int | None = None
+        self.eris_p_delta: float | None = None
         self.eris_c_iv: float | None = None
         self.eris_c_strike: int | None = None
+        self.eris_c_delta: float | None = None
         self.delta022_c_iv: float | None = None      # Call Δ0.22 iv
         self.delta022_c_strike: int | None = None  # Call Δ0.22 strike
         self.delta002_c_iv: float | None = None  # Call Δ0.02 iv
         self.delta002_c_strike: int | None = None  # Call Δ0.02 strike
+        self.delta002_c_delta: float | None = None  # Call Δ0.02 actual delta
         self.delta012_p_iv: float | None = None      # Put Δ0.12 iv
         self.delta012_p_strike: int | None = None  # Put Δ0.12 strike
         self.delta002_p_iv: float | None = None  # Put Δ0.02 iv
@@ -592,9 +595,11 @@ class ChainData:
         if eris_call:
             self.eris_c_iv = eris_call.mid_impv
             self.eris_c_strike = eris_call.strike_price
+            self.eris_c_delta = eris_call.theo_delta / eris_call.size if eris_call.size else None
         else:
             self.eris_c_iv = None
             self.eris_c_strike = None
+            self.eris_c_delta = None
 
         # Find put with delta closest to -0.1
         min_put_delta_diff = 100.0
@@ -617,9 +622,11 @@ class ChainData:
         if eris_put:
             self.eris_p_iv = eris_put.mid_impv
             self.eris_p_strike = eris_put.strike_price
+            self.eris_p_delta = eris_put.theo_delta / eris_put.size if eris_put.size else None
         else:
             self.eris_p_iv = None
             self.eris_p_strike = None
+            self.eris_p_delta = None
 
         # Find call with delta closest to +0.22
         min_call_delta_diff = 100.0
@@ -667,9 +674,11 @@ class ChainData:
         if delta002_call:
             self.delta002_c_iv = delta002_call.mid_impv
             self.delta002_c_strike = delta002_call.strike_price
+            self.delta002_c_delta = delta002_call.theo_delta / delta002_call.size if delta002_call.size else None
         else:
             self.delta002_c_iv = None
             self.delta002_c_strike = None
+            self.delta002_c_delta = None
 
         # Find put with delta closest to -0.12
         min_put_delta_diff = 100.0

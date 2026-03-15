@@ -50,10 +50,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         # self.pricing_curves: dict[str, pg.PlotCurveItem] = {}
         self.eris_p_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.eris_c_strike_lines: dict[str, pg.InfiniteLine] = {}
-        self.delta022_c_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.delta002_c_strike_lines: dict[str, pg.InfiniteLine] = {}
-        self.delta002_p_strike_lines: dict[str, pg.InfiniteLine] = {}
-        self.delta012_p_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.atm_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.underlying_price_lines: dict[str, pg.InfiniteLine] = {}
         self.total_volume_bars: dict[str, pg.BarGraphItem] = {}
@@ -264,35 +261,12 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             labelOpts={'position': 0.05, 'color': color, 'fill': (200,200,200,50), 'movable': False}
         )
 
-        self.delta022_c_strike_lines[chain_symbol] = pg.InfiniteLine(
-            angle=90,
-            movable=False,
-            pen=c_line_pen,
-            label=symbol + " コールΔ0.22",
-            labelOpts={'position': 0.12, 'color': color, 'fill': (200, 200, 200, 50), 'movable': False}
-        )
         self.delta002_c_strike_lines[chain_symbol] = pg.InfiniteLine(
             angle=90,
             movable=False,
             pen=c_line_pen,
             label=symbol + " コールΔ0.022",
             labelOpts={'position': 0.12, 'color': color, 'fill': (200, 200, 200, 50), 'movable': False}
-        )
-
-        self.delta002_p_strike_lines[chain_symbol] = pg.InfiniteLine(
-            angle=90,
-            movable=False,
-            pen=p_line_pen,
-            label=symbol + " プットΔ0.022",
-            labelOpts={'position': 0.88, 'color': color, 'fill': (200, 200, 200, 50), 'movable': False}
-        )
-
-        self.delta012_p_strike_lines[chain_symbol] = pg.InfiniteLine(
-            angle=90,
-            movable=False,
-            pen=p_line_pen,
-            label=symbol + " プットΔ0.12",
-            labelOpts={'position': 0.88, 'color': color, 'fill': (200, 200, 200, 50), 'movable': False}
         )
 
         self.atm_strike_lines[chain_symbol] = pg.InfiniteLine(
@@ -314,19 +288,13 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.impv_chart.addItem(self.eris_c_strike_lines[chain_symbol])
         self.impv_chart.addItem(self.atm_strike_lines[chain_symbol])
         self.impv_chart.addItem(self.underlying_price_lines[chain_symbol])
-        self.impv_chart.addItem(self.delta022_c_strike_lines[chain_symbol])
         self.impv_chart.addItem(self.delta002_c_strike_lines[chain_symbol])
-        self.impv_chart.addItem(self.delta002_p_strike_lines[chain_symbol])
-        self.impv_chart.addItem(self.delta012_p_strike_lines[chain_symbol])
 
         self.eris_p_strike_lines[chain_symbol].hide()
         self.eris_c_strike_lines[chain_symbol].hide()
         self.atm_strike_lines[chain_symbol].hide()
         self.underlying_price_lines[chain_symbol].hide()
-        self.delta022_c_strike_lines[chain_symbol].hide()
         self.delta002_c_strike_lines[chain_symbol].hide()
-        self.delta002_p_strike_lines[chain_symbol].hide()
-        self.delta012_p_strike_lines[chain_symbol].hide()
 
         self.total_volume_bars[chain_symbol] = pg.BarGraphItem(
             x=[],
@@ -626,42 +594,34 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 set_curve_data(self.prev_put_curves[chain.chain_symbol], put_strikes, prev_put_ivs)
 
             # Update ERIS strike lines
+            symbol = chain.chain_symbol.split(".")[0]
             if chain.eris_p_strike is not None:
-                self.eris_p_strike_lines[chain.chain_symbol].setPos(chain.eris_p_strike)
-                self.eris_p_strike_lines[chain.chain_symbol].show()
+                line = self.eris_p_strike_lines[chain.chain_symbol]
+                line.setPos(chain.eris_p_strike)
+                delta_text = f"{chain.eris_p_delta:.3f}" if chain.eris_p_delta is not None else "N/A"
+                line.label.setText(f"{symbol} PΔ{delta_text}")
+                line.show()
             else:
                 self.eris_p_strike_lines[chain.chain_symbol].hide()
 
             if chain.eris_c_strike is not None:
-                self.eris_c_strike_lines[chain.chain_symbol].setPos(chain.eris_c_strike)
-                self.eris_c_strike_lines[chain.chain_symbol].show()
+                line = self.eris_c_strike_lines[chain.chain_symbol]
+                line.setPos(chain.eris_c_strike)
+                delta_text = f"{chain.eris_c_delta:.3f}" if chain.eris_c_delta is not None else "N/A"
+                line.label.setText(f"{symbol} CΔ{delta_text}")
+                line.show()
             else:
                 self.eris_c_strike_lines[chain.chain_symbol].hide()
 
             # Update Delta strike lines
-            if hasattr(chain, "delta022_c_strike") and chain.delta022_c_strike is not None:
-                self.delta022_c_strike_lines[chain.chain_symbol].setPos(chain.delta022_c_strike)
-                self.delta022_c_strike_lines[chain.chain_symbol].show()
-            else:
-                self.delta022_c_strike_lines[chain.chain_symbol].hide()
-
             if hasattr(chain, "delta002_c_strike") and chain.delta002_c_strike is not None:
-                self.delta002_c_strike_lines[chain.chain_symbol].setPos(chain.delta002_c_strike)
-                self.delta002_c_strike_lines[chain.chain_symbol].show()
+                line = self.delta002_c_strike_lines[chain.chain_symbol]
+                line.setPos(chain.delta002_c_strike)
+                delta_text = f"{chain.delta002_c_delta:.4f}" if getattr(chain, "delta002_c_delta", None) is not None else "N/A"
+                line.label.setText(f"{symbol} CΔ{delta_text}")
+                line.show()
             else:
                 self.delta002_c_strike_lines[chain.chain_symbol].hide()
-
-            if hasattr(chain, "delta002_p_strike") and chain.delta002_p_strike is not None:
-                self.delta002_p_strike_lines[chain.chain_symbol].setPos(chain.delta002_p_strike)
-                self.delta002_p_strike_lines[chain.chain_symbol].show()
-            else:
-                self.delta002_p_strike_lines[chain.chain_symbol].hide()
-
-            if hasattr(chain, "delta012_p_strike") and chain.delta012_p_strike is not None:
-                self.delta012_p_strike_lines[chain.chain_symbol].setPos(chain.delta012_p_strike)
-                self.delta012_p_strike_lines[chain.chain_symbol].show()
-            else:
-                self.delta012_p_strike_lines[chain.chain_symbol].hide()
 
             # Update ATM strike line
             if chain.atm_price:
@@ -809,10 +769,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             prev_put_curve: pg.PlotCurveItem = self.prev_put_curves[chain_symbol]
             p_line = self.eris_p_strike_lines[chain_symbol]
             c_line = self.eris_c_strike_lines[chain_symbol]
-            delta_c_line = self.delta022_c_strike_lines[chain_symbol]
             delta_f_c_line = self.delta002_c_strike_lines[chain_symbol]
-            delta_f_p_line = self.delta002_p_strike_lines[chain_symbol]
-            delta_p_line = self.delta012_p_strike_lines[chain_symbol]
             atm_line = self.atm_strike_lines[chain_symbol]
             underlying_line = self.underlying_price_lines[chain_symbol]
             total_volume_bar = self.total_volume_bars[chain_symbol]
@@ -850,10 +807,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 prev_put_curve.hide()
                 p_line.hide()
                 c_line.hide()
-                delta_c_line.hide()
                 delta_f_c_line.hide()
-                delta_f_p_line.hide()
-                delta_p_line.hide()
                 atm_line.hide()
                 underlying_line.hide()
                 total_volume_bar.hide()
