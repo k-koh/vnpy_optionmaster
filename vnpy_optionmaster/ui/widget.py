@@ -15,7 +15,7 @@ from .monitor import (
     OptionMarketMonitor, OptionGreeksMonitor, OptionChainMonitor,
     MonitorCell
 )
-from .chart import OptionVolatilityChart, ScenarioAnalysisChart
+from .chart import OptionVolatilityChart, ScenarioAnalysisChart, IVHeatmapChart, IVTimeSeriesChart, IVDecayChart
 from .manager import ElectronicEyeManager, PricingVolatilityManager
 
 
@@ -40,6 +40,9 @@ class OptionManager(QtWidgets.QWidget):
         self.manual_trader: OptionManualTrader
         self.hedge_widget: OptionHedgeWidget
         self.scenario_chart: ScenarioAnalysisChart
+        self.heatmap_chart: IVHeatmapChart
+        self.iv_timeseries_chart: IVTimeSeriesChart
+        self.iv_decay_chart: IVDecayChart
         self.eye_manager: ElectronicEyeManager
         self.pricing_manager: PricingVolatilityManager
 
@@ -64,6 +67,9 @@ class OptionManager(QtWidgets.QWidget):
         self.volatility_button = QtWidgets.QPushButton("波动率曲线")
         self.hedge_button = QtWidgets.QPushButton("Delta对冲")
         self.scenario_button = QtWidgets.QPushButton("情景分析")
+        self.heatmap_button = QtWidgets.QPushButton("IV残像")
+        self.iv_timeseries_button = QtWidgets.QPushButton("IV時系列")
+        self.iv_decay_button = QtWidgets.QPushButton("IV減衰")
         self.eye_button = QtWidgets.QPushButton("电子眼")
         self.pricing_button = QtWidgets.QPushButton("波动率管理")
         self.risk_button = QtWidgets.QPushButton("风险监控")
@@ -76,6 +82,9 @@ class OptionManager(QtWidgets.QWidget):
             self.volatility_button,
             self.hedge_button,
             self.scenario_button,
+            self.heatmap_button,
+            self.iv_timeseries_button,
+            self.iv_decay_button,
             self.eye_button,
             self.pricing_button,
             self.risk_button
@@ -93,6 +102,9 @@ class OptionManager(QtWidgets.QWidget):
         hbox.addWidget(self.volatility_button)
         hbox.addWidget(self.hedge_button)
         hbox.addWidget(self.scenario_button)
+        hbox.addWidget(self.heatmap_button)
+        hbox.addWidget(self.iv_timeseries_button)
+        hbox.addWidget(self.iv_decay_button)
         hbox.addWidget(self.pricing_button)
         hbox.addWidget(self.eye_button)
         hbox.addWidget(self.risk_button)
@@ -144,6 +156,9 @@ class OptionManager(QtWidgets.QWidget):
         self.manual_trader = OptionManualTrader(self.option_engine, self.portfolio_name)
         self.hedge_widget = OptionHedgeWidget(self.option_engine, self.portfolio_name)
         self.scenario_chart = ScenarioAnalysisChart(self.option_engine, self.portfolio_name)
+        self.heatmap_chart = IVHeatmapChart(self.option_engine, self.portfolio_name)
+        self.iv_timeseries_chart = IVTimeSeriesChart(self.option_engine, self.portfolio_name)
+        self.iv_decay_chart = IVDecayChart(self.option_engine, self.portfolio_name)
         self.eye_manager = ElectronicEyeManager(self.option_engine, self.portfolio_name)
         self.pricing_manager = PricingVolatilityManager(self.option_engine, self.portfolio_name)
         self.risk_widget = OptionRiskWidget(self.option_engine)
@@ -156,6 +171,9 @@ class OptionManager(QtWidgets.QWidget):
         self.chain_button.clicked.connect(self.chain_monitor.show)
         self.volatility_button.clicked.connect(self.volatility_chart.show)
         self.scenario_button.clicked.connect(self.scenario_chart.show)
+        self.heatmap_button.clicked.connect(self.heatmap_chart.show)
+        self.iv_timeseries_button.clicked.connect(self.iv_timeseries_chart.show)
+        self.iv_decay_button.clicked.connect(self.iv_decay_chart.show)
         self.hedge_button.clicked.connect(self.hedge_widget.show)
         self.eye_button.clicked.connect(self.eye_manager.show)
         self.pricing_button.clicked.connect(self.pricing_manager.show)
@@ -168,6 +186,9 @@ class OptionManager(QtWidgets.QWidget):
             self.manual_button,
             self.volatility_button,
             self.scenario_button,
+            self.heatmap_button,
+            self.iv_timeseries_button,
+            self.iv_decay_button,
             self.hedge_button,
             self.eye_button,
             self.pricing_button,
@@ -185,6 +206,9 @@ class OptionManager(QtWidgets.QWidget):
             self.manual_trader.close()
             self.hedge_widget.close()
             self.scenario_chart.close()
+            self.heatmap_chart.close()
+            self.iv_timeseries_chart.close()
+            self.iv_decay_chart.close()
             self.eye_manager.close()
             self.pricing_manager.close()
             self.risk_widget.close()

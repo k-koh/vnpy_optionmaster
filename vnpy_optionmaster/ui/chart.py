@@ -1,10 +1,12 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import pyqtgraph as pg
 from typing import cast
 
 from vnpy.trader.ui import QtWidgets, QtCore, QtGui
 from vnpy.trader.event import EVENT_TIMER
-from vnpy.trader.database import DB_TZ
+from vnpy.trader.constant import Exchange, Interval
+from vnpy.trader.database import DB_TZ, get_database, BaseDatabase
+from vnpy.trader.object import BarData
 
 from ..base import PortfolioData, OptionData, PreviousDayOptionData
 from ..engine import OptionEngine, Event, EventEngine
@@ -1031,3 +1033,755 @@ class ScenarioAnalysisChart(QtWidgets.QWidget):
             cstride=1,
             cmap='coolwarm'
         )
+
+
+def _load_option_bars_with_today(days: int) -> list[BarData]:
+    """DAILYバー + 当日MINUTEフォールバックでオプションバーを取得する共通関数
+
+    セッション構成:
+      ナイトセッション 17:00～翌06:00 + デイセッション 08:45～15:40
+      → 翌日15:45のdatetimeでDAILYバーとして保存される
+    例: 4/7 17:00 ～ 4/8 15:40 のデータ → datetime=4/8 15:45 として保存
+    """
+    now: datetime = datetime.now(DB_TZ)
+    start: datetime = now - timedelta(days=days)
+
+    # 17:00以降はナイトセッション開始 = 翌営業日のデータ
+    # DAILYバーは翌日15:45で保存されるため、endを翌日末まで拡張
+    if now.hour >= 17:
+        session_date: datetime = (now + timedelta(days=1))
+    else:
+        session_date = now
+    end: datetime = session_date.replace(hour=23, minute=59, second=59, microsecond=0)
+
+    database: BaseDatabase = get_database()
+    daily_bars: list[BarData] = database.load_option_data(
+        symbol="",
+        exchange=Exchange.JPX,
+        interval=Interval.DAILY,
+        start=start,
+        end=end,
+    )
+
+    # 現在のセッション日のDAILYバーがあるか確認
+    session_date_str: str = session_date.strftime("%Y-%m-%d")
+    has_session_data: bool = any(
+        bar.datetime.strftime("%Y-%m-%d") == session_date_str for bar in daily_bars
+    )
+
+    if not has_session_data:
+        # ナイトセッション開始（当日or前日17:00）からのMINUTEバーを取得
+        if now.hour >= 17:
+            minute_start: datetime = now.replace(
+                hour=17, minute=0, second=0, microsecond=0
+            )
+        else:
+            minute_start = (now - timedelta(days=1)).replace(
+                hour=17, minute=0, second=0, microsecond=0
+            )
+        minute_bars: list[BarData] = database.load_option_data(
+            symbol="",
+            exchange=Exchange.JPX,
+            interval=Interval.MINUTE,
+            start=minute_start,
+            end=now,
+        )
+
+        if minute_bars:
+            latest_by_symbol: dict[str, BarData] = {}
+            for bar in minute_bars:
+                existing = latest_by_symbol.get(bar.symbol)
+                if existing is None or bar.datetime > existing.datetime:
+                    latest_by_symbol[bar.symbol] = bar
+
+            # セッション日の15:45として統一
+            session_dt: datetime = session_date.replace(
+                hour=15, minute=45, second=0, microsecond=0
+            )
+            for bar in latest_by_symbol.values():
+                bar.datetime = session_dt
+                bar.interval = Interval.DAILY
+                daily_bars.append(bar)
+
+    return daily_bars
+
+
+def _extract_month(bar: BarData) -> str:
+    """シンボル(例: nk-2604-C-35000)から限月部分を抽出"""
+    parts: list[str] = bar.symbol.split("-")
+    return parts[1] if len(parts) >= 2 else ""
+
+
+def _filter_bars_by_month(bars: list[BarData], month: str) -> list[BarData]:
+    """限月でバーをフィルタ。'全て'の場合はフィルタなし"""
+    if month == "全て":
+        return bars
+    return [b for b in bars if _extract_month(b) == month]
+
+
+def _populate_month_combo(combo: QtWidgets.QComboBox, bars: list[BarData]) -> None:
+    """バーから限月一覧を取得してコンボボックスに設定"""
+    prev_text: str = combo.currentText()
+    months: set[str] = set()
+    for bar in bars:
+        m: str = _extract_month(bar)
+        if m:
+            months.add(m)
+    combo.clear()
+    combo.addItem("全て")
+    for m in sorted(months):
+        combo.addItem(m)
+    # 以前の選択を復元
+    idx: int = combo.findText(prev_text)
+    if idx >= 0:
+        combo.setCurrentIndex(idx)
+
+
+class IVHeatmapChart(QtWidgets.QWidget):
+    """IV残像ヒートマップ - デルタレベル別IV推移の可視化"""
+
+    # Target delta values: negative = put, positive = call
+    DELTA_TARGETS: list[tuple[str, float]] = [
+        ("Put Δ0.02", -0.02),
+        ("Put Δ0.10", -0.10),
+        ("Put Δ0.20", -0.20),
+        ("ATM (Δ0.50)", -0.50),
+        ("Call Δ0.20", 0.20),
+        ("Call Δ0.10", 0.10),
+        ("Call Δ0.02", 0.02),
+    ]
+
+    def __init__(self, option_engine: OptionEngine, portfolio_name: str) -> None:
+        super().__init__()
+
+        self.option_engine: OptionEngine = option_engine
+        self.portfolio_name: str = portfolio_name
+        self.fig: Figure = Figure(figsize=(10, 5))
+        self.canvas: FigureCanvas = FigureCanvas(self.fig)
+
+        self.init_ui()
+
+    def init_ui(self) -> None:
+        self.setWindowTitle("IV残像ヒートマップ")
+        self.resize(900, 500)
+
+        self.days_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.days_spin.setMinimum(3)
+        self.days_spin.setMaximum(90)
+        self.days_spin.setValue(30)
+        self.days_spin.setSuffix("日")
+
+        self.month_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        self.month_combo.setFixedWidth(100)
+
+        self.mode_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        self.mode_combo.addItems(["IV値 (年率%)", "前日比 (bp)"])
+
+        button: QtWidgets.QPushButton = QtWidgets.QPushButton("更新")
+        button.clicked.connect(self.run_analysis)
+
+        hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        hbox.addWidget(QtWidgets.QLabel("期間"))
+        hbox.addWidget(self.days_spin)
+        hbox.addWidget(QtWidgets.QLabel("限月"))
+        hbox.addWidget(self.month_combo)
+        hbox.addWidget(QtWidgets.QLabel("表示モード"))
+        hbox.addWidget(self.mode_combo)
+        hbox.addStretch()
+        hbox.addWidget(button)
+
+        vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
+        vbox.addLayout(hbox)
+        vbox.addWidget(self.canvas)
+        self.setLayout(vbox)
+
+    def build_matrix(self, bars: list[BarData]) -> tuple[np.ndarray, list[str], list[str]]:
+        """個別オプションバーからデルタレベル別×日付のIV行列を構築"""
+        # Group bars by date
+        date_bars: dict[str, list[BarData]] = {}
+        for bar in bars:
+            if bar.iv <= 0 or bar.delta == 0:
+                continue
+            date_key: str = bar.datetime.strftime("%Y-%m-%d")
+            date_bars.setdefault(date_key, []).append(bar)
+
+        sorted_dates: list[str] = sorted(date_bars.keys())
+        if not sorted_dates:
+            return np.array([]), [], []
+
+        delta_labels: list[str] = [t[0] for t in self.DELTA_TARGETS]
+        n_deltas: int = len(self.DELTA_TARGETS)
+        n_dates: int = len(sorted_dates)
+        matrix: np.ndarray = np.full((n_deltas, n_dates), np.nan)
+
+        for j, date_key in enumerate(sorted_dates):
+            day_bars: list[BarData] = date_bars[date_key]
+
+            for i, (label, target_delta) in enumerate(self.DELTA_TARGETS):
+                best_bar: BarData | None = None
+                best_diff: float = float("inf")
+
+                for bar in day_bars:
+                    diff: float = abs(bar.delta - target_delta)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_bar = bar
+
+                if best_bar and best_diff < 0.05:
+                    matrix[i, j] = best_bar.iv * 100
+
+        return matrix, sorted_dates, delta_labels
+
+    def run_analysis(self) -> None:
+        days: int = self.days_spin.value()
+        mode: str = self.mode_combo.currentText()
+
+        all_bars: list[BarData] = _load_option_bars_with_today(days)
+        if not all_bars:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "データなし",
+                f"過去{days}日間のオプションデータが見つかりません",
+                QtWidgets.QMessageBox.Ok,
+            )
+            return
+
+        _populate_month_combo(self.month_combo, all_bars)
+        month: str = self.month_combo.currentText()
+        bars: list[BarData] = _filter_bars_by_month(all_bars, month)
+
+        matrix, date_labels, delta_labels = self.build_matrix(bars)
+        if matrix.size == 0:
+            return
+
+        if "前日比" in mode:
+            diff: np.ndarray = np.diff(matrix, axis=1)
+            matrix = diff * 100
+            date_labels = date_labels[1:]
+
+        self.update_chart(matrix, date_labels, delta_labels, mode)
+
+    def update_chart(
+        self,
+        matrix: np.ndarray,
+        date_labels: list[str],
+        delta_labels: list[str],
+        mode: str,
+    ) -> None:
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+
+        masked: np.ma.MaskedArray = np.ma.masked_invalid(matrix)
+
+        cmap: str = "RdYlBu_r" if "IV値" in mode else "RdBu_r"
+        im = ax.pcolormesh(
+            masked,
+            cmap=cmap,
+            edgecolors="grey",
+            linewidth=0.3,
+        )
+        self.fig.colorbar(im, ax=ax, pad=0.02)
+
+        # 各セルにIV値をテキスト表示
+        n_rows, n_cols = matrix.shape
+        for i in range(n_rows):
+            for j in range(n_cols):
+                val: float = matrix[i, j]
+                if not np.isnan(val):
+                    fontsize: int = 9 if n_cols <= 15 else 7 if n_cols <= 25 else 6
+                    fmt: str = f"{val:.1f}" if "IV値" in mode else f"{val:+.0f}"
+                    ax.text(
+                        j + 0.5, i + 0.5, fmt,
+                        ha="center", va="center",
+                        fontsize=fontsize, color="black",
+                        fontweight="bold",
+                    )
+
+        n_dates: int = len(date_labels)
+        step: int = max(1, n_dates // 15)
+        tick_positions: list[float] = [i + 0.5 for i in range(0, n_dates, step)]
+        tick_labels: list[str] = [date_labels[i][5:] for i in range(0, n_dates, step)]
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=8)
+
+        ax.set_yticks([i + 0.5 for i in range(len(delta_labels))])
+        ax.set_yticklabels(delta_labels, fontsize=9)
+
+        ax.set_title("IV残像ヒートマップ", fontsize=12)
+        ax.set_xlabel("日付")
+        ax.set_ylabel("デルタレベル")
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+
+class IVDecayChart(QtWidgets.QWidget):
+    """IV実績vs理論減衰チャート - イベント後のIV残像を定量化"""
+
+    DELTA_TARGETS: list[tuple[str, float, str]] = [
+        ("ATM (Δ0.50)", -0.50, "#ffffff"),
+        ("Put Δ0.10", -0.10, "#ff8800"),
+        ("Call Δ0.10", 0.10, "#00ccff"),
+    ]
+
+    def __init__(self, option_engine: OptionEngine, portfolio_name: str) -> None:
+        super().__init__()
+
+        self.option_engine: OptionEngine = option_engine
+        self.portfolio_name: str = portfolio_name
+        self.fig: Figure = Figure(figsize=(12, 6))
+        self.canvas: FigureCanvas = FigureCanvas(self.fig)
+
+        self.init_ui()
+
+    def init_ui(self) -> None:
+        self.setWindowTitle("IV実績 vs 理論減衰")
+        self.resize(1000, 600)
+
+        self.days_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.days_spin.setMinimum(5)
+        self.days_spin.setMaximum(90)
+        self.days_spin.setValue(30)
+        self.days_spin.setSuffix("日")
+
+        self.event_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        self.event_combo.setFixedWidth(220)
+
+        self.month_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        self.month_combo.setFixedWidth(100)
+
+        self.delta_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        for label, _delta, _color in self.DELTA_TARGETS:
+            self.delta_combo.addItem(label)
+
+        self.after_days_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.after_days_spin.setMinimum(3)
+        self.after_days_spin.setMaximum(30)
+        self.after_days_spin.setValue(30)
+        self.after_days_spin.setSuffix("日後")
+
+        scan_button: QtWidgets.QPushButton = QtWidgets.QPushButton("イベント検出")
+        scan_button.clicked.connect(self.scan_events)
+
+        plot_button: QtWidgets.QPushButton = QtWidgets.QPushButton("描画")
+        plot_button.clicked.connect(self.run_analysis)
+
+        hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        hbox.addWidget(QtWidgets.QLabel("期間"))
+        hbox.addWidget(self.days_spin)
+        hbox.addWidget(QtWidgets.QLabel("限月"))
+        hbox.addWidget(self.month_combo)
+        hbox.addWidget(scan_button)
+        hbox.addWidget(QtWidgets.QLabel("イベント日"))
+        hbox.addWidget(self.event_combo)
+        hbox.addWidget(QtWidgets.QLabel("デルタ"))
+        hbox.addWidget(self.delta_combo)
+        hbox.addWidget(QtWidgets.QLabel("表示"))
+        hbox.addWidget(self.after_days_spin)
+        hbox.addStretch()
+        hbox.addWidget(plot_button)
+
+        vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
+        vbox.addLayout(hbox)
+        vbox.addWidget(self.canvas)
+        self.setLayout(vbox)
+
+    def _build_daily_iv(
+        self, bars: list[BarData], target_delta: float, month: str = "全て"
+    ) -> dict[str, float]:
+        """日付→IV(%) の辞書を構築"""
+        filtered: list[BarData] = _filter_bars_by_month(bars, month)
+
+        date_bars: dict[str, list[BarData]] = {}
+        for bar in filtered:
+            if bar.iv <= 0 or bar.delta == 0:
+                continue
+            date_key: str = bar.datetime.strftime("%Y-%m-%d")
+            date_bars.setdefault(date_key, []).append(bar)
+
+        daily_iv: dict[str, float] = {}
+        for date_key in sorted(date_bars.keys()):
+            best_bar: BarData | None = None
+            best_diff: float = float("inf")
+            for bar in date_bars[date_key]:
+                diff: float = abs(bar.delta - target_delta)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_bar = bar
+            if best_bar and best_diff < 0.05:
+                daily_iv[date_key] = best_bar.iv * 100
+        return daily_iv
+
+    def scan_events(self) -> None:
+        """IVスパイク（前日比が大きい日）を自動検出してcomboに追加"""
+        days: int = self.days_spin.value()
+        bars: list[BarData] = _load_option_bars_with_today(days)
+        if not bars:
+            return
+
+        _populate_month_combo(self.month_combo, bars)
+        month: str = self.month_combo.currentText()
+
+        # ATMのIV時系列を構築
+        daily_iv: dict[str, float] = self._build_daily_iv(bars, -0.50, month)
+        sorted_dates: list[str] = sorted(daily_iv.keys())
+        if len(sorted_dates) < 3:
+            return
+
+        # 前日比を計算してスパイクを検出
+        spikes: list[tuple[str, float]] = []
+        for i in range(1, len(sorted_dates)):
+            prev_iv: float = daily_iv[sorted_dates[i - 1]]
+            curr_iv: float = daily_iv[sorted_dates[i]]
+            change: float = curr_iv - prev_iv
+            if change > 0:
+                spikes.append((sorted_dates[i], change))
+
+        # 変化量の大きい順にソート
+        spikes.sort(key=lambda x: x[1], reverse=True)
+
+        self.event_combo.clear()
+        for date_key, change in spikes[:15]:
+            self.event_combo.addItem(f"{date_key} (+{change:.1f}%)")
+
+    def run_analysis(self) -> None:
+        event_text: str = self.event_combo.currentText()
+        if not event_text:
+            QtWidgets.QMessageBox.warning(
+                self, "未選択", "先に「イベント検出」でイベント日を選択してください",
+                QtWidgets.QMessageBox.Ok,
+            )
+            return
+
+        event_date: str = event_text[:10]
+        delta_idx: int = self.delta_combo.currentIndex()
+        _label, target_delta, color = self.DELTA_TARGETS[delta_idx]
+        month: str = self.month_combo.currentText()
+
+        days: int = self.days_spin.value()
+        bars: list[BarData] = _load_option_bars_with_today(days)
+        if not bars:
+            return
+
+        daily_iv: dict[str, float] = self._build_daily_iv(bars, target_delta, month)
+        sorted_dates: list[str] = sorted(daily_iv.keys())
+
+        if event_date not in sorted_dates:
+            return
+
+        event_idx: int = sorted_dates.index(event_date)
+        after_days: int = self.after_days_spin.value()
+        # イベント前1日 + イベント日 + after_days
+        start_idx: int = max(0, event_idx - 1)
+        end_idx: int = min(len(sorted_dates), event_idx + after_days + 1)
+
+        plot_dates: list[str] = sorted_dates[start_idx:end_idx]
+        actual_ivs: list[float] = [daily_iv.get(d, float("nan")) for d in plot_dates]
+
+        # イベント日のIVをピークとして理論減衰カーブ（√t）を計算
+        peak_iv: float = daily_iv[event_date]
+        # イベント前日のIVをベースラインとする
+        if event_idx > 0:
+            base_iv: float = daily_iv.get(sorted_dates[event_idx - 1], peak_iv * 0.8)
+        else:
+            base_iv = peak_iv * 0.8
+        iv_spike: float = peak_iv - base_iv
+
+        event_pos: int = event_idx - start_idx
+        theory_ivs: list[float] = []
+        for k in range(len(plot_dates)):
+            t: int = k - event_pos  # イベント日からの日数
+            if t < 0:
+                theory_ivs.append(float("nan"))
+            elif t == 0:
+                theory_ivs.append(peak_iv)
+            else:
+                # 理論減衰: spike / √(t+1) + base
+                decay: float = iv_spike / np.sqrt(t + 1)
+                theory_ivs.append(base_iv + decay)
+
+        self.update_chart(plot_dates, actual_ivs, theory_ivs, event_date, event_pos, _label, color)
+
+    def update_chart(
+        self,
+        date_labels: list[str],
+        actual_ivs: list[float],
+        theory_ivs: list[float],
+        event_date: str,
+        event_pos: int,
+        delta_label: str,
+        color: str,
+    ) -> None:
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+
+        x = np.arange(len(date_labels))
+
+        # 実績IV
+        ax.plot(x, actual_ivs, color=color, linewidth=2, label=f"実績IV ({delta_label})",
+                marker="o", markersize=5)
+
+        # 各線分の中心に前日比テキストを表示
+        for i in range(1, len(actual_ivs)):
+            prev_val: float = actual_ivs[i - 1]
+            curr_val: float = actual_ivs[i]
+            if np.isnan(prev_val) or np.isnan(curr_val):
+                continue
+            diff_val: float = curr_val - prev_val
+            mid_x: float = (x[i - 1] + x[i]) / 2
+            mid_y: float = (prev_val + curr_val) / 2
+            text_color: str = "#ff6666" if diff_val >= 0 else "#00ff99"
+            ax.text(
+                mid_x, mid_y, f"{diff_val:+.1f}",
+                ha="center", va="bottom", fontsize=11,
+                color=text_color, fontweight="bold",
+            )
+
+        # 理論減衰カーブ
+        ax.plot(x, theory_ivs, color="#888888", linewidth=1.5, linestyle="--",
+                label="理論減衰 (1/√t)", marker="", markersize=0)
+
+        # 残像領域を塗りつぶし（実績が理論より高い部分）
+        actual_arr = np.array(actual_ivs, dtype=float)
+        theory_arr = np.array(theory_ivs, dtype=float)
+        mask = ~(np.isnan(actual_arr) | np.isnan(theory_arr))
+        if mask.any():
+            ax.fill_between(
+                x, actual_arr, theory_arr,
+                where=mask & (actual_arr > theory_arr),
+                alpha=0.3, color="#ff6666", label="IV残像",
+            )
+
+        # イベント日の縦線
+        ax.axvline(x=event_pos, color="#ffff00", linewidth=1, linestyle=":", alpha=0.7)
+        ax.text(event_pos, ax.get_ylim()[1], f" Event\n {event_date}",
+                color="#ffff00", fontsize=8, va="top")
+
+        ax.legend(loc="upper right", fontsize=9, framealpha=0.7)
+        ax.grid(True, alpha=0.3)
+
+        # X軸ラベル
+        relative_labels: list[str] = []
+        for i, d in enumerate(date_labels):
+            offset: int = i - event_pos
+            if offset == 0:
+                relative_labels.append(f"E\n{d[5:]}")
+            elif offset < 0:
+                relative_labels.append(f"{offset}\n{d[5:]}")
+            else:
+                relative_labels.append(f"+{offset}\n{d[5:]}")
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(relative_labels, fontsize=7, ha="center")
+
+        ax.set_title(f"IV実績 vs 理論減衰 — {delta_label}", fontsize=12)
+        ax.set_xlabel("イベント日からの日数")
+        ax.set_ylabel("IV (年率%)")
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+
+class IVTimeSeriesChart(QtWidgets.QWidget):
+    """IV時系列チャート - デルタレベル別IV推移の折れ線グラフ"""
+
+    DELTA_TARGETS: list[tuple[str, float, str]] = [
+        ("Put Δ0.02", -0.02, "#ff4444"),
+        ("Put Δ0.10", -0.10, "#ff8800"),
+        ("ATM (Δ0.50)", -0.50, "#ffffff"),
+        ("Call Δ0.10", 0.10, "#00ccff"),
+        ("Call Δ0.02", 0.02, "#44ff44"),
+    ]
+
+    def __init__(self, option_engine: OptionEngine, portfolio_name: str) -> None:
+        super().__init__()
+
+        self.option_engine: OptionEngine = option_engine
+        self.portfolio_name: str = portfolio_name
+        self.fig: Figure = Figure(figsize=(12, 6))
+        self.canvas: FigureCanvas = FigureCanvas(self.fig)
+
+        self.init_ui()
+
+    def init_ui(self) -> None:
+        self.setWindowTitle("IV時系列チャート")
+        self.resize(1000, 600)
+
+        self.days_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.days_spin.setMinimum(3)
+        self.days_spin.setMaximum(90)
+        self.days_spin.setValue(30)
+        self.days_spin.setSuffix("日")
+
+        self.month_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        self.month_combo.setFixedWidth(100)
+
+        self.delta_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        self.delta_combo.addItem("全デルタ")
+        for label, _delta, _color in self.DELTA_TARGETS:
+            self.delta_combo.addItem(label)
+
+        self.ymin_spin: QtWidgets.QDoubleSpinBox = QtWidgets.QDoubleSpinBox()
+        self.ymin_spin.setMinimum(0)
+        self.ymin_spin.setMaximum(200)
+        self.ymin_spin.setValue(0)
+        self.ymin_spin.setSuffix("%")
+        self.ymin_spin.setDecimals(1)
+
+        self.ymax_spin: QtWidgets.QDoubleSpinBox = QtWidgets.QDoubleSpinBox()
+        self.ymax_spin.setMinimum(0)
+        self.ymax_spin.setMaximum(200)
+        self.ymax_spin.setValue(0)
+        self.ymax_spin.setSuffix("%")
+        self.ymax_spin.setDecimals(1)
+
+        button: QtWidgets.QPushButton = QtWidgets.QPushButton("更新")
+        button.clicked.connect(self.run_analysis)
+
+        hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        hbox.addWidget(QtWidgets.QLabel("期間"))
+        hbox.addWidget(self.days_spin)
+        hbox.addWidget(QtWidgets.QLabel("限月"))
+        hbox.addWidget(self.month_combo)
+        hbox.addWidget(QtWidgets.QLabel("デルタ"))
+        hbox.addWidget(self.delta_combo)
+        hbox.addWidget(QtWidgets.QLabel("Y軸min"))
+        hbox.addWidget(self.ymin_spin)
+        hbox.addWidget(QtWidgets.QLabel("max"))
+        hbox.addWidget(self.ymax_spin)
+        hbox.addStretch()
+        hbox.addWidget(button)
+
+        vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
+        vbox.addLayout(hbox)
+        vbox.addWidget(self.canvas)
+        self.setLayout(vbox)
+
+    def build_series(
+        self, bars: list[BarData]
+    ) -> tuple[list[str], dict[str, list[float]]]:
+        """個別オプションバーからデルタレベル別IV時系列を構築"""
+        date_bars: dict[str, list[BarData]] = {}
+        for bar in bars:
+            if bar.iv <= 0 or bar.delta == 0:
+                continue
+            date_key: str = bar.datetime.strftime("%Y-%m-%d")
+            date_bars.setdefault(date_key, []).append(bar)
+
+        sorted_dates: list[str] = sorted(date_bars.keys())
+        if not sorted_dates:
+            return [], {}
+
+        series: dict[str, list[float]] = {}
+        for label, target_delta, _color in self.DELTA_TARGETS:
+            series[label] = []
+
+        for date_key in sorted_dates:
+            day_bars: list[BarData] = date_bars[date_key]
+
+            for label, target_delta, _color in self.DELTA_TARGETS:
+                best_bar: BarData | None = None
+                best_diff: float = float("inf")
+
+                for bar in day_bars:
+                    diff: float = abs(bar.delta - target_delta)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_bar = bar
+
+                if best_bar and best_diff < 0.05:
+                    series[label].append(best_bar.iv * 100)
+                else:
+                    series[label].append(float("nan"))
+
+        return sorted_dates, series
+
+    def run_analysis(self) -> None:
+        days: int = self.days_spin.value()
+
+        all_bars: list[BarData] = _load_option_bars_with_today(days)
+        if not all_bars:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "データなし",
+                f"過去{days}日間のオプションデータが見つかりません",
+                QtWidgets.QMessageBox.Ok,
+            )
+            return
+
+        _populate_month_combo(self.month_combo, all_bars)
+        month: str = self.month_combo.currentText()
+        bars: list[BarData] = _filter_bars_by_month(all_bars, month)
+
+        date_labels, series = self.build_series(bars)
+        if not date_labels:
+            return
+
+        delta_selection: str = self.delta_combo.currentText()
+        ymin: float = self.ymin_spin.value()
+        ymax: float = self.ymax_spin.value()
+        self.update_chart(date_labels, series, delta_selection, ymin, ymax)
+
+    def update_chart(
+        self,
+        date_labels: list[str],
+        series: dict[str, list[float]],
+        delta_selection: str,
+        ymin: float,
+        ymax: float,
+    ) -> None:
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+
+        x = np.arange(len(date_labels))
+
+        if delta_selection == "全デルタ":
+            plot_targets = self.DELTA_TARGETS
+        else:
+            plot_targets = [t for t in self.DELTA_TARGETS if t[0] == delta_selection]
+
+        for label, target_delta, color in plot_targets:
+            values: list[float] = series[label]
+            ax.plot(x, values, color=color, linewidth=1.5, label=label, marker=".", markersize=3)
+
+            # 前日比テキストを表示
+            fs: int = 11 if delta_selection != "全デルタ" else 9
+            for i in range(1, len(values)):
+                prev_val: float = values[i - 1]
+                curr_val: float = values[i]
+                if np.isnan(prev_val) or np.isnan(curr_val):
+                    continue
+                diff_val: float = curr_val - prev_val
+                mid_x: float = (x[i - 1] + x[i]) / 2
+                mid_y: float = (prev_val + curr_val) / 2
+                ax.text(
+                    mid_x, mid_y, f"{diff_val:+.1f}",
+                    ha="center", va="bottom", fontsize=fs,
+                    color=color, fontweight="bold",
+                )
+
+        ax.legend(loc="upper right", fontsize=8, framealpha=0.7)
+        ax.grid(True, alpha=0.3)
+
+        if ymin > 0 or ymax > 0:
+            if ymin > 0 and ymax > 0 and ymax > ymin:
+                ax.set_ylim(ymin, ymax)
+            elif ymin > 0:
+                ax.set_ylim(bottom=ymin)
+            elif ymax > 0:
+                ax.set_ylim(top=ymax)
+
+        n_dates: int = len(date_labels)
+        step: int = max(1, n_dates // 15)
+        tick_positions = [i for i in range(0, n_dates, step)]
+        tick_labels: list[str] = [date_labels[i][5:] for i in range(0, n_dates, step)]
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=8)
+
+        title: str = f"IV時系列 — {delta_selection}" if delta_selection != "全デルタ" else "IV時系列（デルタレベル別）"
+        ax.set_title(title, fontsize=12)
+        ax.set_xlabel("日付")
+        ax.set_ylabel("IV (年率%)")
+
+        self.fig.tight_layout()
+        self.canvas.draw()
