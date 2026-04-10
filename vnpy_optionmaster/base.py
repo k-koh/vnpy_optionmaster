@@ -346,9 +346,11 @@ class ChainData:
         self.eris_p_iv: float | None = None
         self.eris_p_strike: int | None = None
         self.eris_p_delta: float | None = None
+        self.eris_p_price: float | None = None
         self.eris_c_iv: float | None = None
         self.eris_c_strike: int | None = None
         self.eris_c_delta: float | None = None
+        self.eris_c_price: float | None = None
         self.delta022_c_iv: float | None = None      # Call Δ0.22 iv
         self.delta022_c_strike: int | None = None  # Call Δ0.22 strike
         self.delta002_c_iv: float | None = None  # Call Δ0.02 iv
@@ -596,10 +598,15 @@ class ChainData:
             self.eris_c_iv = eris_call.mid_impv
             self.eris_c_strike = eris_call.strike_price
             self.eris_c_delta = eris_call.theo_delta / eris_call.size if eris_call.size else None
+            if eris_call.tick and eris_call.tick.bid_price_1 and eris_call.tick.ask_price_1:
+                self.eris_c_price = (eris_call.tick.bid_price_1 + eris_call.tick.ask_price_1) / 2
+            else:
+                self.eris_c_price = None
         else:
             self.eris_c_iv = None
             self.eris_c_strike = None
             self.eris_c_delta = None
+            self.eris_c_price = None
 
         # Find put with delta closest to -0.1
         min_put_delta_diff = 100.0
@@ -623,10 +630,15 @@ class ChainData:
             self.eris_p_iv = eris_put.mid_impv
             self.eris_p_strike = eris_put.strike_price
             self.eris_p_delta = eris_put.theo_delta / eris_put.size if eris_put.size else None
+            if eris_put.tick and eris_put.tick.bid_price_1 and eris_put.tick.ask_price_1:
+                self.eris_p_price = (eris_put.tick.bid_price_1 + eris_put.tick.ask_price_1) / 2
+            else:
+                self.eris_p_price = None
         else:
             self.eris_p_iv = None
             self.eris_p_strike = None
             self.eris_p_delta = None
+            self.eris_p_price = None
 
         # Find call with delta closest to +0.22
         min_call_delta_diff = 100.0

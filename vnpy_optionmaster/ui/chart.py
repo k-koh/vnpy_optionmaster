@@ -260,7 +260,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             movable=False,
             pen=c_line_pen,
             label=symbol + " コールΔ0.1",
-            labelOpts={'position': 0.05, 'color': color, 'fill': (200,200,200,50), 'movable': False}
+            labelOpts={'position': 0.01, 'color': color, 'fill': (200,200,200,50), 'movable': False}
         )
 
         self.delta002_c_strike_lines[chain_symbol] = pg.InfiniteLine(
@@ -601,7 +601,9 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 line = self.eris_p_strike_lines[chain.chain_symbol]
                 line.setPos(chain.eris_p_strike)
                 delta_text = f"{chain.eris_p_delta:.3f}" if chain.eris_p_delta is not None else "N/A"
-                line.label.setText(f"{symbol} PΔ{delta_text}")
+                iv_text = f"{chain.eris_p_iv:.3f}" if chain.eris_p_iv is not None else "N/A"
+                price_text = f"{chain.eris_p_price:.0f}" if chain.eris_p_price is not None else "N/A"
+                line.label.setText(f"{symbol} PΔ{delta_text} IV{iv_text} ¥{price_text}")
                 line.show()
             else:
                 self.eris_p_strike_lines[chain.chain_symbol].hide()
@@ -610,7 +612,9 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 line = self.eris_c_strike_lines[chain.chain_symbol]
                 line.setPos(chain.eris_c_strike)
                 delta_text = f"{chain.eris_c_delta:.3f}" if chain.eris_c_delta is not None else "N/A"
-                line.label.setText(f"{symbol} CΔ{delta_text}")
+                iv_text = f"{chain.eris_c_iv:.3f}" if chain.eris_c_iv is not None else "N/A"
+                price_text = f"{chain.eris_c_price:.0f}" if chain.eris_c_price is not None else "N/A"
+                line.label.setText(f"{symbol} CΔ{delta_text} IV{iv_text} ¥{price_text}")
                 line.show()
             else:
                 self.eris_c_strike_lines[chain.chain_symbol].hide()
