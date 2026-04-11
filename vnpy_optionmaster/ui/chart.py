@@ -52,7 +52,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         # self.pricing_curves: dict[str, pg.PlotCurveItem] = {}
         self.eris_p_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.eris_c_strike_lines: dict[str, pg.InfiniteLine] = {}
-        self.delta002_c_strike_lines: dict[str, pg.InfiniteLine] = {}
+
         self.atm_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.underlying_price_lines: dict[str, pg.InfiniteLine] = {}
         self.total_volume_bars: dict[str, pg.BarGraphItem] = {}
@@ -263,13 +263,6 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             labelOpts={'position': 0.01, 'color': color, 'fill': (200,200,200,50), 'movable': False}
         )
 
-        self.delta002_c_strike_lines[chain_symbol] = pg.InfiniteLine(
-            angle=90,
-            movable=False,
-            pen=c_line_pen,
-            label=symbol + " コールΔ0.022",
-            labelOpts={'position': 0.12, 'color': color, 'fill': (200, 200, 200, 50), 'movable': False}
-        )
 
         self.atm_strike_lines[chain_symbol] = pg.InfiniteLine(
             angle=90,
@@ -290,13 +283,11 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.impv_chart.addItem(self.eris_c_strike_lines[chain_symbol])
         self.impv_chart.addItem(self.atm_strike_lines[chain_symbol])
         self.impv_chart.addItem(self.underlying_price_lines[chain_symbol])
-        self.impv_chart.addItem(self.delta002_c_strike_lines[chain_symbol])
 
         self.eris_p_strike_lines[chain_symbol].hide()
         self.eris_c_strike_lines[chain_symbol].hide()
         self.atm_strike_lines[chain_symbol].hide()
         self.underlying_price_lines[chain_symbol].hide()
-        self.delta002_c_strike_lines[chain_symbol].hide()
 
         self.total_volume_bars[chain_symbol] = pg.BarGraphItem(
             x=[],
@@ -619,15 +610,6 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             else:
                 self.eris_c_strike_lines[chain.chain_symbol].hide()
 
-            # Update Delta strike lines
-            if hasattr(chain, "delta002_c_strike") and chain.delta002_c_strike is not None:
-                line = self.delta002_c_strike_lines[chain.chain_symbol]
-                line.setPos(chain.delta002_c_strike)
-                delta_text = f"{chain.delta002_c_delta:.4f}" if getattr(chain, "delta002_c_delta", None) is not None else "N/A"
-                line.label.setText(f"{symbol} CΔ{delta_text}")
-                line.show()
-            else:
-                self.delta002_c_strike_lines[chain.chain_symbol].hide()
 
             # Update ATM strike line
             if chain.atm_price:
@@ -775,7 +757,6 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             prev_put_curve: pg.PlotCurveItem = self.prev_put_curves[chain_symbol]
             p_line = self.eris_p_strike_lines[chain_symbol]
             c_line = self.eris_c_strike_lines[chain_symbol]
-            delta_f_c_line = self.delta002_c_strike_lines[chain_symbol]
             atm_line = self.atm_strike_lines[chain_symbol]
             underlying_line = self.underlying_price_lines[chain_symbol]
             total_volume_bar = self.total_volume_bars[chain_symbol]
@@ -813,7 +794,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 prev_put_curve.hide()
                 p_line.hide()
                 c_line.hide()
-                delta_f_c_line.hide()
+
                 atm_line.hide()
                 underlying_line.hide()
                 total_volume_bar.hide()
@@ -1146,13 +1127,9 @@ class IVHeatmapChart(QtWidgets.QWidget):
 
     # Target delta values: negative = put, positive = call
     DELTA_TARGETS: list[tuple[str, float]] = [
-        ("Put Δ0.02", -0.02),
         ("Put Δ0.10", -0.10),
-        ("Put Δ0.20", -0.20),
         ("ATM (Δ0.50)", -0.50),
-        ("Call Δ0.20", 0.20),
         ("Call Δ0.10", 0.10),
-        ("Call Δ0.02", 0.02),
     ]
 
     def __init__(self, option_engine: OptionEngine, portfolio_name: str) -> None:
@@ -1590,11 +1567,9 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
     """IV時系列チャート - デルタレベル別IV推移の折れ線グラフ"""
 
     DELTA_TARGETS: list[tuple[str, float, str]] = [
-        ("Put Δ0.02", -0.02, "#ff4444"),
         ("Put Δ0.10", -0.10, "#ff8800"),
         ("ATM (Δ0.50)", -0.50, "#ffffff"),
         ("Call Δ0.10", 0.10, "#00ccff"),
-        ("Call Δ0.02", 0.02, "#44ff44"),
     ]
 
     def __init__(self, option_engine: OptionEngine, portfolio_name: str) -> None:

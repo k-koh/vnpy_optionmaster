@@ -351,15 +351,6 @@ class ChainData:
         self.eris_c_strike: int | None = None
         self.eris_c_delta: float | None = None
         self.eris_c_price: float | None = None
-        self.delta022_c_iv: float | None = None      # Call Δ0.22 iv
-        self.delta022_c_strike: int | None = None  # Call Δ0.22 strike
-        self.delta002_c_iv: float | None = None  # Call Δ0.02 iv
-        self.delta002_c_strike: int | None = None  # Call Δ0.02 strike
-        self.delta002_c_delta: float | None = None  # Call Δ0.02 actual delta
-        self.delta012_p_iv: float | None = None      # Put Δ0.12 iv
-        self.delta012_p_strike: int | None = None  # Put Δ0.12 strike
-        self.delta002_p_iv: float | None = None  # Put Δ0.02 iv
-        self.delta002_p_strike: int | None = None  # Put Δ0.02 strike
 
     def add_option(self, option: OptionData) -> None:
         """"""
@@ -640,107 +631,6 @@ class ChainData:
             self.eris_p_delta = None
             self.eris_p_price = None
 
-        # Find call with delta closest to +0.22
-        min_call_delta_diff = 100.0
-        delta022_call = None
-
-        for call in self.calls.values():
-            if not call.theo_delta or not call.size:
-                continue
-
-            if call.strike_price % 1000 != 0:
-                continue
-
-            option_delta = call.theo_delta / call.size
-            delta_diff = abs(option_delta - 0.22)
-
-            if delta_diff < min_call_delta_diff:
-                min_call_delta_diff = delta_diff
-                delta022_call = call
-
-        if delta022_call:
-            self.delta022_c_iv = delta022_call.mid_impv
-            self.delta022_c_strike = delta022_call.strike_price
-        else:
-            self.delta022_c_iv = None
-            self.delta022_c_strike = None
-
-        # Find call with delta closest to +0.022
-        min_call_delta_diff = 100.0
-        delta002_call = None
-
-        for call in self.calls.values():
-            if not call.theo_delta or not call.size:
-                continue
-
-            if call.strike_price % 1000 != 0:
-                continue
-
-            option_delta = call.theo_delta / call.size
-            delta_diff = abs(option_delta - 0.022)
-
-            if delta_diff < min_call_delta_diff:
-                min_call_delta_diff = delta_diff
-                delta002_call = call
-
-        if delta002_call:
-            self.delta002_c_iv = delta002_call.mid_impv
-            self.delta002_c_strike = delta002_call.strike_price
-            self.delta002_c_delta = delta002_call.theo_delta / delta002_call.size if delta002_call.size else None
-        else:
-            self.delta002_c_iv = None
-            self.delta002_c_strike = None
-            self.delta002_c_delta = None
-
-        # Find put with delta closest to -0.12
-        min_put_delta_diff = 100.0
-        delta012_put = None
-
-        for put in self.puts.values():
-            if not put.theo_delta or not put.size:
-                continue
-
-            if put.strike_price % 1000 != 0:
-                continue
-
-            option_delta = put.theo_delta / put.size
-            delta_diff = abs(option_delta - (-0.12))
-
-            if delta_diff < min_put_delta_diff:
-                min_put_delta_diff = delta_diff
-                delta012_put = put
-
-        if delta012_put:
-            self.delta012_p_iv = delta012_put.mid_impv
-            self.delta012_p_strike = delta012_put.strike_price
-        else:
-            self.delta012_p_iv = None
-            self.delta012_p_strike = None
-
-        # Find put with delta closest to -0.022
-        min_put_delta_diff = 100.0
-        delta002_put = None
-
-        for put in self.puts.values():
-            if not put.theo_delta or not put.size:
-                continue
-
-            if put.strike_price % 1000 != 0:
-                continue
-
-            option_delta = put.theo_delta / put.size
-            delta_diff = abs(option_delta - (-0.022))
-
-            if delta_diff < min_put_delta_diff:
-                min_put_delta_diff = delta_diff
-                delta002_put = put
-
-        if delta002_put:
-            self.delta002_p_iv = delta002_put.mid_impv
-            self.delta002_p_strike = delta002_put.strike_price
-        else:
-            self.delta002_p_iv = None
-            self.delta002_p_strike = None
 
     def calculate_underlying_adjustment(self) -> None:
         """"""
@@ -961,9 +851,7 @@ class PreviousDayOptionData:
     def __init__(self) -> None:
         self.bars: dict[datetime, dict[str, BarData]] = {}
         self.eris_p_iv: dict[str, float | None] = {}
-        self.delta002_p_iv: dict[str, float | None] = {}
         self.eris_c_iv: dict[str, float | None] = {}
-        self.delta002_c_iv: dict[str, float | None] = {}
         self.atm_iv: dict[str, float | None] = {}
         self.datetime: dict[int, datetime | None] = {}
         self.sorted_dates: list[datetime] = []
@@ -1105,30 +993,24 @@ class PreviousDayOptionData:
         self,
         op_month: str,
         prev_iv_type: OptionPrevIvType,
-        delta002_put_strike: int,
         put_strike: int,
         call_strike: int,
-        delta022_call_strike: int,
         atm_strike: int,
         dt: datetime
-    ) -> tuple[float, float, float, float, float]:
+    ) -> tuple[float, float, float]:
         """"""
         put_iv: float = 0.0
-        delta002_p_iv: float = 0.0
         call_iv: float = 0.0
-        delta002_c_iv: float = 0.0
         atm_iv: float = 0.0
 
         prev_date = self.get_prev_day_datetime(dt)
         if not prev_date:
-            return delta002_p_iv, put_iv, call_iv, delta002_c_iv, atm_iv
+            return put_iv, call_iv, atm_iv
 
         if prev_iv_type == OptionPrevIvType.SAME_DELTA:
             dt_op_month = prev_date.strftime("%Y-%m-%d-%H-%M-%S") + "_" + op_month
             put_iv = self.eris_p_iv.get(dt_op_month, 0.0)
-            delta002_p_iv = self.delta002_p_iv.get(dt_op_month, 0.0)
             call_iv = self.eris_c_iv.get(dt_op_month, 0.0)
-            delta002_c_iv = self.delta002_c_iv.get(dt_op_month, 0.0)
             atm_iv = self.atm_iv.get(dt_op_month, 0.0)
         elif prev_iv_type == OptionPrevIvType.SAME_STRIKE:
             if put_strike is not None and call_strike is not None:
@@ -1150,22 +1032,6 @@ class PreviousDayOptionData:
                     bar = day_bars[call_vt_symbol]
                     if hasattr(bar, 'iv'):
                         call_iv = bar.iv
-                # Get delta002 Call IV
-                if delta022_call_strike is not None:
-                    delta002_c_strike = int(delta022_call_strike)
-                    delta002_call_vt_symbol = f"{op_month}-C-{delta002_c_strike}.JPX"
-                    if delta002_call_vt_symbol in day_bars:
-                        bar = day_bars[delta002_call_vt_symbol]
-                        if hasattr(bar, 'iv'):
-                            delta002_c_iv = bar.iv
-                # Get delta002 Put IV
-                if delta002_put_strike is not None:
-                    delta002_p_strike = int(delta002_put_strike)
-                    delta002_p_vt_symbol = f"{op_month}-P-{delta002_p_strike}.JPX"
-                    if delta002_p_vt_symbol in day_bars:
-                        bar = day_bars[delta002_p_vt_symbol]
-                        if hasattr(bar, 'iv'):
-                            delta002_p_iv = bar.iv
                 # Calculate ATM IV
                 atm_call_bar = day_bars.get(atm_call_vt_symbol, None)
                 atm_put_bar = day_bars.get(atm_put_vt_symbol, None)
@@ -1179,7 +1045,7 @@ class PreviousDayOptionData:
                     atm_iv = atm_call_iv
                 elif atm_put_iv is not None:
                     atm_iv = atm_put_iv
-        return delta002_p_iv, put_iv, call_iv, delta002_c_iv, atm_iv
+        return put_iv, call_iv, atm_iv
 
     def get_prev_day_iv_curve(
         self,
