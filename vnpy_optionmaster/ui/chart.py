@@ -8,9 +8,12 @@ from vnpy.trader.constant import Exchange, Interval
 from vnpy.trader.database import DB_TZ, get_database, BaseDatabase
 from vnpy.trader.object import BarData
 
+from vnpy.trader.utility import load_json, save_json
+
 from ..base import PortfolioData, OptionData, PreviousDayOptionData
 from ..engine import OptionEngine, Event, EventEngine
 from ..time import ANNUAL_DAYS
+from ..pricing import black_76
 
 import numpy as np
 import matplotlib
@@ -119,6 +122,23 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.impv_chart.addLegend()
         self.impv_chart.setMenuEnabled(False)
         self.impv_chart.setMouseEnabled(False, False)
+
+        # Crosshair cursor for impv_chart
+        self.impv_vline = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("gray", width=0.8, style=QtCore.Qt.DashLine))
+        self.impv_hline = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen("gray", width=0.8, style=QtCore.Qt.DashLine))
+        self.impv_chart.addItem(self.impv_vline, ignoreBounds=True)
+        self.impv_chart.addItem(self.impv_hline, ignoreBounds=True)
+        self.impv_vline.hide()
+        self.impv_hline.hide()
+
+        self.impv_cursor_label = pg.TextItem(color="white", anchor=(0, 1))
+        self.impv_cursor_label.setFont(QtGui.QFont("", 11))
+        self.impv_chart.addItem(self.impv_cursor_label, ignoreBounds=True)
+        self.impv_cursor_label.hide()
+
+        self.impv_proxy = pg.SignalProxy(
+            self.impv_chart.scene().sigMouseMoved, rateLimit=60, slot=self._on_impv_mouse_move
+        )
 
         graphics_window.nextRow()
 
@@ -806,6 +826,28 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                     text_item.hide()
                 for text_item in self.total_volume_text_items[chain_symbol]:
                     text_item.hide()
+
+    def _on_impv_mouse_move(self, evt) -> None:
+        """Show crosshair and coordinate label on impv_chart mouse hover."""
+        pos = evt[0]
+        if not self.impv_chart.sceneBoundingRect().contains(pos):
+            self.impv_vline.hide()
+            self.impv_hline.hide()
+            self.impv_cursor_label.hide()
+            return
+
+        mouse_point = self.impv_chart.vb.mapSceneToView(pos)
+        x: float = mouse_point.x()
+        y: float = mouse_point.y()
+
+        self.impv_vline.setPos(x)
+        self.impv_hline.setPos(y)
+        self.impv_vline.show()
+        self.impv_hline.show()
+
+        self.impv_cursor_label.setText(f"権利行使価格: {x:.0f}  IV: {y:.2f}%")
+        self.impv_cursor_label.setPos(x, y)
+        self.impv_cursor_label.show()
 
 
 class ScenarioAnalysisChart(QtWidgets.QWidget):
@@ -1764,3 +1806,1177 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
 
         self.fig.tight_layout()
         self.canvas.draw()
+
+
+class PayoffDiagramChart(QtWidgets.QWidget):
+    """ペイオフ図 - Position payoff diagram with IV adjustment."""
+
+    SETTING_FILENAME: str = "payoff_diagram_setting.json"
+
+    def __init__(self, option_engine: OptionEngine, portfolio_name: str) -> None:
+        super().__init__()
+
+        self.option_engine: OptionEngine = option_engine
+        self.portfolio_name: str = portfolio_name
+
+        self.init_ui()
+        self._load_settings()
+
+    def init_ui(self) -> None:
+        self.setWindowTitle("ペイオフ図")
+        self.resize(1200, 900)
+
+        # --- Mode selector ---
+        self.mode_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        self.mode_combo.addItems(["ポートフォリオ", "シミュレーション"])
+        self.mode_combo.currentIndexChanged.connect(self._toggle_mode)
+
+        # --- Simulation panel (hidden by default) ---
+        self.sim_group: QtWidgets.QGroupBox = QtWidgets.QGroupBox("シミュレーション設定")
+
+        self.sim_underlying_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.sim_underlying_spin.setRange(10000, 100000)
+        self.sim_underlying_spin.setValue(57000)
+        self.sim_underlying_spin.setSingleStep(100)
+
+        self.sim_days_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.sim_days_spin.setSuffix(" 日")
+        self.sim_days_spin.setRange(1, 365)
+        self.sim_days_spin.setValue(25)
+
+        self.sim_rate_spin: QtWidgets.QDoubleSpinBox = QtWidgets.QDoubleSpinBox()
+        self.sim_rate_spin.setSuffix(" %")
+        self.sim_rate_spin.setRange(0, 10)
+        self.sim_rate_spin.setValue(0.0)
+        self.sim_rate_spin.setDecimals(2)
+
+        # Simulation position table
+        self.sim_table: QtWidgets.QTableWidget = QtWidgets.QTableWidget(0, 5)
+        self.sim_table.setHorizontalHeaderLabels(
+            ["種類", "行使価格", "枚数", "建値", "IV(%)"]
+        )
+        self.sim_table.horizontalHeader().setStretchLastSection(True)
+        self.sim_table.setMaximumHeight(180)
+
+        add_btn: QtWidgets.QPushButton = QtWidgets.QPushButton("行追加")
+        add_btn.clicked.connect(self._add_sim_row)
+        del_btn: QtWidgets.QPushButton = QtWidgets.QPushButton("行削除")
+        del_btn.clicked.connect(self._remove_sim_row)
+
+        sim_param_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        sim_param_hbox.addWidget(QtWidgets.QLabel("先物価格"))
+        sim_param_hbox.addWidget(self.sim_underlying_spin)
+        sim_param_hbox.addWidget(QtWidgets.QLabel("残存日数"))
+        sim_param_hbox.addWidget(self.sim_days_spin)
+        sim_param_hbox.addWidget(QtWidgets.QLabel("金利"))
+        sim_param_hbox.addWidget(self.sim_rate_spin)
+        sim_param_hbox.addStretch()
+        sim_param_hbox.addWidget(add_btn)
+        sim_param_hbox.addWidget(del_btn)
+
+        sim_layout: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
+        sim_layout.addLayout(sim_param_hbox)
+        sim_layout.addWidget(self.sim_table)
+        self.sim_group.setLayout(sim_layout)
+        self.sim_group.hide()
+
+        # --- Common controls ---
+        self.price_range_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.price_range_spin.setSuffix(" pt")
+        self.price_range_spin.setMinimum(1000)
+        self.price_range_spin.setMaximum(20000)
+        self.price_range_spin.setSingleStep(1000)
+        self.price_range_spin.setValue(5000)
+
+        self.step_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        self.step_combo.addItems(["500", "1000"])
+
+        self.days_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.days_spin.setSuffix(" 日")
+        self.days_spin.setMinimum(0)
+        self.days_spin.setMaximum(30)
+        self.days_spin.setValue(1)
+
+        self.iv_sensitivity_spin: QtWidgets.QDoubleSpinBox = QtWidgets.QDoubleSpinBox()
+        self.iv_sensitivity_spin.setSuffix(" %/1000pt")
+        self.iv_sensitivity_spin.setMinimum(-5.0)
+        self.iv_sensitivity_spin.setMaximum(5.0)
+        self.iv_sensitivity_spin.setSingleStep(0.1)
+        self.iv_sensitivity_spin.setValue(-1.0)
+        self.iv_sensitivity_spin.setDecimals(1)
+
+        self.show_legs_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("個別ポジション")
+        self.show_legs_check.setChecked(True)
+
+        button: QtWidgets.QPushButton = QtWidgets.QPushButton("分析実行")
+        button.clicked.connect(self.run_analysis)
+
+        # Chart tabs (left side)
+        self.chart_tabs: QtWidgets.QTabWidget = QtWidgets.QTabWidget()
+
+        self.pnl_fig: Figure = Figure()
+        self.pnl_canvas: FigureCanvas = FigureCanvas(self.pnl_fig)
+        self.pnl_ax = self.pnl_fig.add_subplot(111)
+        self.chart_tabs.addTab(self.pnl_canvas, "損益")
+
+        self.delta_fig: Figure = Figure()
+        self.delta_canvas: FigureCanvas = FigureCanvas(self.delta_fig)
+        self.delta_ax = self.delta_fig.add_subplot(111)
+        self.chart_tabs.addTab(self.delta_canvas, "Delta")
+
+        self.gamma_fig: Figure = Figure()
+        self.gamma_canvas: FigureCanvas = FigureCanvas(self.gamma_fig)
+        self.gamma_ax = self.gamma_fig.add_subplot(111)
+        self.chart_tabs.addTab(self.gamma_canvas, "Gamma")
+
+        self.theta_fig: Figure = Figure()
+        self.theta_canvas: FigureCanvas = FigureCanvas(self.theta_fig)
+        self.theta_ax = self.theta_fig.add_subplot(111)
+        self.chart_tabs.addTab(self.theta_canvas, "Theta")
+
+        self.vega_fig: Figure = Figure()
+        self.vega_canvas: FigureCanvas = FigureCanvas(self.vega_fig)
+        self.vega_ax = self.vega_fig.add_subplot(111)
+        self.chart_tabs.addTab(self.vega_canvas, "Vega")
+
+        # Crosshair cursor setup — elements are created per-axis after each redraw
+        self._cursor_lines: dict[str, tuple] = {}
+        self._cursor_texts: dict[str, tuple] = {}
+        self._cursor_y_fmts: dict[str, str] = {
+            "pnl": ".1f", "delta": ".2f", "gamma": ".6f", "theta": ".1f", "vega": ".2f",
+        }
+        for canvas in (self.pnl_canvas, self.delta_canvas,
+                       self.gamma_canvas, self.theta_canvas, self.vega_canvas):
+            canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+
+        # Results table (right side, below settings)
+        self.result_table: QtWidgets.QTableWidget = QtWidgets.QTableWidget()
+        self.result_table.setAlternatingRowColors(True)
+
+        # --- Right panel: all settings + table ---
+        right_panel: QtWidgets.QWidget = QtWidgets.QWidget()
+        right_panel.setMaximumWidth(2880)
+        right_panel.setMinimumWidth(350)
+
+        # Mode selector
+        mode_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        mode_hbox.addWidget(QtWidgets.QLabel("モード"))
+        mode_hbox.addWidget(self.mode_combo)
+        mode_hbox.addStretch()
+
+        # Common controls — use a form-style grid
+        ctrl_grid: QtWidgets.QGridLayout = QtWidgets.QGridLayout()
+        ctrl_grid.addWidget(QtWidgets.QLabel("価格範囲"), 0, 0)
+        ctrl_grid.addWidget(self.price_range_spin, 0, 1)
+        ctrl_grid.addWidget(QtWidgets.QLabel("ステップ"), 0, 2)
+        ctrl_grid.addWidget(self.step_combo, 0, 3)
+        ctrl_grid.addWidget(QtWidgets.QLabel("日数"), 1, 0)
+        ctrl_grid.addWidget(self.days_spin, 1, 1)
+        ctrl_grid.addWidget(QtWidgets.QLabel("IV感応度"), 1, 2)
+        ctrl_grid.addWidget(self.iv_sensitivity_spin, 1, 3)
+
+        btn_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        btn_hbox.addWidget(self.show_legs_check)
+        btn_hbox.addStretch()
+        btn_hbox.addWidget(button)
+
+        right_vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
+        right_vbox.addLayout(mode_hbox)
+        right_vbox.addWidget(self.sim_group)
+        right_vbox.addLayout(ctrl_grid)
+        right_vbox.addLayout(btn_hbox)
+        right_vbox.addWidget(self.result_table, stretch=1)
+        right_panel.setLayout(right_vbox)
+
+        # --- Main layout: chart (left) | settings+table (right) ---
+        splitter: QtWidgets.QSplitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter.addWidget(self.chart_tabs)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 6)
+
+        main_layout: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        main_layout.addWidget(splitter)
+        self.setLayout(main_layout)
+
+    # ------------------------------------------------------------------
+    #  Mouse cursor crosshair
+    # ------------------------------------------------------------------
+    def _init_cursor(self, name: str, ax) -> None:
+        """(Re-)create crosshair elements on an axes after it has been redrawn."""
+        # Preserve axis limits so the cursor elements don't alter them
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+
+        h_line = ax.axhline(color="gray", linewidth=0.8, linestyle="--", visible=False)
+        v_line = ax.axvline(color="gray", linewidth=0.8, linestyle="--", visible=False)
+        self._cursor_lines[name] = (h_line, v_line)
+
+        bbox_style = dict(facecolor="black", alpha=0.7, edgecolor="none", pad=3)
+        x_text = ax.text(
+            xlim[0], ylim[0], "", fontsize=11, color="white", bbox=bbox_style,
+            visible=False, transform=ax.transData,
+        )
+        y_text = ax.text(
+            xlim[0], ylim[0], "", fontsize=11, color="white", bbox=bbox_style,
+            visible=False, transform=ax.transData,
+        )
+        self._cursor_texts[name] = (x_text, y_text, self._cursor_y_fmts[name])
+
+        # Restore original limits
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+
+    def _on_mouse_move(self, event) -> None:
+        """Show crosshair and x/y labels on mouse hover for all charts."""
+        if not event.inaxes:
+            for h, v in self._cursor_lines.values():
+                h.set_visible(False)
+                v.set_visible(False)
+            for xt, yt, _ in self._cursor_texts.values():
+                xt.set_visible(False)
+                yt.set_visible(False)
+            for canvas in (self.pnl_canvas, self.delta_canvas,
+                           self.gamma_canvas, self.theta_canvas,
+                           self.vega_canvas):
+                canvas.draw_idle()
+            return
+
+        ax = event.inaxes
+        x, y = event.xdata, event.ydata
+
+        # Find which chart this event belongs to
+        name_map = {
+            id(self.pnl_ax): ("pnl", self.pnl_canvas),
+            id(self.delta_ax): ("delta", self.delta_canvas),
+            id(self.gamma_ax): ("gamma", self.gamma_canvas),
+            id(self.theta_ax): ("theta", self.theta_canvas),
+            id(self.vega_ax): ("vega", self.vega_canvas),
+        }
+        match = name_map.get(id(ax))
+        if not match:
+            return
+        name, canvas = match
+
+        if name not in self._cursor_lines:
+            return
+
+        h_line, v_line = self._cursor_lines[name]
+        x_text, y_text, y_fmt = self._cursor_texts[name]
+
+        h_line.set_ydata([y, y])
+        v_line.set_xdata([x, x])
+        h_line.set_visible(True)
+        v_line.set_visible(True)
+
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+
+        x_text.set_position((x, ylim[0]))
+        x_text.set_text(f"{x:.0f}")
+        x_text.set_ha("center")
+        x_text.set_va("top")
+        x_text.set_visible(True)
+
+        y_text.set_position((xlim[0], y))
+        y_text.set_text(f"{y:{y_fmt}}")
+        y_text.set_ha("left")
+        y_text.set_va("center")
+        y_text.set_visible(True)
+
+        canvas.draw_idle()
+
+    # ------------------------------------------------------------------
+    #  Save / Load settings
+    # ------------------------------------------------------------------
+    def _save_settings(self) -> None:
+        """Save all settings and simulation positions to JSON."""
+        # Read simulation position rows
+        sim_positions: list[dict] = []
+        for row in range(self.sim_table.rowCount()):
+            combo: QtWidgets.QComboBox = self.sim_table.cellWidget(row, 0)
+            type_text: str = combo.currentText() if combo else "コール"
+            sim_positions.append({
+                "type": type_text,
+                "strike": self.sim_table.item(row, 1).text() if self.sim_table.item(row, 1) else "",
+                "lots": self.sim_table.item(row, 2).text() if self.sim_table.item(row, 2) else "",
+                "entry_price": self.sim_table.item(row, 3).text() if self.sim_table.item(row, 3) else "",
+                "iv": self.sim_table.item(row, 4).text() if self.sim_table.item(row, 4) else "",
+            })
+
+        data: dict = {
+            "mode": self.mode_combo.currentIndex(),
+            "sim_underlying": self.sim_underlying_spin.value(),
+            "sim_days": self.sim_days_spin.value(),
+            "sim_rate": self.sim_rate_spin.value(),
+            "sim_positions": sim_positions,
+            "price_range": self.price_range_spin.value(),
+            "step": self.step_combo.currentText(),
+            "days": self.days_spin.value(),
+            "iv_sensitivity": self.iv_sensitivity_spin.value(),
+            "show_legs": self.show_legs_check.isChecked(),
+        }
+        save_json(self.SETTING_FILENAME, data)
+
+    def _load_settings(self) -> None:
+        """Restore settings and simulation positions from JSON."""
+        data: dict = load_json(self.SETTING_FILENAME)
+        if not data:
+            return
+
+        self.mode_combo.setCurrentIndex(data.get("mode", 0))
+        self.sim_underlying_spin.setValue(data.get("sim_underlying", 57000))
+        self.sim_days_spin.setValue(data.get("sim_days", 25))
+        self.sim_rate_spin.setValue(data.get("sim_rate", 0.0))
+        self.price_range_spin.setValue(data.get("price_range", 5000))
+        self.days_spin.setValue(data.get("days", 1))
+        self.iv_sensitivity_spin.setValue(data.get("iv_sensitivity", -1.0))
+        self.show_legs_check.setChecked(data.get("show_legs", True))
+
+        step_text: str = data.get("step", "500")
+        idx: int = self.step_combo.findText(step_text)
+        if idx >= 0:
+            self.step_combo.setCurrentIndex(idx)
+
+        # Restore simulation position rows
+        for pos in data.get("sim_positions", []):
+            row: int = self.sim_table.rowCount()
+            self.sim_table.insertRow(row)
+
+            type_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+            type_combo.addItems(["コール", "プット", "先物ミニ", "先物ラージ"])
+            combo_idx: int = type_combo.findText(pos.get("type", "コール"))
+            if combo_idx >= 0:
+                type_combo.setCurrentIndex(combo_idx)
+            self.sim_table.setCellWidget(row, 0, type_combo)
+
+            self.sim_table.setItem(row, 1, QtWidgets.QTableWidgetItem(pos.get("strike", "")))
+            self.sim_table.setItem(row, 2, QtWidgets.QTableWidgetItem(pos.get("lots", "")))
+            self.sim_table.setItem(row, 3, QtWidgets.QTableWidgetItem(pos.get("entry_price", "")))
+            self.sim_table.setItem(row, 4, QtWidgets.QTableWidgetItem(pos.get("iv", "")))
+
+        self._toggle_mode()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        """Auto-save settings when the window is closed."""
+        self._save_settings()
+        super().closeEvent(event)
+
+    # ------------------------------------------------------------------
+    #  Simulation panel helpers
+    # ------------------------------------------------------------------
+    def _toggle_mode(self) -> None:
+        is_sim: bool = self.mode_combo.currentIndex() == 1
+        self.sim_group.setVisible(is_sim)
+
+    def _add_sim_row(self) -> None:
+        row: int = self.sim_table.rowCount()
+        self.sim_table.insertRow(row)
+
+        type_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        type_combo.addItems(["コール", "プット", "先物ミニ", "先物ラージ"])
+        self.sim_table.setCellWidget(row, 0, type_combo)
+
+        self.sim_table.setItem(row, 1, QtWidgets.QTableWidgetItem("62000"))
+        self.sim_table.setItem(row, 2, QtWidgets.QTableWidgetItem("5"))
+        self.sim_table.setItem(row, 3, QtWidgets.QTableWidgetItem("152"))
+        self.sim_table.setItem(row, 4, QtWidgets.QTableWidgetItem("25.0"))
+
+    def _remove_sim_row(self) -> None:
+        row: int = self.sim_table.currentRow()
+        if row >= 0:
+            self.sim_table.removeRow(row)
+
+    def _get_sim_positions(self) -> list[dict]:
+        """Read positions from the simulation table."""
+        type_map: dict[str, tuple[str, int]] = {
+            "コール": ("call", 1000),
+            "プット": ("put", 1000),
+            "先物ミニ": ("futures", 100),
+            "先物ラージ": ("futures", 1000),
+        }
+        positions: list[dict] = []
+        for row in range(self.sim_table.rowCount()):
+            combo: QtWidgets.QComboBox = self.sim_table.cellWidget(row, 0)
+            if not combo:
+                continue
+            type_text: str = combo.currentText()
+            kind, size = type_map.get(type_text, ("call", 1000))
+
+            try:
+                strike = float(self.sim_table.item(row, 1).text()) if kind != "futures" else 0.0
+                lots = int(float(self.sim_table.item(row, 2).text()))
+                entry_price = float(self.sim_table.item(row, 3).text())
+                iv = float(self.sim_table.item(row, 4).text()) / 100.0 if kind != "futures" else 0.0
+            except (ValueError, AttributeError):
+                continue
+
+            cp: int = 0
+            if kind == "call":
+                cp = 1
+            elif kind == "put":
+                cp = -1
+
+            positions.append({
+                "kind": kind, "cp": cp, "strike": strike,
+                "lots": lots, "entry_price": entry_price,
+                "iv": iv, "size": size, "label": type_text,
+            })
+        return positions
+
+    def _calculate_sim_pnl_at_price(
+        self,
+        positions: list[dict],
+        sim_price: float,
+        ref_price: float,
+        time_to_expiry: float,
+        interest_rate: float,
+        time_change: float,
+        iv_per_1000: float,
+    ) -> tuple[float, float, float, float, dict[int, float]]:
+        """Calculate P&L for simulation positions (change from current state).
+
+        Baseline is the model-calculated value at ref_price, so P&L = 0
+        at (ref_price, same time, same IV).
+        """
+        iv_adj: float = iv_per_1000 / 100.0 * ((sim_price - ref_price) / 1000.0)
+
+        total_now: float = 0.0
+        total_day_same: float = 0.0
+        total_day_adj: float = 0.0
+        total_expiry: float = 0.0
+        leg_pnls: dict[int, float] = {}
+
+        for i, pos in enumerate(positions):
+            lots: int = pos["lots"]
+            size: int = pos["size"]
+
+            if pos["kind"] == "futures":
+                # Baseline = ref_price; P&L = 0 when sim_price == ref_price
+                pnl: float = (sim_price - ref_price) * lots * size
+                total_now += pnl
+                total_day_same += pnl
+                total_day_adj += pnl
+                total_expiry += pnl
+                leg_pnls[i] = pnl
+            else:
+                cp: int = pos["cp"]
+                strike: float = pos["strike"]
+                iv: float = pos["iv"]
+
+                # Baseline: model price at current conditions
+                base: float = black_76.calculate_price(
+                    ref_price, strike, interest_rate, time_to_expiry, iv, cp
+                )
+
+                # Scenario 1: current time, current IV
+                p_now: float = black_76.calculate_price(
+                    sim_price, strike, interest_rate, time_to_expiry, iv, cp
+                )
+                total_now += (p_now - base) * lots * size
+
+                # Scenario 2: +N days, same IV
+                new_t: float = max(time_to_expiry - time_change, 1e-6)
+                p_day: float = black_76.calculate_price(
+                    sim_price, strike, interest_rate, new_t, iv, cp
+                )
+                total_day_same += (p_day - base) * lots * size
+
+                # Scenario 3: +N days, IV adjusted
+                new_iv: float = max(iv + iv_adj, 0.01)
+                p_adj: float = black_76.calculate_price(
+                    sim_price, strike, interest_rate, new_t, new_iv, cp
+                )
+                total_day_adj += (p_adj - base) * lots * size
+
+                # Scenario 4: expiration
+                intrinsic: float = max(0.0, cp * (sim_price - strike))
+                total_expiry += (intrinsic - base) * lots * size
+
+                leg_pnls[i] = (p_adj - base) * lots * size
+
+        return total_now, total_day_same, total_day_adj, total_expiry, leg_pnls
+
+    def _calculate_pnl_at_price(
+        self,
+        portfolio: PortfolioData,
+        sim_price: float,
+        ref_price: float,
+        time_change: float,
+        iv_per_1000: float,
+    ) -> tuple[float, float, float, float, dict[str, float]]:
+        """Calculate portfolio P&L at a simulated underlying price.
+
+        Returns (pnl_now, pnl_day_same_iv, pnl_day_adj_iv, pnl_expiry, leg_pnls)
+        in raw yen.
+        """
+        price_ratio: float = sim_price / ref_price
+        iv_adj: float = iv_per_1000 / 100.0 * ((sim_price - ref_price) / 1000.0)
+
+        total_now: float = 0.0
+        total_day_same: float = 0.0
+        total_day_adj: float = 0.0
+        total_expiry: float = 0.0
+        leg_pnls: dict[str, float] = {}
+
+        # Underlying (futures) P&L — same for all time scenarios
+        for underlying in portfolio.underlyings.values():
+            if not underlying.net_pos:
+                continue
+            pnl: float = (underlying.mid_price * price_ratio - underlying.mid_price) \
+                * underlying.net_pos * underlying.size
+            total_now += pnl
+            total_day_same += pnl
+            total_day_adj += pnl
+            total_expiry += pnl
+            leg_pnls[underlying.vt_symbol] = pnl
+
+        # Option P&L
+        for option in portfolio.options.values():
+            if not option.net_pos or not option.mid_impv or not option.tick:
+                continue
+
+            current_last: float = option.tick.last_price
+            if not current_last:
+                continue
+
+            new_underlying: float = option.underlying.mid_price * price_ratio
+            multiplier: float = option.net_pos * option.size
+
+            # Scenario 1: current time, current IV
+            try:
+                p_now, _, _, _, _ = option.calculate_greeks(
+                    new_underlying, option.strike_price, option.interest_rate,
+                    option.time_to_expiry, option.mid_impv, option.option_type
+                )
+            except Exception:
+                p_now = current_last
+            total_now += (p_now - current_last) * multiplier
+
+            # Scenario 2: +N days, same IV
+            new_t: float = max(option.time_to_expiry - time_change, 1e-6)
+            try:
+                p_day, _, _, _, _ = option.calculate_greeks(
+                    new_underlying, option.strike_price, option.interest_rate,
+                    new_t, option.mid_impv, option.option_type
+                )
+            except Exception:
+                p_day = current_last
+            total_day_same += (p_day - current_last) * multiplier
+
+            # Scenario 3: +N days, IV adjusted by underlying move
+            new_iv: float = max(option.mid_impv + iv_adj, 0.01)
+            try:
+                p_adj, _, _, _, _ = option.calculate_greeks(
+                    new_underlying, option.strike_price, option.interest_rate,
+                    new_t, new_iv, option.option_type
+                )
+            except Exception:
+                p_adj = current_last
+            total_day_adj += (p_adj - current_last) * multiplier
+
+            # Scenario 4: at expiration (intrinsic only)
+            intrinsic: float = max(
+                0.0, option.option_type * (new_underlying - option.strike_price)
+            )
+            total_expiry += (intrinsic - current_last) * multiplier
+
+            # Leg P&L uses the IV-adjusted scenario
+            leg_pnls[option.vt_symbol] = (p_adj - current_last) * multiplier
+
+        return total_now, total_day_same, total_day_adj, total_expiry, leg_pnls
+
+    def run_analysis(self) -> None:
+        is_sim: bool = self.mode_combo.currentIndex() == 1
+
+        if is_sim:
+            self._run_sim_analysis()
+        else:
+            self._run_portfolio_analysis()
+
+    # ------------------------------------------------------------------
+    #  Portfolio mode
+    # ------------------------------------------------------------------
+    def _run_portfolio_analysis(self) -> None:
+        portfolio: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
+
+        # Find reference underlying with valid price
+        ref_price: float = 0.0
+        for underlying in portfolio.underlyings.values():
+            if underlying.mid_price:
+                ref_price = underlying.mid_price
+                break
+
+        if not ref_price:
+            QtWidgets.QMessageBox.warning(
+                self, "エラー",
+                "原資産の価格データがありません",
+                QtWidgets.QMessageBox.Ok
+            )
+            return
+
+        # Read parameters
+        price_range: int = self.price_range_spin.value()
+        step: int = int(self.step_combo.currentText())
+        days: int = self.days_spin.value()
+        iv_per_1000: float = self.iv_sensitivity_spin.value()
+        time_change: float = days / ANNUAL_DAYS
+        show_legs: bool = self.show_legs_check.isChecked()
+
+        # Build leg labels
+        leg_labels: dict[str, str] = {}
+        if show_legs:
+            for underlying in portfolio.underlyings.values():
+                if underlying.net_pos:
+                    pos_str = f"+{underlying.net_pos}" if underlying.net_pos > 0 \
+                        else str(underlying.net_pos)
+                    leg_labels[underlying.vt_symbol] = f"先物 {pos_str}枚"
+            for option in portfolio.options.values():
+                if option.net_pos and option.mid_impv and option.tick:
+                    cp_str = "C" if option.option_type > 0 else "P"
+                    pos_str = f"+{option.net_pos}" if option.net_pos > 0 \
+                        else str(option.net_pos)
+                    leg_labels[option.vt_symbol] = \
+                        f"{cp_str}{option.strike_price:.0f} {pos_str}枚"
+
+        # Fine-grained prices for smooth chart curves
+        fine_step: int = 100
+        prices_fine: np.ndarray = np.arange(
+            ref_price - price_range,
+            ref_price + price_range + fine_step,
+            fine_step,
+        )
+
+        pnl_now_arr: list[float] = []
+        pnl_day_same_arr: list[float] = []
+        pnl_day_adj_arr: list[float] = []
+        pnl_expiry_arr: list[float] = []
+        leg_pnl_arrs: dict[str, list[float]] = {k: [] for k in leg_labels}
+        greeks_data: dict[str, dict[str, list[float]]] = {
+            k: {"now": [], "day_same": [], "day_adj": []}
+            for k in ("delta", "gamma", "theta", "vega")
+        }
+
+        for sim_price in prices_fine:
+            sp: float = float(sim_price)
+            now, day_same, day_adj, expiry, legs = self._calculate_pnl_at_price(
+                portfolio, sp, ref_price, time_change, iv_per_1000
+            )
+            pnl_now_arr.append(now / 1000)
+            pnl_day_same_arr.append(day_same / 1000)
+            pnl_day_adj_arr.append(day_adj / 1000)
+            pnl_expiry_arr.append(expiry / 1000)
+
+            for key in leg_pnl_arrs:
+                leg_pnl_arrs[key].append(legs.get(key, 0) / 1000)
+
+            g_now, g_ds, g_da = self._calculate_portfolio_greeks_at_price(
+                portfolio, sp, ref_price, time_change, iv_per_1000
+            )
+            for gk in ("delta", "gamma", "theta", "vega"):
+                greeks_data[gk]["now"].append(g_now[gk])
+                greeks_data[gk]["day_same"].append(g_ds[gk])
+                greeks_data[gk]["day_adj"].append(g_da[gk])
+
+        # Step-level values for the results table
+        prices_step: np.ndarray = np.arange(
+            ref_price - price_range,
+            ref_price + price_range + step,
+            step,
+        )
+        table_data: list[dict] = []
+        for sim_price in prices_step:
+            now, day_same, day_adj, expiry, _ = self._calculate_pnl_at_price(
+                portfolio, float(sim_price), ref_price, time_change, iv_per_1000
+            )
+            iv_change_pct: float = iv_per_1000 * ((sim_price - ref_price) / 1000.0)
+            table_data.append({
+                "price": float(sim_price),
+                "iv_change": iv_change_pct,
+                "pnl_now": now / 1000,
+                "pnl_day_same": day_same / 1000,
+                "pnl_day_adj": day_adj / 1000,
+                "pnl_expiry": expiry / 1000,
+            })
+
+        # Portfolio greeks for title
+        greeks_str: str = (
+            f"Δ:{portfolio.pos_delta:.2f}  Γ:{portfolio.pos_gamma:.2f}  "
+            f"Θ:{portfolio.pos_theta:.2f}  V:{portfolio.pos_vega:.2f}"
+        )
+
+        self._update_chart(
+            prices_fine, pnl_now_arr, pnl_day_same_arr, pnl_day_adj_arr,
+            pnl_expiry_arr, leg_pnl_arrs, leg_labels, ref_price, days,
+            show_legs, greeks_str,
+        )
+        self._update_greeks_charts(prices_fine, greeks_data, ref_price, days)
+        self._update_table(table_data, days)
+
+    # ------------------------------------------------------------------
+    #  Simulation mode
+    # ------------------------------------------------------------------
+    def _run_sim_analysis(self) -> None:
+        positions: list[dict] = self._get_sim_positions()
+        if not positions:
+            QtWidgets.QMessageBox.warning(
+                self, "エラー",
+                "ポジションを入力してください",
+                QtWidgets.QMessageBox.Ok
+            )
+            return
+
+        ref_price: float = float(self.sim_underlying_spin.value())
+        sim_days_to_expiry: int = self.sim_days_spin.value()
+        time_to_expiry: float = sim_days_to_expiry / ANNUAL_DAYS
+        interest_rate: float = self.sim_rate_spin.value() / 100.0
+
+        price_range: int = self.price_range_spin.value()
+        step: int = int(self.step_combo.currentText())
+        days: int = self.days_spin.value()
+        iv_per_1000: float = self.iv_sensitivity_spin.value()
+        time_change: float = days / ANNUAL_DAYS
+        show_legs: bool = self.show_legs_check.isChecked()
+
+        # Build leg labels from simulation positions
+        leg_labels: dict[int, str] = {}
+        if show_legs:
+            for i, pos in enumerate(positions):
+                sign: str = "+" if pos["lots"] > 0 else ""
+                if pos["kind"] == "futures":
+                    leg_labels[i] = f"{pos['label']} {sign}{pos['lots']}枚"
+                else:
+                    cp_str = "C" if pos["cp"] == 1 else "P"
+                    leg_labels[i] = \
+                        f"{cp_str}{pos['strike']:.0f} {sign}{pos['lots']}枚"
+
+        # Fine-grained prices
+        fine_step: int = 100
+        prices_fine: np.ndarray = np.arange(
+            ref_price - price_range,
+            ref_price + price_range + fine_step,
+            fine_step,
+        )
+
+        pnl_now_arr: list[float] = []
+        pnl_day_same_arr: list[float] = []
+        pnl_day_adj_arr: list[float] = []
+        pnl_expiry_arr: list[float] = []
+        leg_pnl_arrs: dict[int, list[float]] = {k: [] for k in leg_labels}
+        greeks_data: dict[str, dict[str, list[float]]] = {
+            k: {"now": [], "day_same": [], "day_adj": []}
+            for k in ("delta", "gamma", "theta", "vega")
+        }
+
+        for sim_price in prices_fine:
+            sp: float = float(sim_price)
+            now, day_same, day_adj, expiry, legs = self._calculate_sim_pnl_at_price(
+                positions, sp, ref_price,
+                time_to_expiry, interest_rate, time_change, iv_per_1000,
+            )
+            pnl_now_arr.append(now / 1000)
+            pnl_day_same_arr.append(day_same / 1000)
+            pnl_day_adj_arr.append(day_adj / 1000)
+            pnl_expiry_arr.append(expiry / 1000)
+
+            for key in leg_pnl_arrs:
+                leg_pnl_arrs[key].append(legs.get(key, 0) / 1000)
+
+            g_now, g_ds, g_da = self._calculate_sim_greeks_at_price(
+                positions, sp, ref_price,
+                time_to_expiry, interest_rate, time_change, iv_per_1000,
+            )
+            for gk in ("delta", "gamma", "theta", "vega"):
+                greeks_data[gk]["now"].append(g_now[gk])
+                greeks_data[gk]["day_same"].append(g_ds[gk])
+                greeks_data[gk]["day_adj"].append(g_da[gk])
+
+        # Step-level values for table
+        prices_step: np.ndarray = np.arange(
+            ref_price - price_range,
+            ref_price + price_range + step,
+            step,
+        )
+        table_data: list[dict] = []
+        for sim_price in prices_step:
+            now, day_same, day_adj, expiry, _ = self._calculate_sim_pnl_at_price(
+                positions, float(sim_price), ref_price,
+                time_to_expiry, interest_rate, time_change, iv_per_1000,
+            )
+            iv_change_pct: float = iv_per_1000 * ((sim_price - ref_price) / 1000.0)
+            table_data.append({
+                "price": float(sim_price),
+                "iv_change": iv_change_pct,
+                "pnl_now": now / 1000,
+                "pnl_day_same": day_same / 1000,
+                "pnl_day_adj": day_adj / 1000,
+                "pnl_expiry": expiry / 1000,
+            })
+
+        # Greeks summary for simulation
+        greeks_str = self._calc_sim_greeks_str(
+            positions, ref_price, time_to_expiry, interest_rate
+        )
+
+        self._update_chart(
+            prices_fine, pnl_now_arr, pnl_day_same_arr, pnl_day_adj_arr,
+            pnl_expiry_arr, leg_pnl_arrs, leg_labels, ref_price, days,
+            show_legs, greeks_str,
+        )
+        self._update_greeks_charts(prices_fine, greeks_data, ref_price, days)
+        self._update_table(table_data, days)
+
+    def _calc_sim_greeks_str(
+        self,
+        positions: list[dict],
+        ref_price: float,
+        time_to_expiry: float,
+        interest_rate: float,
+    ) -> str:
+        """Calculate aggregate greeks for simulation positions."""
+        total_delta: float = 0.0
+        total_gamma: float = 0.0
+        total_theta: float = 0.0
+        total_vega: float = 0.0
+
+        for pos in positions:
+            lots: int = pos["lots"]
+            size: int = pos["size"]
+            if pos["kind"] == "futures":
+                total_delta += lots * size
+            else:
+                _, delta, gamma, theta, vega = black_76.calculate_greeks(
+                    ref_price, pos["strike"], interest_rate,
+                    time_to_expiry, pos["iv"], pos["cp"],
+                )
+                total_delta += delta * size * lots
+                total_gamma += gamma * size * lots
+                total_theta += theta * size / ANNUAL_DAYS * lots
+                total_vega += vega * size / 100 * lots
+
+        return (
+            f"Δ:{total_delta:.2f}  Γ:{total_gamma:.2f}  "
+            f"Θ:{total_theta:.2f}  V:{total_vega:.2f}"
+        )
+
+    # ------------------------------------------------------------------
+    #  Chart rendering
+    # ------------------------------------------------------------------
+    def _update_chart(
+        self,
+        prices: np.ndarray,
+        pnl_now: list[float],
+        pnl_day_same: list[float],
+        pnl_day_adj: list[float],
+        pnl_expiry: list[float],
+        leg_pnl_arrs: dict,
+        leg_labels: dict,
+        current_price: float,
+        days: int,
+        show_legs: bool,
+        greeks_str: str = "",
+    ) -> None:
+        self.pnl_ax.clear()
+
+        # Individual position legs (thin, semi-transparent)
+        if show_legs and leg_pnl_arrs:
+            leg_colors = [
+                "#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFEAA7",
+                "#DDA0DD", "#98D8C8", "#F7DC6F", "#BB8FCE", "#85C1E9",
+            ]
+            for i, (key, pnls) in enumerate(leg_pnl_arrs.items()):
+                color = leg_colors[i % len(leg_colors)]
+                label = leg_labels.get(key, str(key))
+                self.pnl_ax.plot(
+                    prices, pnls, color=color, linewidth=1, alpha=0.6, label=label,
+                )
+
+        # Main scenario curves
+        self.pnl_ax.plot(prices, pnl_now, color="white", linewidth=2.5, label="現在")
+        self.pnl_ax.plot(
+            prices, pnl_day_same, color="#00BFFF", linewidth=2,
+            label=f"+{days}日(同IV)",
+        )
+        self.pnl_ax.plot(
+            prices, pnl_day_adj, color="#FFD700", linewidth=2,
+            label=f"+{days}日(IV変動)",
+        )
+        self.pnl_ax.plot(
+            prices, pnl_expiry, color="#808080", linewidth=1,
+            linestyle="--", label="満期",
+        )
+
+        # Reference lines
+        self.pnl_ax.axvline(
+            x=current_price, color="cyan", linestyle=":", alpha=0.5,
+            label=f"現在値: {current_price:.0f}",
+        )
+        self.pnl_ax.axhline(y=0, color="gray", linestyle="-", alpha=0.3)
+
+        title: str = "損益"
+        if greeks_str:
+            title += f"    {greeks_str}"
+        self.pnl_ax.set_title(title)
+        self.pnl_ax.set_xlabel("原資産価格")
+        self.pnl_ax.set_ylabel("損益 (千円)")
+        self.pnl_ax.legend(loc="upper right", fontsize=8, framealpha=0.7)
+        self.pnl_ax.grid(True, alpha=0.3)
+
+        self._init_cursor("pnl", self.pnl_ax)
+        self.pnl_fig.tight_layout()
+        self.pnl_canvas.draw()
+
+    # ------------------------------------------------------------------
+    #  Greeks calculation
+    # ------------------------------------------------------------------
+    def _calculate_sim_greeks_at_price(
+        self,
+        positions: list[dict],
+        sim_price: float,
+        ref_price: float,
+        time_to_expiry: float,
+        interest_rate: float,
+        time_change: float,
+        iv_per_1000: float,
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+        """Calculate aggregate Greeks at a simulated price for simulation mode.
+
+        Returns (greeks_now, greeks_day_same, greeks_day_adj).
+        Each dict has keys: delta, gamma, theta, vega.
+        """
+        iv_adj: float = iv_per_1000 / 100.0 * ((sim_price - ref_price) / 1000.0)
+        g_now: dict[str, float] = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+        g_day_same: dict[str, float] = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+        g_day_adj: dict[str, float] = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+
+        for pos in positions:
+            lots: int = pos["lots"]
+            size: int = pos["size"]
+
+            if pos["kind"] == "futures":
+                fd: float = lots * size
+                g_now["delta"] += fd
+                g_day_same["delta"] += fd
+                g_day_adj["delta"] += fd
+            else:
+                cp: int = pos["cp"]
+                strike: float = pos["strike"]
+                iv: float = pos["iv"]
+                new_t: float = max(time_to_expiry - time_change, 1e-6)
+                new_iv: float = max(iv + iv_adj, 0.01)
+
+                # Current time, current IV
+                _, d, g, th, ve = black_76.calculate_greeks(
+                    sim_price, strike, interest_rate, time_to_expiry, iv, cp
+                )
+                g_now["delta"] += d * size * lots
+                g_now["gamma"] += g * size * lots
+                g_now["theta"] += th * size / ANNUAL_DAYS * lots
+                g_now["vega"] += ve * size / 100 * lots
+
+                # +N days, same IV
+                _, d, g, th, ve = black_76.calculate_greeks(
+                    sim_price, strike, interest_rate, new_t, iv, cp
+                )
+                g_day_same["delta"] += d * size * lots
+                g_day_same["gamma"] += g * size * lots
+                g_day_same["theta"] += th * size / ANNUAL_DAYS * lots
+                g_day_same["vega"] += ve * size / 100 * lots
+
+                # +N days, IV adjusted
+                _, d, g, th, ve = black_76.calculate_greeks(
+                    sim_price, strike, interest_rate, new_t, new_iv, cp
+                )
+                g_day_adj["delta"] += d * size * lots
+                g_day_adj["gamma"] += g * size * lots
+                g_day_adj["theta"] += th * size / ANNUAL_DAYS * lots
+                g_day_adj["vega"] += ve * size / 100 * lots
+
+        return g_now, g_day_same, g_day_adj
+
+    def _calculate_portfolio_greeks_at_price(
+        self,
+        portfolio: PortfolioData,
+        sim_price: float,
+        ref_price: float,
+        time_change: float,
+        iv_per_1000: float,
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+        """Calculate aggregate Greeks at a simulated price for portfolio mode."""
+        price_ratio: float = sim_price / ref_price
+        iv_adj: float = iv_per_1000 / 100.0 * ((sim_price - ref_price) / 1000.0)
+        g_now: dict[str, float] = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+        g_day_same: dict[str, float] = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+        g_day_adj: dict[str, float] = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+
+        for underlying in portfolio.underlyings.values():
+            if not underlying.net_pos:
+                continue
+            fd: float = underlying.size * underlying.net_pos
+            g_now["delta"] += fd
+            g_day_same["delta"] += fd
+            g_day_adj["delta"] += fd
+
+        for option in portfolio.options.values():
+            if not option.net_pos or not option.mid_impv or not option.tick:
+                continue
+            new_underlying: float = option.underlying.mid_price * price_ratio
+            new_t: float = max(option.time_to_expiry - time_change, 1e-6)
+            new_iv: float = max(option.mid_impv + iv_adj, 0.01)
+            m: int = option.net_pos
+
+            try:
+                _, d, ga, th, ve = option.calculate_greeks(
+                    new_underlying, option.strike_price, option.interest_rate,
+                    option.time_to_expiry, option.mid_impv, option.option_type
+                )
+                g_now["delta"] += d * option.size * m
+                g_now["gamma"] += ga * option.size * m
+                g_now["theta"] += th * option.size / ANNUAL_DAYS * m
+                g_now["vega"] += ve * option.size / 100 * m
+            except Exception:
+                pass
+
+            try:
+                _, d, ga, th, ve = option.calculate_greeks(
+                    new_underlying, option.strike_price, option.interest_rate,
+                    new_t, option.mid_impv, option.option_type
+                )
+                g_day_same["delta"] += d * option.size * m
+                g_day_same["gamma"] += ga * option.size * m
+                g_day_same["theta"] += th * option.size / ANNUAL_DAYS * m
+                g_day_same["vega"] += ve * option.size / 100 * m
+            except Exception:
+                pass
+
+            try:
+                _, d, ga, th, ve = option.calculate_greeks(
+                    new_underlying, option.strike_price, option.interest_rate,
+                    new_t, new_iv, option.option_type
+                )
+                g_day_adj["delta"] += d * option.size * m
+                g_day_adj["gamma"] += ga * option.size * m
+                g_day_adj["theta"] += th * option.size / ANNUAL_DAYS * m
+                g_day_adj["vega"] += ve * option.size / 100 * m
+            except Exception:
+                pass
+
+        return g_now, g_day_same, g_day_adj
+
+    # ------------------------------------------------------------------
+    #  Greeks chart rendering
+    # ------------------------------------------------------------------
+    def _update_greeks_charts(
+        self,
+        prices: np.ndarray,
+        greeks_data: dict[str, dict[str, list[float]]],
+        current_price: float,
+        days: int,
+    ) -> None:
+        """Plot Delta, Gamma, Theta charts.
+
+        greeks_data structure:
+          {"delta": {"now": [...], "day_same": [...], "day_adj": [...]},
+           "gamma": {...}, "theta": {...}}
+        """
+        # Unit conversion factors and Y-axis labels
+        #   delta: yen/pt  → 千円/pt  (/ 1000)
+        #   gamma: yen/pt/pt → 千円/pt² (/ 1000)
+        #   theta: yen/day  → 千円/day  (/ 1000)
+        conv: dict[str, float] = {
+            "delta": 1.0 / 1000.0,
+            "gamma": 1.0 / 1000.0,
+            "theta": 1.0 / 1000.0,
+            "vega": 1.0 / 1000.0,
+        }
+        ylabel: dict[str, str] = {
+            "delta": "Delta (千円/1pt)",
+            "gamma": "Gamma (千円/1pt²)",
+            "theta": "Theta (千円/day)",
+            "vega": "Vega (千円/1%IV)",
+        }
+
+        chart_info: list[tuple] = [
+            (self.delta_ax, self.delta_fig, self.delta_canvas, "delta", "Delta"),
+            (self.gamma_ax, self.gamma_fig, self.gamma_canvas, "gamma", "Gamma"),
+            (self.theta_ax, self.theta_fig, self.theta_canvas, "theta", "Theta"),
+            (self.vega_ax, self.vega_fig, self.vega_canvas, "vega", "Vega"),
+        ]
+
+        for ax, fig, canvas, key, title in chart_info:
+            ax.clear()
+            series: dict[str, list[float]] = greeks_data[key]
+            c: float = conv[key]
+
+            ax.plot(
+                prices, [v * c for v in series["now"]],
+                color="white", linewidth=2.5, label="現在",
+            )
+            ax.plot(
+                prices, [v * c for v in series["day_same"]],
+                color="#00BFFF", linewidth=2, label=f"+{days}日(同IV)",
+            )
+            ax.plot(
+                prices, [v * c for v in series["day_adj"]],
+                color="#FFD700", linewidth=2, label=f"+{days}日(IV変動)",
+            )
+
+            ax.axvline(
+                x=current_price, color="cyan", linestyle=":", alpha=0.5,
+            )
+            ax.axhline(y=0, color="gray", linestyle="-", alpha=0.3)
+
+            # Set tick label decimal places per Greek
+            decimals: dict[str, int] = {"delta": 2, "gamma": 6, "theta": 1, "vega": 2}
+            fmt: str = f"%.{decimals[key]}f"
+            ax.yaxis.set_major_formatter(plt.FormatStrFormatter(fmt))
+
+            ax.set_title(title)
+            ax.set_xlabel("原資産価格")
+            ax.set_ylabel(ylabel[key])
+            ax.legend(loc="upper right", fontsize=8, framealpha=0.7)
+            ax.grid(True, alpha=0.3)
+
+            self._init_cursor(key, ax)
+            fig.tight_layout()
+            canvas.draw()
+
+    # ------------------------------------------------------------------
+    #  Results table
+    # ------------------------------------------------------------------
+    def _update_table(self, table_data: list[dict], days: int) -> None:
+        headers: list[str] = [
+            "原資産価格", "IV変動(%)",
+            "現在P&L", f"+{days}日(同IV)", f"+{days}日(IV変動)", "満期P&L",
+        ]
+        self.result_table.setColumnCount(len(headers))
+        self.result_table.setRowCount(len(table_data))
+        self.result_table.setHorizontalHeaderLabels(headers)
+
+        for row, data in enumerate(table_data):
+            values: list[str] = [
+                f"{data['price']:.0f}",
+                f"{data['iv_change']:+.1f}",
+                f"{data['pnl_now']:.1f}",
+                f"{data['pnl_day_same']:.1f}",
+                f"{data['pnl_day_adj']:.1f}",
+                f"{data['pnl_expiry']:.1f}",
+            ]
+            for col, val in enumerate(values):
+                item: QtWidgets.QTableWidgetItem = QtWidgets.QTableWidgetItem(val)
+                item.setTextAlignment(
+                    QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter
+                )
+                # Colour P&L columns: red for negative, green for positive
+                if col >= 2:
+                    try:
+                        num: float = float(val)
+                        if num < 0:
+                            item.setForeground(QtGui.QColor(255, 100, 100))
+                        elif num > 0:
+                            item.setForeground(QtGui.QColor(100, 255, 100))
+                    except ValueError:
+                        pass
+                self.result_table.setItem(row, col, item)
+
+        self.result_table.resizeColumnsToContents()

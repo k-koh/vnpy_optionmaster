@@ -15,7 +15,7 @@ from .monitor import (
     OptionMarketMonitor, OptionGreeksMonitor, OptionChainMonitor,
     MonitorCell
 )
-from .chart import OptionVolatilityChart, ScenarioAnalysisChart, IVHeatmapChart, IVTimeSeriesChart, IVDecayChart
+from .chart import OptionVolatilityChart, ScenarioAnalysisChart, IVHeatmapChart, IVTimeSeriesChart, IVDecayChart, PayoffDiagramChart
 from .manager import ElectronicEyeManager, PricingVolatilityManager
 
 
@@ -43,6 +43,7 @@ class OptionManager(QtWidgets.QWidget):
         self.heatmap_chart: IVHeatmapChart
         self.iv_timeseries_chart: IVTimeSeriesChart
         self.iv_decay_chart: IVDecayChart
+        self.payoff_chart: PayoffDiagramChart
         self.eye_manager: ElectronicEyeManager
         self.pricing_manager: PricingVolatilityManager
 
@@ -70,6 +71,7 @@ class OptionManager(QtWidgets.QWidget):
         self.heatmap_button = QtWidgets.QPushButton("IV残像")
         self.iv_timeseries_button = QtWidgets.QPushButton("IV時系列")
         self.iv_decay_button = QtWidgets.QPushButton("IV減衰")
+        self.payoff_button = QtWidgets.QPushButton("ペイオフ図")
         self.eye_button = QtWidgets.QPushButton("电子眼")
         self.pricing_button = QtWidgets.QPushButton("波动率管理")
         self.risk_button = QtWidgets.QPushButton("风险监控")
@@ -85,6 +87,7 @@ class OptionManager(QtWidgets.QWidget):
             self.heatmap_button,
             self.iv_timeseries_button,
             self.iv_decay_button,
+            self.payoff_button,
             self.eye_button,
             self.pricing_button,
             self.risk_button
@@ -105,6 +108,7 @@ class OptionManager(QtWidgets.QWidget):
         hbox.addWidget(self.heatmap_button)
         hbox.addWidget(self.iv_timeseries_button)
         hbox.addWidget(self.iv_decay_button)
+        hbox.addWidget(self.payoff_button)
         hbox.addWidget(self.pricing_button)
         hbox.addWidget(self.eye_button)
         hbox.addWidget(self.risk_button)
@@ -159,6 +163,7 @@ class OptionManager(QtWidgets.QWidget):
         self.heatmap_chart = IVHeatmapChart(self.option_engine, self.portfolio_name)
         self.iv_timeseries_chart = IVTimeSeriesChart(self.option_engine, self.portfolio_name)
         self.iv_decay_chart = IVDecayChart(self.option_engine, self.portfolio_name)
+        self.payoff_chart = PayoffDiagramChart(self.option_engine, self.portfolio_name)
         self.eye_manager = ElectronicEyeManager(self.option_engine, self.portfolio_name)
         self.pricing_manager = PricingVolatilityManager(self.option_engine, self.portfolio_name)
         self.risk_widget = OptionRiskWidget(self.option_engine)
@@ -174,6 +179,7 @@ class OptionManager(QtWidgets.QWidget):
         self.heatmap_button.clicked.connect(self.heatmap_chart.show)
         self.iv_timeseries_button.clicked.connect(self.iv_timeseries_chart.show)
         self.iv_decay_button.clicked.connect(self.iv_decay_chart.show)
+        self.payoff_button.clicked.connect(self.payoff_chart.show)
         self.hedge_button.clicked.connect(self.hedge_widget.show)
         self.eye_button.clicked.connect(self.eye_manager.show)
         self.pricing_button.clicked.connect(self.pricing_manager.show)
@@ -189,6 +195,7 @@ class OptionManager(QtWidgets.QWidget):
             self.heatmap_button,
             self.iv_timeseries_button,
             self.iv_decay_button,
+            self.payoff_button,
             self.hedge_button,
             self.eye_button,
             self.pricing_button,
