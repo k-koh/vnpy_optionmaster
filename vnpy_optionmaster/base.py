@@ -567,7 +567,7 @@ class ChainData:
         """
         Calculate ERIS data (IV and strike for options with specific deltas).
         """
-        # Find call with delta closest to +0.1
+        # Find call with delta closest to +0.15
         min_call_delta_diff = 100.0
         eris_call = None
 
@@ -579,7 +579,7 @@ class ChainData:
                 continue
 
             option_delta = call.theo_delta / call.size
-            delta_diff = abs(option_delta - 0.1)
+            delta_diff = abs(option_delta - 0.15)
 
             if delta_diff < min_call_delta_diff:
                 min_call_delta_diff = delta_diff
@@ -908,7 +908,7 @@ class PreviousDayOptionData:
                 else:
                     self.eris_p_iv[dt_op_month] = 0
 
-                # Find call with delta closest to +0.1
+                # Find call with delta closest to +0.15
                 min_call_delta_diff = 100.0
                 eris_call_bar = None
 
@@ -917,7 +917,7 @@ class PreviousDayOptionData:
                         continue
 
                     option_delta = bar.delta
-                    delta_diff = abs(option_delta - 0.1)
+                    delta_diff = abs(option_delta - 0.15)
 
                     if delta_diff < min_call_delta_diff:
                         min_call_delta_diff = delta_diff
