@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 import exchange_calendars
 
 
-ANNUAL_DAYS = 240
+ANNUAL_DAYS = 365
 
 # Get public holidays data from Shanghai Stock Exchange
 # cn_calendar: exchange_calendars.ExchangeCalendar = exchange_calendars.get_calendar('XSHG')
@@ -23,12 +23,12 @@ def calculate_days_to_expiry(option_expiry: datetime) -> int:
         current_dt += timedelta(days=1)
 
         # Ignore weekends
-        if current_dt.weekday() in [5, 6]:
-            continue
+        # if current_dt.weekday() in [5, 6]:
+        #     continue
 
-        # Ignore public holidays
-        if current_dt in PUBLIC_HOLIDAYS:
-            continue
+        # # Ignore public holidays
+        # if current_dt in PUBLIC_HOLIDAYS:
+        #     continue
 
         days += 1
 
