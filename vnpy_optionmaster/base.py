@@ -352,6 +352,15 @@ class ChainData:
         self.eris_c_delta: float | None = None
         self.eris_c_price: float | None = None
 
+        self.delta002_p_iv: float | None = None
+        self.delta002_p_strike: int | None = None
+        self.delta002_p_delta: float | None = None
+        self.delta002_p_price: float | None = None
+        self.delta002_c_iv: float | None = None
+        self.delta002_c_strike: int | None = None
+        self.delta002_c_delta: float | None = None
+        self.delta002_c_price: float | None = None
+
     def add_option(self, option: OptionData) -> None:
         """"""
         self.options[option.vt_symbol] = option
@@ -567,7 +576,7 @@ class ChainData:
         """
         Calculate ERIS data (IV and strike for options with specific deltas).
         """
-        # Find call with delta closest to +0.15
+        # Find call with delta closest to +0.1
         min_call_delta_diff = 100.0
         eris_call = None
 
@@ -579,7 +588,7 @@ class ChainData:
                 continue
 
             option_delta = call.theo_delta / call.size
-            delta_diff = abs(option_delta - 0.15)
+            delta_diff = abs(option_delta - 0.1)
 
             if delta_diff < min_call_delta_diff:
                 min_call_delta_diff = delta_diff
@@ -630,6 +639,70 @@ class ChainData:
             self.eris_p_strike = None
             self.eris_p_delta = None
             self.eris_p_price = None
+
+        # Find call with delta closest to +0.02
+        min_call_delta_diff = 100.0
+        delta002_call = None
+
+        for call in self.calls.values():
+            if not call.theo_delta or not call.size:
+                continue
+
+            if call.strike_price % 1000 != 0:
+                continue
+
+            option_delta = call.theo_delta / call.size
+            delta_diff = abs(option_delta - 0.02)
+
+            if delta_diff < min_call_delta_diff:
+                min_call_delta_diff = delta_diff
+                delta002_call = call
+
+        if delta002_call:
+            self.delta002_c_iv = delta002_call.mid_impv
+            self.delta002_c_strike = delta002_call.strike_price
+            self.delta002_c_delta = delta002_call.theo_delta / delta002_call.size if delta002_call.size else None
+            if delta002_call.tick and delta002_call.tick.bid_price_1 and delta002_call.tick.ask_price_1:
+                self.delta002_c_price = (delta002_call.tick.bid_price_1 + delta002_call.tick.ask_price_1) / 2
+            else:
+                self.delta002_c_price = None
+        else:
+            self.delta002_c_iv = None
+            self.delta002_c_strike = None
+            self.delta002_c_delta = None
+            self.delta002_c_price = None
+
+        # Find put with delta closest to -0.02
+        min_put_delta_diff = 100.0
+        delta002_put = None
+
+        for put in self.puts.values():
+            if not put.theo_delta or not put.size:
+                continue
+
+            if put.strike_price % 1000 != 0:
+                continue
+
+            option_delta = put.theo_delta / put.size
+            delta_diff = abs(option_delta - (-0.02))
+
+            if delta_diff < min_put_delta_diff:
+                min_put_delta_diff = delta_diff
+                delta002_put = put
+
+        if delta002_put:
+            self.delta002_p_iv = delta002_put.mid_impv
+            self.delta002_p_strike = delta002_put.strike_price
+            self.delta002_p_delta = delta002_put.theo_delta / delta002_put.size if delta002_put.size else None
+            if delta002_put.tick and delta002_put.tick.bid_price_1 and delta002_put.tick.ask_price_1:
+                self.delta002_p_price = (delta002_put.tick.bid_price_1 + delta002_put.tick.ask_price_1) / 2
+            else:
+                self.delta002_p_price = None
+        else:
+            self.delta002_p_iv = None
+            self.delta002_p_strike = None
+            self.delta002_p_delta = None
+            self.delta002_p_price = None
 
 
     def calculate_underlying_adjustment(self) -> None:
@@ -852,6 +925,8 @@ class PreviousDayOptionData:
         self.bars: dict[datetime, dict[str, BarData]] = {}
         self.eris_p_iv: dict[str, float | None] = {}
         self.eris_c_iv: dict[str, float | None] = {}
+        self.delta002_p_iv: dict[str, float | None] = {}
+        self.delta002_c_iv: dict[str, float | None] = {}
         self.atm_iv: dict[str, float | None] = {}
         self.datetime: dict[int, datetime | None] = {}
         self.sorted_dates: list[datetime] = []
@@ -908,7 +983,7 @@ class PreviousDayOptionData:
                 else:
                     self.eris_p_iv[dt_op_month] = 0
 
-                # Find call with delta closest to +0.15
+                # Find call with delta closest to +0.1
                 min_call_delta_diff = 100.0
                 eris_call_bar = None
 
@@ -917,7 +992,7 @@ class PreviousDayOptionData:
                         continue
 
                     option_delta = bar.delta
-                    delta_diff = abs(option_delta - 0.15)
+                    delta_diff = abs(option_delta - 0.1)
 
                     if delta_diff < min_call_delta_diff:
                         min_call_delta_diff = delta_diff
@@ -927,6 +1002,46 @@ class PreviousDayOptionData:
                     self.eris_c_iv[dt_op_month] = eris_call_bar.iv
                 else:
                     self.eris_c_iv[dt_op_month] = 0
+
+                # Find put with delta closest to -0.02
+                min_put_delta_diff = 100.0
+                delta002_put_bar = None
+
+                for bar in month_bars.values():
+                    if not hasattr(bar, 'delta'):
+                        continue
+
+                    option_delta = bar.delta
+                    delta_diff = abs(option_delta - (-0.02))
+
+                    if delta_diff < min_put_delta_diff:
+                        min_put_delta_diff = delta_diff
+                        delta002_put_bar = bar
+
+                if delta002_put_bar and hasattr(delta002_put_bar, 'iv'):
+                    self.delta002_p_iv[dt_op_month] = delta002_put_bar.iv
+                else:
+                    self.delta002_p_iv[dt_op_month] = 0
+
+                # Find call with delta closest to +0.02
+                min_call_delta_diff = 100.0
+                delta002_call_bar = None
+
+                for bar in month_bars.values():
+                    if not hasattr(bar, 'delta'):
+                        continue
+
+                    option_delta = bar.delta
+                    delta_diff = abs(option_delta - 0.02)
+
+                    if delta_diff < min_call_delta_diff:
+                        min_call_delta_diff = delta_diff
+                        delta002_call_bar = bar
+
+                if delta002_call_bar and hasattr(delta002_call_bar, 'iv'):
+                    self.delta002_c_iv[dt_op_month] = delta002_call_bar.iv
+                else:
+                    self.delta002_c_iv[dt_op_month] = 0
 
     def calculate_atm_iv(self) -> None:
         # Find put with delta closest to -0.5

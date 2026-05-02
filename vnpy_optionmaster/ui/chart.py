@@ -55,6 +55,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         # self.pricing_curves: dict[str, pg.PlotCurveItem] = {}
         self.eris_p_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.eris_c_strike_lines: dict[str, pg.InfiniteLine] = {}
+        self.delta002_p_strike_lines: dict[str, pg.InfiniteLine] = {}
+        self.delta002_c_strike_lines: dict[str, pg.InfiniteLine] = {}
 
         self.atm_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.underlying_price_lines: dict[str, pg.InfiniteLine] = {}
@@ -283,6 +285,21 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             labelOpts={'position': 0.01, 'color': color, 'fill': (200,200,200,50), 'movable': False}
         )
 
+        self.delta002_p_strike_lines[chain_symbol] = pg.InfiniteLine(
+            angle=90,
+            movable=False,
+            pen=p_line_pen,
+            label=symbol + " プットΔ0.02",
+            labelOpts={'position': 0.92, 'color': color, 'fill': (200,200,200,50), 'movable': False}
+        )
+        self.delta002_c_strike_lines[chain_symbol] = pg.InfiniteLine(
+            angle=90,
+            movable=False,
+            pen=c_line_pen,
+            label=symbol + " コールΔ0.02",
+            labelOpts={'position': 0.04, 'color': color, 'fill': (200,200,200,50), 'movable': False}
+        )
+
 
         self.atm_strike_lines[chain_symbol] = pg.InfiniteLine(
             angle=90,
@@ -301,11 +318,15 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
         self.impv_chart.addItem(self.eris_p_strike_lines[chain_symbol])
         self.impv_chart.addItem(self.eris_c_strike_lines[chain_symbol])
+        self.impv_chart.addItem(self.delta002_p_strike_lines[chain_symbol])
+        self.impv_chart.addItem(self.delta002_c_strike_lines[chain_symbol])
         self.impv_chart.addItem(self.atm_strike_lines[chain_symbol])
         self.impv_chart.addItem(self.underlying_price_lines[chain_symbol])
 
         self.eris_p_strike_lines[chain_symbol].hide()
         self.eris_c_strike_lines[chain_symbol].hide()
+        self.delta002_p_strike_lines[chain_symbol].hide()
+        self.delta002_c_strike_lines[chain_symbol].hide()
         self.atm_strike_lines[chain_symbol].hide()
         self.underlying_price_lines[chain_symbol].hide()
 
@@ -630,6 +651,28 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             else:
                 self.eris_c_strike_lines[chain.chain_symbol].hide()
 
+            if chain.delta002_p_strike is not None:
+                line = self.delta002_p_strike_lines[chain.chain_symbol]
+                line.setPos(chain.delta002_p_strike)
+                delta_text = f"{chain.delta002_p_delta:.3f}" if chain.delta002_p_delta is not None else "N/A"
+                iv_text = f"{chain.delta002_p_iv:.3f}" if chain.delta002_p_iv is not None else "N/A"
+                price_text = f"{chain.delta002_p_price:.0f}" if chain.delta002_p_price is not None else "N/A"
+                line.label.setText(f"{symbol} PΔ{delta_text} IV{iv_text} ¥{price_text}")
+                line.show()
+            else:
+                self.delta002_p_strike_lines[chain.chain_symbol].hide()
+
+            if chain.delta002_c_strike is not None:
+                line = self.delta002_c_strike_lines[chain.chain_symbol]
+                line.setPos(chain.delta002_c_strike)
+                delta_text = f"{chain.delta002_c_delta:.3f}" if chain.delta002_c_delta is not None else "N/A"
+                iv_text = f"{chain.delta002_c_iv:.3f}" if chain.delta002_c_iv is not None else "N/A"
+                price_text = f"{chain.delta002_c_price:.0f}" if chain.delta002_c_price is not None else "N/A"
+                line.label.setText(f"{symbol} CΔ{delta_text} IV{iv_text} ¥{price_text}")
+                line.show()
+            else:
+                self.delta002_c_strike_lines[chain.chain_symbol].hide()
+
 
             # Update ATM strike line
             if chain.atm_price:
@@ -777,6 +820,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             prev_put_curve: pg.PlotCurveItem = self.prev_put_curves[chain_symbol]
             p_line = self.eris_p_strike_lines[chain_symbol]
             c_line = self.eris_c_strike_lines[chain_symbol]
+            d002_p_line = self.delta002_p_strike_lines[chain_symbol]
+            d002_c_line = self.delta002_c_strike_lines[chain_symbol]
             atm_line = self.atm_strike_lines[chain_symbol]
             underlying_line = self.underlying_price_lines[chain_symbol]
             total_volume_bar = self.total_volume_bars[chain_symbol]
@@ -814,6 +859,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 prev_put_curve.hide()
                 p_line.hide()
                 c_line.hide()
+                d002_p_line.hide()
+                d002_c_line.hide()
 
                 atm_line.hide()
                 underlying_line.hide()
@@ -1726,6 +1773,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         data: dict = {
             "window_width": self.width(),
             "window_height": self.height(),
+            "show_decay": self.decay_check.isChecked(),
+            "show_envelope": self.envelope_check.isChecked(),
         }
         save_json(self.SETTING_FILENAME, data)
 
@@ -1737,6 +1786,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         win_h: int = data.get("window_height", 0)
         if win_w > 0 and win_h > 0:
             self.resize(win_w, win_h)
+        self.decay_check.setChecked(data.get("show_decay", False))
+        self.envelope_check.setChecked(data.get("show_envelope", False))
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._save_settings()
@@ -1774,6 +1825,9 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self.ymax_spin.setSuffix("%")
         self.ymax_spin.setDecimals(1)
 
+        self.decay_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("理論減衰")
+        self.envelope_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("残像")
+
         button: QtWidgets.QPushButton = QtWidgets.QPushButton("更新")
         button.clicked.connect(self.run_analysis)
 
@@ -1789,6 +1843,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         hbox.addWidget(QtWidgets.QLabel("max"))
         hbox.addWidget(self.ymax_spin)
         hbox.addStretch()
+        hbox.addWidget(self.decay_check)
+        hbox.addWidget(self.envelope_check)
         hbox.addWidget(button)
 
         vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
@@ -1912,7 +1968,6 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         futures_prices: dict[str, float] | None = None,
     ) -> None:
         self.fig.clear()
-        ax = self.fig.add_subplot(111)
 
         x = np.arange(len(date_labels))
 
@@ -1921,9 +1976,67 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         else:
             plot_targets = [t for t in self.DELTA_TARGETS if t[0] == delta_selection]
 
+        show_decay: bool = self.decay_check.isChecked()
+        show_envelope: bool = self.envelope_check.isChecked()
+        envelope_window: int = 20
+
+        # Split into two subplots when the decay overlay (compression indicator) is on
+        if show_decay:
+            gs = self.fig.add_gridspec(2, 1, height_ratios=[6, 1], hspace=0.08)
+            ax = self.fig.add_subplot(gs[0, 0])
+            ax_comp = self.fig.add_subplot(gs[1, 0], sharex=ax)
+        else:
+            ax = self.fig.add_subplot(111)
+            ax_comp = None
+
+        # Per-target compression ratio = (actual - theory) / spike
+        compression: dict[str, np.ndarray] = {}
+
         for label, target_delta, color in plot_targets:
             values: list[float] = series[label]
+
+            # IV残像 (rolling high/low band) — plotted behind the line
+            if show_envelope:
+                arr = np.array(values, dtype=float)
+                n = len(arr)
+                roll_hi = np.full(n, np.nan)
+                roll_lo = np.full(n, np.nan)
+                for i in range(n):
+                    j0 = max(0, i - envelope_window + 1)
+                    window = arr[j0:i + 1]
+                    valid = window[~np.isnan(window)]
+                    if valid.size:
+                        roll_hi[i] = valid.max()
+                        roll_lo[i] = valid.min()
+                mask = ~(np.isnan(roll_hi) | np.isnan(roll_lo))
+                if mask.any():
+                    ax.fill_between(
+                        x, roll_lo, roll_hi, where=mask,
+                        color=color, alpha=0.1, linewidth=0,
+                    )
+
             ax.plot(x, values, color=color, linewidth=1.5, label=label, marker=".", markersize=3)
+
+            # IV理論減衰 — from most-recent peak, decay ∝ 1/√(t+1)
+            if show_decay:
+                arr = np.array(values, dtype=float)
+                valid_mask = ~np.isnan(arr)
+                if valid_mask.sum() >= 3:
+                    peak_idx = int(np.nanargmax(arr))
+                    peak_iv = float(arr[peak_idx])
+                    base_iv = float(np.nanmin(arr))
+                    spike = peak_iv - base_iv
+                    if spike > 0:
+                        theory = np.full(len(arr), np.nan)
+                        for i in range(peak_idx, len(arr)):
+                            t = i - peak_idx
+                            theory[i] = base_iv + spike / np.sqrt(t + 1)
+                        ax.plot(
+                            x, theory,
+                            color=color, linewidth=1.0, linestyle="--",
+                            alpha=0.7, label=f"{label} 理論減衰",
+                        )
+                        compression[label] = (arr - theory) / spike
 
             # 前日比テキストを表示
             fs: int = 11 if delta_selection != "全デルタ" else 9
@@ -1974,20 +2087,49 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         step: int = max(1, n_dates // 15)
         tick_positions = [i for i in range(0, n_dates, step)]
         tick_labels: list[str] = [date_labels[i][5:] for i in range(0, n_dates, step)]
-        ax.set_xticks(tick_positions)
-        ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=8)
 
         title: str = f"IV時系列 — {delta_selection}" if delta_selection != "全デルタ" else "IV時系列（デルタレベル別）"
         ax.set_title(title, fontsize=12)
-        ax.set_xlabel("日付")
         ax.set_ylabel("IV (年率%)")
+
+        # Compression subplot: (actual IV − theory IV) / spike. Negative = IV crush.
+        if ax_comp is not None and compression:
+            n_targets = len(compression)
+            bar_width = 0.8 / max(n_targets, 1)
+            for idx, (label, target_delta, color) in enumerate(plot_targets):
+                if label not in compression:
+                    continue
+                comp_vals = compression[label]
+                offset = (idx - (n_targets - 1) / 2) * bar_width
+                colors = ["#ff5050" if (not np.isnan(v) and v < 0) else color for v in comp_vals]
+                ax_comp.bar(
+                    x + offset, comp_vals, width=bar_width,
+                    color=colors, edgecolor="none", alpha=0.75,
+                )
+            ax_comp.axhline(0, color="#ffffff", linewidth=0.6, alpha=0.5)
+            ax_comp.grid(True, alpha=0.2)
+            ax_comp.set_ylabel("圧縮度\n(実績−理論)/spike", fontsize=8)
+            ax_comp.tick_params(axis="y", labelsize=8)
+            ax_comp.set_xticks(tick_positions)
+            ax_comp.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=8)
+            ax_comp.set_xlabel("日付")
+            # Hide x-tick labels on main ax since the subplot carries them
+            ax.set_xticks(tick_positions)
+            ax.tick_params(axis="x", labelbottom=False)
+            ax.set_xlabel("")
+        else:
+            ax.set_xticks(tick_positions)
+            ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=8)
+            ax.set_xlabel("日付")
 
         # Setup cursor
         self._cursor_ax = ax
+        self._cursor_ax_comp = ax_comp
         self._cursor_date_labels = date_labels
         self._cursor_series = {label: series[label] for label, _, _ in plot_targets}
         self._cursor_plot_targets = list(plot_targets)
         self._cursor_futures_values = futures_values
+        self._cursor_compression = {k: list(v) for k, v in compression.items()}
 
         self._cursor_vline = ax.axvline(x=0, color="#ffffff", linewidth=0.5, linestyle="--", alpha=0.5, visible=False)
         self._cursor_text = ax.text(
@@ -2000,11 +2142,33 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         )
         self._cursor_text.set_visible(False)
 
+        # Compression subplot cursor mirror
+        self._cursor_vline_comp = None
+        self._cursor_text_comp = None
+        if ax_comp is not None:
+            self._cursor_vline_comp = ax_comp.axvline(
+                x=0, color="#ffffff", linewidth=0.5, linestyle="--", alpha=0.5, visible=False,
+            )
+            self._cursor_text_comp = ax_comp.text(
+                0.02, 0.98, "",
+                transform=ax_comp.transAxes,
+                fontsize=8,
+                color="#ffffff",
+                verticalalignment="top",
+                bbox=dict(boxstyle="round,pad=0.3", fc="#333333", ec="#888888", alpha=0.9),
+            )
+            self._cursor_text_comp.set_visible(False)
+
         if self._cursor_cid:
             self.canvas.mpl_disconnect(self._cursor_cid)
         self._cursor_cid = self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
 
         self.fig.tight_layout()
+        # Trim outer whitespace to match IVEventDecayChart compactness
+        if ax_comp is not None:
+            self.fig.subplots_adjust(left=0.045, right=0.97, top=0.96, bottom=0.07, hspace=0.05)
+        else:
+            self.fig.subplots_adjust(left=0.045, right=0.97, top=0.96, bottom=0.08)
         self.canvas.draw()
 
     def _on_mouse_move(self, event) -> None:
@@ -2013,6 +2177,10 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 self._cursor_vline.set_visible(False)
             if self._cursor_text:
                 self._cursor_text.set_visible(False)
+            if self._cursor_vline_comp:
+                self._cursor_vline_comp.set_visible(False)
+            if self._cursor_text_comp:
+                self._cursor_text_comp.set_visible(False)
             self.canvas.draw_idle()
             return
 
@@ -2020,6 +2188,10 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         if ix < 0 or ix >= len(self._cursor_date_labels):
             self._cursor_vline.set_visible(False)
             self._cursor_text.set_visible(False)
+            if self._cursor_vline_comp:
+                self._cursor_vline_comp.set_visible(False)
+            if self._cursor_text_comp:
+                self._cursor_text_comp.set_visible(False)
             self.canvas.draw_idle()
             return
 
@@ -2045,6 +2217,36 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self._cursor_text.set_position((ax_frac[0] + 0.02, ax_frac[1] + 0.02))
         self._cursor_text.set_text("\n".join(lines))
         self._cursor_text.set_visible(True)
+
+        # Mirror cursor + label on the compression subplot
+        if self._cursor_vline_comp is not None and self._cursor_text_comp is not None:
+            self._cursor_vline_comp.set_xdata([ix])
+            self._cursor_vline_comp.set_visible(True)
+
+            comp_lines: list[str] = [date_str]
+            for label, _delta, color in self._cursor_plot_targets:
+                comp_vals = self._cursor_compression.get(label)
+                if not comp_vals or ix >= len(comp_vals):
+                    continue
+                v = comp_vals[ix]
+                if not np.isnan(v):
+                    short_label = label.split(" ")[0]
+                    comp_lines.append(f"{short_label}: {v:+.2f}")
+
+            if len(comp_lines) > 1:
+                # Follow the mouse horizontally but pin Y to the top of the
+                # compression subplot — the label tracks the cursor like the
+                # IV label, while staying inside the comp axis so it can never
+                # cross into the main chart where the other label lives.
+                comp_frac_x = self._cursor_ax_comp.transAxes.inverted().transform(
+                    (event.x, event.y)
+                )[0]
+                comp_frac_x = max(0.02, min(comp_frac_x + 0.02, 0.85))
+                self._cursor_text_comp.set_position((comp_frac_x, 0.98))
+                self._cursor_text_comp.set_text("\n".join(comp_lines))
+                self._cursor_text_comp.set_visible(True)
+            else:
+                self._cursor_text_comp.set_visible(False)
 
         self.canvas.draw_idle()
 
@@ -2511,6 +2713,16 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         self._save_settings()
         super().closeEvent(event)
 
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        """Restart the auto-refresh timer and refresh tables when reopened."""
+        super().showEvent(event)
+        if self.mode_combo.currentIndex() == 1:
+            if self.sim_positions:
+                self._refresh_sim_table()
+                self._run_sim_analysis()
+            if not self._update_timer.isActive():
+                self._update_timer.start()
+
     # ------------------------------------------------------------------
     #  Simulation panel helpers
     # ------------------------------------------------------------------
@@ -2664,6 +2876,16 @@ class PayoffDiagramChart(QtWidgets.QWidget):
 
     def _refresh_sim_table(self) -> None:
         """Rebuild the sim table display from self.sim_positions."""
+        # Identify the cell currently being edited (if any) so the live-price
+        # refresh doesn't clobber the user's in-progress input.
+        editing_row: int = -1
+        editing_col: int = -1
+        if self.sim_table.state() == QtWidgets.QAbstractItemView.State.EditingState:
+            idx = self.sim_table.currentIndex()
+            if idx.isValid():
+                editing_row = idx.row()
+                editing_col = idx.column()
+
         # Block itemChanged signals during rebuild
         self.sim_table.blockSignals(True)
         self.sim_table.setRowCount(len(self.sim_positions))
@@ -2815,8 +3037,10 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             contrib_cols: set[int] = {12, 13, 14, 15}
             for i, val in enumerate(values):
                 col = i + 1
+                if row == editing_row and col == editing_col:
+                    continue  # leave the in-edit cell alone
                 item = QtWidgets.QTableWidgetItem(val)
-                if col == 4:  # 枚数 column is editable
+                if col == 4 or col == 6:  # 枚数 / 建値 columns are editable
                     item.setFlags(
                         QtCore.Qt.ItemFlag.ItemIsEnabled
                         | QtCore.Qt.ItemFlag.ItemIsSelectable
@@ -2907,6 +3131,18 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             self.sim_positions[row]["lots"] = new_lots
             self._refresh_sim_table()
             self._run_sim_analysis()
+        elif col == 6:  # 建値 column
+            text: str = item.text().strip()
+            try:
+                new_entry_price: float = float(text) if text else 0.0
+            except ValueError:
+                self._refresh_sim_table()
+                return
+            if self.sim_positions[row].get("entry_price", 0.0) == new_entry_price:
+                return
+            self.sim_positions[row]["entry_price"] = new_entry_price
+            self._refresh_sim_table()
+            self._run_sim_analysis()
         elif col == 24:  # 決済済 checkbox
             new_closed: bool = item.checkState() == QtCore.Qt.CheckState.Checked
             pos_row = self.sim_positions[row]
@@ -2945,9 +3181,8 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             return
         if not self.sim_positions:
             return
-        # Don't clobber an in-progress cell edit (e.g. 決済値 entry)
-        if self.sim_table.state() == QtWidgets.QAbstractItemView.State.EditingState:
-            return
+        # _refresh_sim_table skips the specific cell that's currently being
+        # edited, so live-price updates flow through the rest of the table.
         self._refresh_sim_table()
         self._run_sim_analysis()
 
