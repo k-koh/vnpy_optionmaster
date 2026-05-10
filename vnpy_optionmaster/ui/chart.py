@@ -60,6 +60,9 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
         self.atm_strike_lines: dict[str, pg.InfiniteLine] = {}
         self.underlying_price_lines: dict[str, pg.InfiniteLine] = {}
+        self.prev_underlying_price_lines: dict[str, pg.InfiniteLine] = {}
+        self.prev_underlying_prices: dict[str, float] = {}
+        self._prev_underlying_loaded_date: str | None = None
         self.total_volume_bars: dict[str, pg.BarGraphItem] = {}
 
         self.prev_call_curves: dict[str, pg.PlotCurveItem] = {}
@@ -268,7 +271,9 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         c_line_pen = pg.mkPen(color=color, width=2, style=QtCore.Qt.DotLine)
         atm_line_pen = pg.mkPen(color=(255, 174, 201), width=2, style=QtCore.Qt.DotLine)
         underlying_line_pen = pg.mkPen(color=(0, 255, 255), width=2, style=QtCore.Qt.DotLine)
+        prev_underlying_line_pen = pg.mkPen(color=(255, 165, 0), width=2, style=QtCore.Qt.DashLine)
         position = self.underlying_line_positions.pop(0)
+        prev_position = max(0.05, position - 0.08)
 
         self.eris_p_strike_lines[chain_symbol] = pg.InfiniteLine(
             angle=90,
@@ -315,6 +320,13 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             label=symbol + " 先物",
             labelOpts={'position': position, 'color': (0, 255, 255), 'fill': (200, 200, 200, 50), 'movable': False}
         )
+        self.prev_underlying_price_lines[chain_symbol] = pg.InfiniteLine(
+            angle=90,
+            movable=False,
+            pen=prev_underlying_line_pen,
+            label=symbol + " 前日先物",
+            labelOpts={'position': prev_position, 'color': (255, 165, 0), 'fill': (200, 200, 200, 50), 'movable': False}
+        )
 
         self.impv_chart.addItem(self.eris_p_strike_lines[chain_symbol])
         self.impv_chart.addItem(self.eris_c_strike_lines[chain_symbol])
@@ -322,6 +334,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.impv_chart.addItem(self.delta002_c_strike_lines[chain_symbol])
         self.impv_chart.addItem(self.atm_strike_lines[chain_symbol])
         self.impv_chart.addItem(self.underlying_price_lines[chain_symbol])
+        self.impv_chart.addItem(self.prev_underlying_price_lines[chain_symbol])
 
         self.eris_p_strike_lines[chain_symbol].hide()
         self.eris_c_strike_lines[chain_symbol].hide()
@@ -329,6 +342,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.delta002_c_strike_lines[chain_symbol].hide()
         self.atm_strike_lines[chain_symbol].hide()
         self.underlying_price_lines[chain_symbol].hide()
+        self.prev_underlying_price_lines[chain_symbol].hide()
 
         self.total_volume_bars[chain_symbol] = pg.BarGraphItem(
             x=[],
@@ -697,6 +711,27 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             else:
                 self.underlying_price_lines[chain.chain_symbol].hide()
 
+            # Update previous day futures close line
+            today_key: str = datetime.now(DB_TZ).strftime("%Y-%m-%d")
+            if self._prev_underlying_loaded_date != today_key:
+                self.prev_underlying_prices.clear()
+                self._prev_underlying_loaded_date = today_key
+
+            if chain.chain_symbol not in self.prev_underlying_prices:
+                prev_price = self._load_prev_day_futures_close(chain.chain_symbol)
+                if prev_price is not None:
+                    self.prev_underlying_prices[chain.chain_symbol] = prev_price
+
+            prev_price = self.prev_underlying_prices.get(chain.chain_symbol)
+            if prev_price:
+                prev_line = self.prev_underlying_price_lines[chain.chain_symbol]
+                prev_line.setPos(prev_price)
+                symbol = chain.chain_symbol.split(".")[0]
+                prev_line.label.setText(f"{symbol} 前日先物: {prev_price:.0f}")
+                prev_line.show()
+            else:
+                self.prev_underlying_price_lines[chain.chain_symbol].hide()
+
             # Calculate strike_step
             strike_step = 0
             if len(all_strikes) > 1:
@@ -824,6 +859,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             d002_c_line = self.delta002_c_strike_lines[chain_symbol]
             atm_line = self.atm_strike_lines[chain_symbol]
             underlying_line = self.underlying_price_lines[chain_symbol]
+            prev_underlying_line = self.prev_underlying_price_lines[chain_symbol]
             total_volume_bar = self.total_volume_bars[chain_symbol]
             iv_diff_pos_bar = self.iv_diff_pos_bars[chain_symbol]
             iv_diff_neg_bar = self.iv_diff_neg_bars[chain_symbol]
@@ -864,6 +900,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
                 atm_line.hide()
                 underlying_line.hide()
+                prev_underlying_line.hide()
                 total_volume_bar.hide()
                 iv_diff_pos_bar.hide()
                 iv_diff_neg_bar.hide()
@@ -873,6 +910,30 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                     text_item.hide()
                 for text_item in self.total_volume_text_items[chain_symbol]:
                     text_item.hide()
+
+    def _load_prev_day_futures_close(self, chain_symbol: str) -> float | None:
+        """Load previous day's futures close price for a chain.
+
+        chain_symbol is like "nk-202506.JPX"; futures symbol is "nk-202506".
+        Reads pre_close directly from the most recent bar.
+        """
+        symbol: str = chain_symbol.split(".")[0]
+        now: datetime = datetime.now(DB_TZ)
+        start: datetime = now - timedelta(days=2)
+
+        database: BaseDatabase = get_database()
+        bars: list[BarData] = database.load_bar_data(
+            symbol=symbol,
+            exchange=Exchange.JPX,
+            interval=Interval.MINUTE,
+            start=start,
+            end=now,
+        )
+        if not bars:
+            return None
+
+        pre_close = bars[-1].pre_close
+        return pre_close if pre_close else None
 
     def _on_impv_mouse_move(self, evt) -> None:
         """Show crosshair and coordinate label on impv_chart mouse hover."""
@@ -1209,6 +1270,82 @@ def _populate_month_combo(combo: QtWidgets.QComboBox, bars: list[BarData]) -> No
     idx: int = combo.findText(prev_text)
     if idx >= 0:
         combo.setCurrentIndex(idx)
+
+
+def _compute_realized_vol(
+    daily_close: dict[str, float],
+    date_labels: list[str],
+    window: int = 20,
+) -> list[float]:
+    """Rolling annualized realized volatility (%) from futures daily close.
+
+    Aligns the price dict to date_labels, then computes log-return std × √252 × 100
+    over a trailing window. Days without enough data return NaN.
+    """
+    n: int = len(date_labels)
+    if n == 0:
+        return []
+    prices: np.ndarray = np.array(
+        [daily_close.get(d, np.nan) for d in date_labels], dtype=float
+    )
+    returns: np.ndarray = np.full(n, np.nan)
+    for i in range(1, n):
+        p_prev, p_curr = prices[i - 1], prices[i]
+        if not (np.isnan(p_prev) or np.isnan(p_curr)) and p_prev > 0:
+            returns[i] = float(np.log(p_curr / p_prev))
+
+    rv: np.ndarray = np.full(n, np.nan)
+    min_obs: int = max(2, window // 2)
+    for i in range(n):
+        j0 = max(1, i - window + 1)
+        win = returns[j0:i + 1]
+        valid = win[~np.isnan(win)]
+        if len(valid) >= min_obs:
+            rv[i] = float(np.std(valid, ddof=1) * np.sqrt(252) * 100)
+    return rv.tolist()
+
+
+def _interpolate_iv_at_delta(
+    day_bars: list[BarData], target_delta: float
+) -> float | None:
+    """
+    Linearly interpolate IV at exactly target_delta.
+
+    Picks the two same-side option bars (puts for negative target, calls for positive)
+    whose deltas bracket target_delta, then interpolates IV between them.
+    Returns the IV as a fraction (multiply by 100 for percent) or None when the
+    target cannot be bracketed (no extrapolation outside the chain).
+    """
+    if target_delta < 0:
+        side_bars: list[BarData] = [b for b in day_bars if b.delta < 0]
+    elif target_delta > 0:
+        side_bars = [b for b in day_bars if b.delta > 0]
+    else:
+        return None
+
+    if not side_bars:
+        return None
+
+    side_bars.sort(key=lambda b: b.delta)
+
+    lo_bar: BarData | None = None
+    hi_bar: BarData | None = None
+    for bar in side_bars:
+        if bar.delta <= target_delta:
+            lo_bar = bar
+        if bar.delta >= target_delta:
+            hi_bar = bar
+            break
+
+    # Don't extrapolate when target is outside the available delta range.
+    if lo_bar is None or hi_bar is None:
+        return None
+
+    if lo_bar is hi_bar or hi_bar.delta == lo_bar.delta:
+        return lo_bar.iv
+
+    t: float = (target_delta - lo_bar.delta) / (hi_bar.delta - lo_bar.delta)
+    return lo_bar.iv + t * (hi_bar.iv - lo_bar.iv)
 
 
 class IVHeatmapChart(QtWidgets.QWidget):
@@ -1775,6 +1912,13 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             "window_height": self.height(),
             "show_decay": self.decay_check.isChecked(),
             "show_envelope": self.envelope_check.isChecked(),
+            "show_skew": self.skew_check.isChecked(),
+            "show_comp": self.comp_check.isChecked(),
+            "comp_basis_skew": self.comp_skew_check.isChecked(),
+            "show_pinned": self.pinned_check.isChecked(),
+            "show_realized": self.realized_check.isChecked(),
+            "show_vrp": self.vrp_check.isChecked(),
+            "realized_window": self.realized_window_spin.value(),
         }
         save_json(self.SETTING_FILENAME, data)
 
@@ -1788,6 +1932,13 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             self.resize(win_w, win_h)
         self.decay_check.setChecked(data.get("show_decay", False))
         self.envelope_check.setChecked(data.get("show_envelope", False))
+        self.skew_check.setChecked(data.get("show_skew", False))
+        self.comp_check.setChecked(data.get("show_comp", True))
+        self.comp_skew_check.setChecked(data.get("comp_basis_skew", False))
+        self.pinned_check.setChecked(data.get("show_pinned", False))
+        self.realized_check.setChecked(data.get("show_realized", False))
+        self.vrp_check.setChecked(data.get("show_vrp", False))
+        self.realized_window_spin.setValue(data.get("realized_window", 20))
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._save_settings()
@@ -1827,6 +1978,20 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
 
         self.decay_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("理論減衰")
         self.envelope_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("残像")
+        self.skew_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("スキュー")
+        self.comp_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("圧縮度")
+        self.comp_check.setChecked(True)
+        self.comp_skew_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("圧縮度=スキュー基準")
+        self.pinned_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("ピン留め(固定行使価格)")
+        self.realized_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("実現ボラ")
+        self.realized_window_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.realized_window_spin.setMinimum(2)
+        self.realized_window_spin.setMaximum(90)
+        self.realized_window_spin.setValue(20)
+        self.realized_window_spin.setSuffix("D")
+        self.realized_window_spin.setFixedWidth(60)
+        self.realized_window_spin.setToolTip("実現ボラ/VRP の rolling window (10/20/30 等)")
+        self.vrp_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("VRP")
 
         button: QtWidgets.QPushButton = QtWidgets.QPushButton("更新")
         button.clicked.connect(self.run_analysis)
@@ -1845,6 +2010,13 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         hbox.addStretch()
         hbox.addWidget(self.decay_check)
         hbox.addWidget(self.envelope_check)
+        hbox.addWidget(self.skew_check)
+        hbox.addWidget(self.comp_check)
+        hbox.addWidget(self.comp_skew_check)
+        hbox.addWidget(self.pinned_check)
+        hbox.addWidget(self.realized_check)
+        hbox.addWidget(self.realized_window_spin)
+        hbox.addWidget(self.vrp_check)
         hbox.addWidget(button)
 
         vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
@@ -1855,7 +2027,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
     def build_series(
         self, bars: list[BarData]
     ) -> tuple[list[str], dict[str, list[float]]]:
-        """個別オプションバーからデルタレベル別IV時系列を構築"""
+        """個別オプションバーからデルタレベル別IV時系列を構築 (delta-interpolated)."""
         date_bars: dict[str, list[BarData]] = {}
         for bar in bars:
             if bar.iv <= 0 or bar.delta == 0:
@@ -1875,21 +2047,82 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             day_bars: list[BarData] = date_bars[date_key]
 
             for label, target_delta, _color in self.DELTA_TARGETS:
-                best_bar: BarData | None = None
-                best_diff: float = float("inf")
-
-                for bar in day_bars:
-                    diff: float = abs(bar.delta - target_delta)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best_bar = bar
-
-                if best_bar and best_diff < 0.05:
-                    series[label].append(best_bar.iv * 100)
+                iv: float | None = _interpolate_iv_at_delta(day_bars, target_delta)
+                if iv is not None and iv > 0:
+                    series[label].append(iv * 100)
                 else:
                     series[label].append(float("nan"))
 
         return sorted_dates, series
+
+    def build_strike_anchored_series(
+        self, bars: list[BarData], date_labels: list[str]
+    ) -> tuple[dict[str, list[float]], dict[str, str]]:
+        """Pin one option contract per Δ-target on the latest date and follow its IV.
+
+        For each delta target, the contract whose delta is closest to the target
+        on the most-recent valid date is selected ("anchor"). Its IV is then
+        looked up by symbol on every prior date, so the series tracks one and
+        only one contract — futures movement no longer changes which option is
+        being measured.
+
+        Returns:
+            (pinned_series, anchor_symbols) where pinned_series[label] is the IV
+            (in %) per date_label and anchor_symbols[label] is the pinned
+            contract's symbol (e.g. "nk-2606-P-54000").
+        """
+        date_bars: dict[str, list[BarData]] = {}
+        for bar in bars:
+            if bar.iv <= 0 or bar.delta == 0 or not bar.symbol:
+                continue
+            date_key: str = bar.datetime.strftime("%Y-%m-%d")
+            date_bars.setdefault(date_key, []).append(bar)
+
+        if not date_bars or not date_labels:
+            return {}, {}
+
+        # Anchor on the latest date that actually has bars (= last entry of date_labels
+        # that is also in date_bars)
+        anchor_date: str | None = None
+        for d in reversed(date_labels):
+            if d in date_bars:
+                anchor_date = d
+                break
+        if anchor_date is None:
+            return {}, {}
+
+        anchor_day_bars: list[BarData] = date_bars[anchor_date]
+
+        anchor_symbols: dict[str, str] = {}
+        for label, target_delta, _color in self.DELTA_TARGETS:
+            if target_delta < 0:
+                side_bars = [b for b in anchor_day_bars if b.delta < 0]
+            elif target_delta > 0:
+                side_bars = [b for b in anchor_day_bars if b.delta > 0]
+            else:
+                continue
+            if not side_bars:
+                continue
+            best = min(side_bars, key=lambda b: abs(b.delta - target_delta))
+            anchor_symbols[label] = best.symbol
+
+        pinned_series: dict[str, list[float]] = {}
+        for label, sym in anchor_symbols.items():
+            values: list[float] = []
+            for date_key in date_labels:
+                day_bars = date_bars.get(date_key, [])
+                hit: BarData | None = None
+                for bar in day_bars:
+                    if bar.symbol == sym:
+                        hit = bar
+                        break
+                if hit is not None and hit.iv > 0:
+                    values.append(hit.iv * 100)
+                else:
+                    values.append(float("nan"))
+            pinned_series[label] = values
+
+        return pinned_series, anchor_symbols
 
     def _load_futures_daily_close(
         self, month: str, days: int
@@ -1947,6 +2180,9 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         if not date_labels:
             return
 
+        # Strike-anchored series — pinned to the most-recent date's best-Δ contract.
+        pinned_series, anchor_symbols = self.build_strike_anchored_series(bars, date_labels)
+
         # Load futures price for the selected month
         futures_month: str = month if month != "全て" else ""
         futures_prices: dict[str, float] = {}
@@ -1956,7 +2192,10 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         delta_selection: str = self.delta_combo.currentText()
         ymin: float = self.ymin_spin.value()
         ymax: float = self.ymax_spin.value()
-        self.update_chart(date_labels, series, delta_selection, ymin, ymax, futures_prices)
+        self.update_chart(
+            date_labels, series, delta_selection, ymin, ymax,
+            futures_prices, pinned_series, anchor_symbols,
+        )
 
     def update_chart(
         self,
@@ -1966,8 +2205,14 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         ymin: float,
         ymax: float,
         futures_prices: dict[str, float] | None = None,
+        pinned_series: dict[str, list[float]] | None = None,
+        anchor_symbols: dict[str, str] | None = None,
     ) -> None:
         self.fig.clear()
+        if pinned_series is None:
+            pinned_series = {}
+        if anchor_symbols is None:
+            anchor_symbols = {}
 
         x = np.arange(len(date_labels))
 
@@ -1978,19 +2223,78 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
 
         show_decay: bool = self.decay_check.isChecked()
         show_envelope: bool = self.envelope_check.isChecked()
+        show_skew: bool = self.skew_check.isChecked()
+        show_comp: bool = self.comp_check.isChecked() and show_decay
+        comp_basis_skew: bool = self.comp_skew_check.isChecked() and show_decay
+        show_pinned: bool = self.pinned_check.isChecked() and bool(pinned_series)
+        show_realized: bool = self.realized_check.isChecked() and bool(futures_prices)
+        show_vrp: bool = self.vrp_check.isChecked() and bool(futures_prices)
         envelope_window: int = 20
+        realized_window: int = self.realized_window_spin.value()
 
-        # Split into two subplots when the decay overlay (compression indicator) is on
-        if show_decay:
-            gs = self.fig.add_gridspec(2, 1, height_ratios=[6, 1], hspace=0.08)
-            ax = self.fig.add_subplot(gs[0, 0])
-            ax_comp = self.fig.add_subplot(gs[1, 0], sharex=ax)
-        else:
+        atm_label: str = "ATM (Δ0.50)"
+        skew_series: dict[str, list[float]] = {}
+        if atm_label in series:
+            atm_vals = series[atm_label]
+            for label in series:
+                if label == atm_label:
+                    continue
+                skew_series[label] = [
+                    (v - a) if not (np.isnan(v) or np.isnan(a)) else float("nan")
+                    for v, a in zip(series[label], atm_vals)
+                ]
+
+        skew_targets: list[tuple[str, float, str]] = [
+            t for t in plot_targets if t[0] != atm_label and t[0] in skew_series
+        ]
+        has_skew_plot: bool = show_skew and bool(skew_targets)
+
+        # Build a vertical stack of subplots based on which overlays are enabled.
+        #   row 0: main IV chart (always present)
+        #   row 1: skew subplot (optional)
+        #   row 2: compression bars (optional, only with 理論減衰)
+        height_ratios: list[int] = [6]
+        if has_skew_plot:
+            height_ratios.append(2)
+        if show_comp:
+            height_ratios.append(1)
+
+        ax_skew = None
+        ax_skew_right = None
+        ax_comp = None
+        if len(height_ratios) == 1:
             ax = self.fig.add_subplot(111)
-            ax_comp = None
+        else:
+            gs = self.fig.add_gridspec(
+                len(height_ratios), 1, height_ratios=height_ratios, hspace=0.08
+            )
+            ax = self.fig.add_subplot(gs[0, 0])
+            row_idx = 1
+            if has_skew_plot:
+                ax_skew = self.fig.add_subplot(gs[row_idx, 0], sharex=ax)
+                row_idx += 1
+            if show_comp:
+                ax_comp = self.fig.add_subplot(gs[row_idx, 0], sharex=ax)
 
-        # Per-target compression ratio = (actual - theory) / spike
+        # Per-target compression ratio = (actual - theory) / spike.
+        # Computed against either raw IV (default) or the skew series (when toggled).
         compression: dict[str, np.ndarray] = {}
+
+        def _compute_compression(arr: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
+            """Return (theory_curve, compression_ratio) or (None, None) when not applicable."""
+            valid_mask = ~np.isnan(arr)
+            if valid_mask.sum() < 3:
+                return None, None
+            peak_idx = int(np.nanargmax(arr))
+            peak_v = float(arr[peak_idx])
+            base_v = float(np.nanmin(arr))
+            spike = peak_v - base_v
+            if spike <= 0:
+                return None, None
+            theory = np.full(len(arr), np.nan)
+            for j in range(peak_idx, len(arr)):
+                theory[j] = base_v + spike / np.sqrt(j - peak_idx + 1)
+            return theory, (arr - theory) / spike
 
         for label, target_delta, color in plot_targets:
             values: list[float] = series[label]
@@ -2020,23 +2324,15 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             # IV理論減衰 — from most-recent peak, decay ∝ 1/√(t+1)
             if show_decay:
                 arr = np.array(values, dtype=float)
-                valid_mask = ~np.isnan(arr)
-                if valid_mask.sum() >= 3:
-                    peak_idx = int(np.nanargmax(arr))
-                    peak_iv = float(arr[peak_idx])
-                    base_iv = float(np.nanmin(arr))
-                    spike = peak_iv - base_iv
-                    if spike > 0:
-                        theory = np.full(len(arr), np.nan)
-                        for i in range(peak_idx, len(arr)):
-                            t = i - peak_idx
-                            theory[i] = base_iv + spike / np.sqrt(t + 1)
-                        ax.plot(
-                            x, theory,
-                            color=color, linewidth=1.0, linestyle="--",
-                            alpha=0.7, label=f"{label} 理論減衰",
-                        )
-                        compression[label] = (arr - theory) / spike
+                theory, comp = _compute_compression(arr)
+                if theory is not None:
+                    ax.plot(
+                        x, theory,
+                        color=color, linewidth=1.0, linestyle="--",
+                        alpha=0.7, label=f"{label} 理論減衰",
+                    )
+                    if not comp_basis_skew:
+                        compression[label] = comp
 
             # 前日比テキストを表示
             fs: int = 11 if delta_selection != "全デルタ" else 9
@@ -2054,8 +2350,173 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     color=color, fontweight="bold",
                 )
 
-        ax.legend(loc="upper right", fontsize=8, framealpha=0.7)
+        # --- Realized vol + VRP overlays ---
+        # Realized vol: rolling annualized std of futures log-returns.
+        # VRP: ATM IV − realized vol (= the "vol risk premium" priced into ATM).
+        # Compute realized vol once whenever any consumer (line plot or VRP) needs it.
+        realized_vol: list[float] = []
+        vrp_values: list[float] = []
+        if (show_realized or show_vrp) and futures_prices:
+            realized_vol = _compute_realized_vol(
+                futures_prices, date_labels, window=realized_window
+            )
+        if show_realized and realized_vol and any(not np.isnan(v) for v in realized_vol):
+            ax.plot(
+                x, realized_vol,
+                color="#ffd700", linewidth=1.2, linestyle="-",
+                alpha=0.85, label=f"実現ボラ({realized_window}D)",
+                marker="^", markersize=3,
+            )
+        if show_vrp and realized_vol:
+            atm_vals = series.get(atm_label, [])
+            if atm_vals:
+                vrp_values = [
+                    (a - r) if not (np.isnan(a) or np.isnan(r)) else float("nan")
+                    for a, r in zip(atm_vals, realized_vol)
+                ]
+                if any(not np.isnan(v) for v in vrp_values):
+                    ax.plot(
+                        x, vrp_values,
+                        color="#c896ff", linewidth=1.2, linestyle="-.",
+                        alpha=0.9, label=f"VRP (ATM−RV{realized_window}D)",
+                        marker="d", markersize=3,
+                    )
+
+        # --- Strike-anchored (pinned) IV — dotted line on the main IV chart ---
+        # Tracks one specific contract per Δ-target so its IV move is not
+        # contaminated by the chain rolling along the smile when futures move.
+        if show_pinned:
+            for label, target_delta, color in plot_targets:
+                pinned_values = pinned_series.get(label)
+                if not pinned_values:
+                    continue
+                arr = np.array(pinned_values, dtype=float)
+                if not np.any(~np.isnan(arr)):
+                    continue
+                anchor_sym = anchor_symbols.get(label, "")
+                # Pull strike out of "nk-2606-P-54000" → "54000" for the legend.
+                strike_str: str = anchor_sym.split("-")[-1] if anchor_sym else ""
+                pinned_label: str = f"{label} ピン留め(K={strike_str})" if strike_str else f"{label} ピン留め"
+                ax.plot(
+                    x, pinned_values,
+                    color=color, linewidth=1.2, linestyle=":",
+                    alpha=0.85, label=pinned_label,
+                    marker="x", markersize=4,
+                )
+
+        ax.legend(loc="upper left", fontsize=8, framealpha=0.7)
         ax.grid(True, alpha=0.3)
+
+        # --- Skew subplot: (IV at target Δ) − (IV at ATM) ---
+        # Put (negative Δ) and Call (positive Δ) skews live on very different
+        # scales (Put ≈ +10, Call ≈ -2), so when both are visible we put Put
+        # on the left axis and Call on a twin right axis to remove the gap.
+        if ax_skew is not None:
+            has_put_skew: bool = any(td < 0 for _, td, _ in skew_targets)
+            has_call_skew: bool = any(td > 0 for _, td, _ in skew_targets)
+            use_twin_skew: bool = has_put_skew and has_call_skew
+            if use_twin_skew:
+                ax_skew_right = ax_skew.twinx()
+
+            skew_legend_lines: list = []
+            for label, target_delta, color in skew_targets:
+                skew_values: list[float] = skew_series[label]
+                target_ax = ax_skew_right if (use_twin_skew and target_delta > 0) else ax_skew
+                line, = target_ax.plot(
+                    x, skew_values,
+                    color=color, linewidth=1.5,
+                    label=f"{label} − ATM",
+                    marker=".", markersize=3,
+                )
+                skew_legend_lines.append(line)
+
+                # 前日比 on the skew line too — placed on the same axis as the line
+                fs_skew: int = 9
+                for i in range(1, len(skew_values)):
+                    prev_v = skew_values[i - 1]
+                    curr_v = skew_values[i]
+                    if np.isnan(prev_v) or np.isnan(curr_v):
+                        continue
+                    diff_v = curr_v - prev_v
+                    if abs(diff_v) < 0.05:
+                        continue
+                    mid_x_s = (x[i - 1] + x[i]) / 2
+                    mid_y_s = (prev_v + curr_v) / 2
+                    target_ax.text(
+                        mid_x_s, mid_y_s, f"{diff_v:+.1f}",
+                        ha="center", va="bottom", fontsize=fs_skew,
+                        color=color, fontweight="bold",
+                    )
+
+            ax_skew.axhline(0, color="#ffffff", linewidth=0.6, alpha=0.5)
+            ax_skew.legend(
+                skew_legend_lines,
+                [ln.get_label() for ln in skew_legend_lines],
+                loc="upper left", fontsize=8, framealpha=0.7,
+            )
+            ax_skew.grid(True, alpha=0.3)
+            if use_twin_skew:
+                ax_skew.set_ylabel("Put − ATM", fontsize=9)
+                ax_skew_right.set_ylabel("Call − ATM", fontsize=9)
+                ax_skew_right.tick_params(axis="y", labelsize=8)
+            else:
+                ax_skew.set_ylabel("スキュー\n(IV − ATM)", fontsize=9)
+            ax_skew.tick_params(axis="y", labelsize=8)
+
+        # --- Skew-basis compression: drives the bottom comp subplot when toggled ---
+        # Computed regardless of whether the skew subplot is visible, so the user
+        # can still get skew-basis bars without devoting screen space to skew lines.
+        if comp_basis_skew:
+            for label, target_delta, color in skew_targets:
+                arr = np.array(skew_series[label], dtype=float)
+                theory, comp = _compute_compression(arr)
+                if theory is None:
+                    continue
+                if ax_skew is not None:
+                    theory_ax = (
+                        ax_skew_right
+                        if (ax_skew_right is not None and target_delta > 0)
+                        else ax_skew
+                    )
+                    theory_ax.plot(
+                        x, theory,
+                        color=color, linewidth=1.0, linestyle="--",
+                        alpha=0.7,
+                    )
+                compression[label] = comp
+
+        # Tighten skew Y-axis to the actual IV−ATM data range (ignore theory
+        # decay overlay so the dashed reference can't stretch the view).
+        # When the twin axis is in play, each side gets its own tight bounds.
+        def _tight_ylim(target_ax, vals: list[float]) -> None:
+            if not vals:
+                return
+            lo: float = min(vals)
+            hi: float = max(vals)
+            pad: float = (hi - lo) * 0.08 if hi > lo else 0.5
+            target_ax.set_ylim(lo - pad, hi + pad)
+
+        if ax_skew is not None and skew_targets:
+            if ax_skew_right is not None:
+                left_vals: list[float] = [
+                    v
+                    for lbl, td, _ in skew_targets if td < 0
+                    for v in skew_series.get(lbl, []) if not np.isnan(v)
+                ]
+                right_vals: list[float] = [
+                    v
+                    for lbl, td, _ in skew_targets if td > 0
+                    for v in skew_series.get(lbl, []) if not np.isnan(v)
+                ]
+                _tight_ylim(ax_skew, left_vals)
+                _tight_ylim(ax_skew_right, right_vals)
+            else:
+                all_vals: list[float] = [
+                    v
+                    for lbl, _, _ in skew_targets
+                    for v in skew_series.get(lbl, []) if not np.isnan(v)
+                ]
+                _tight_ylim(ax_skew, all_vals)
 
         if ymin > 0 or ymax > 0:
             if ymin > 0 and ymax > 0 and ymax > ymin:
@@ -2081,7 +2542,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 )
                 ax2.set_ylabel("先物価格", color="#66ff66")
                 ax2.tick_params(axis="y", labelcolor="#66ff66")
-                ax2.legend(loc="upper left", fontsize=8, framealpha=0.7)
+                ax2.legend(loc="upper right", fontsize=8, framealpha=0.7)
 
         n_dates: int = len(date_labels)
         step: int = max(1, n_dates // 15)
@@ -2094,13 +2555,16 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
 
         # Compression subplot: (actual IV − theory IV) / spike. Negative = IV crush.
         if ax_comp is not None and compression:
-            n_targets = len(compression)
+            label_to_color: dict[str, str] = {lbl: col for lbl, _, col in plot_targets}
+            ordered_labels: list[str] = [
+                lbl for lbl, _, _ in plot_targets if lbl in compression
+            ]
+            n_targets = len(ordered_labels)
             bar_width = 0.8 / max(n_targets, 1)
-            for idx, (label, target_delta, color) in enumerate(plot_targets):
-                if label not in compression:
-                    continue
+            for cidx, label in enumerate(ordered_labels):
+                color = label_to_color[label]
                 comp_vals = compression[label]
-                offset = (idx - (n_targets - 1) / 2) * bar_width
+                offset = (cidx - (n_targets - 1) / 2) * bar_width
                 colors = ["#ff5050" if (not np.isnan(v) and v < 0) else color for v in comp_vals]
                 ax_comp.bar(
                     x + offset, comp_vals, width=bar_width,
@@ -2108,28 +2572,51 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 )
             ax_comp.axhline(0, color="#ffffff", linewidth=0.6, alpha=0.5)
             ax_comp.grid(True, alpha=0.2)
-            ax_comp.set_ylabel("圧縮度\n(実績−理論)/spike", fontsize=8)
+            comp_basis_label: str = "スキュー" if comp_basis_skew else "実績"
+            ax_comp.set_ylabel(f"圧縮度\n({comp_basis_label}−理論)/spike", fontsize=8)
             ax_comp.tick_params(axis="y", labelsize=8)
-            ax_comp.set_xticks(tick_positions)
-            ax_comp.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=8)
-            ax_comp.set_xlabel("日付")
-            # Hide x-tick labels on main ax since the subplot carries them
-            ax.set_xticks(tick_positions)
-            ax.tick_params(axis="x", labelbottom=False)
-            ax.set_xlabel("")
+
+        # X-axis labels go on the bottom-most subplot only.
+        if ax_comp is not None:
+            bottom_ax = ax_comp
+        elif ax_skew is not None:
+            bottom_ax = ax_skew
         else:
-            ax.set_xticks(tick_positions)
-            ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=8)
-            ax.set_xlabel("日付")
+            bottom_ax = ax
+        bottom_ax.set_xticks(tick_positions)
+        bottom_ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=8)
+        bottom_ax.set_xlabel("日付")
+        for upper_ax in (ax, ax_skew, ax_comp):
+            if upper_ax is None or upper_ax is bottom_ax:
+                continue
+            upper_ax.set_xticks(tick_positions)
+            upper_ax.tick_params(axis="x", labelbottom=False)
+            upper_ax.set_xlabel("")
 
         # Setup cursor
         self._cursor_ax = ax
+        self._cursor_ax_skew = ax_skew
         self._cursor_ax_comp = ax_comp
         self._cursor_date_labels = date_labels
         self._cursor_series = {label: series[label] for label, _, _ in plot_targets}
+        self._cursor_skew_series = {
+            label: skew_series[label]
+            for label, _, _ in skew_targets
+            if ax_skew is not None and label in skew_series
+        }
         self._cursor_plot_targets = list(plot_targets)
+        self._cursor_skew_targets = list(skew_targets) if ax_skew is not None else []
+        self._cursor_pinned_series = (
+            {label: pinned_series[label] for label in pinned_series}
+            if show_pinned else {}
+        )
+        self._cursor_anchor_symbols = dict(anchor_symbols) if show_pinned else {}
+        self._cursor_realized_vol = realized_vol if show_realized else []
+        self._cursor_vrp_values = vrp_values if show_vrp else []
+        self._cursor_realized_window = realized_window
         self._cursor_futures_values = futures_values
         self._cursor_compression = {k: list(v) for k, v in compression.items()}
+        self._cursor_comp_basis_skew = comp_basis_skew
 
         self._cursor_vline = ax.axvline(x=0, color="#ffffff", linewidth=0.5, linestyle="--", alpha=0.5, visible=False)
         self._cursor_text = ax.text(
@@ -2141,6 +2628,13 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             bbox=dict(boxstyle="round,pad=0.3", fc="#333333", ec="#888888", alpha=0.9),
         )
         self._cursor_text.set_visible(False)
+
+        # Skew subplot cursor mirror
+        self._cursor_vline_skew = None
+        if ax_skew is not None:
+            self._cursor_vline_skew = ax_skew.axvline(
+                x=0, color="#ffffff", linewidth=0.5, linestyle="--", alpha=0.5, visible=False,
+            )
 
         # Compression subplot cursor mirror
         self._cursor_vline_comp = None
@@ -2165,10 +2659,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
 
         self.fig.tight_layout()
         # Trim outer whitespace to match IVEventDecayChart compactness
-        if ax_comp is not None:
-            self.fig.subplots_adjust(left=0.045, right=0.97, top=0.96, bottom=0.07, hspace=0.05)
-        else:
-            self.fig.subplots_adjust(left=0.045, right=0.97, top=0.96, bottom=0.08)
+        bottom_margin = 0.07 if (ax_comp is not None or ax_skew is not None) else 0.08
+        self.fig.subplots_adjust(left=0.045, right=0.97, top=0.96, bottom=bottom_margin, hspace=0.05)
         self.canvas.draw()
 
     def _on_mouse_move(self, event) -> None:
@@ -2177,6 +2669,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 self._cursor_vline.set_visible(False)
             if self._cursor_text:
                 self._cursor_text.set_visible(False)
+            if getattr(self, "_cursor_vline_skew", None):
+                self._cursor_vline_skew.set_visible(False)
             if self._cursor_vline_comp:
                 self._cursor_vline_comp.set_visible(False)
             if self._cursor_text_comp:
@@ -2188,6 +2682,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         if ix < 0 or ix >= len(self._cursor_date_labels):
             self._cursor_vline.set_visible(False)
             self._cursor_text.set_visible(False)
+            if getattr(self, "_cursor_vline_skew", None):
+                self._cursor_vline_skew.set_visible(False)
             if self._cursor_vline_comp:
                 self._cursor_vline_comp.set_visible(False)
             if self._cursor_text_comp:
@@ -2197,6 +2693,9 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
 
         self._cursor_vline.set_xdata([ix])
         self._cursor_vline.set_visible(True)
+        if getattr(self, "_cursor_vline_skew", None):
+            self._cursor_vline_skew.set_xdata([ix])
+            self._cursor_vline_skew.set_visible(True)
 
         date_str: str = self._cursor_date_labels[ix]
         lines: list[str] = [date_str]
@@ -2206,6 +2705,37 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             if ix < len(values) and not np.isnan(values[ix]):
                 short_label = label.split(" ")[0]
                 lines.append(f"{short_label}: {values[ix]:.1f}%")
+
+        # Skew values when the skew subplot is enabled
+        if getattr(self, "_cursor_skew_series", None):
+            for label, _delta, color in getattr(self, "_cursor_skew_targets", []):
+                skew_vals = self._cursor_skew_series.get(label, [])
+                if ix < len(skew_vals) and not np.isnan(skew_vals[ix]):
+                    short_label = label.split(" ")[0]
+                    lines.append(f"{short_label}−ATM: {skew_vals[ix]:+.1f}%")
+
+        # Pinned (strike-anchored) IV values
+        if getattr(self, "_cursor_pinned_series", None):
+            anchor_syms = getattr(self, "_cursor_anchor_symbols", {})
+            for label, _delta, color in self._cursor_plot_targets:
+                pinned_vals = self._cursor_pinned_series.get(label, [])
+                if ix < len(pinned_vals) and not np.isnan(pinned_vals[ix]):
+                    short_label = label.split(" ")[0]
+                    sym = anchor_syms.get(label, "")
+                    strike_part = sym.split("-")[-1] if sym else ""
+                    suffix = f"@K{strike_part}" if strike_part else ""
+                    lines.append(f"{short_label}{suffix}: {pinned_vals[ix]:.1f}%")
+
+        # Realized vol
+        rv_series = getattr(self, "_cursor_realized_vol", [])
+        rv_window = getattr(self, "_cursor_realized_window", 20)
+        if rv_series and ix < len(rv_series) and not np.isnan(rv_series[ix]):
+            lines.append(f"実現ボラ({rv_window}D): {rv_series[ix]:.1f}%")
+
+        # Vol Risk Premium (ATM − realized vol)
+        vrp_series = getattr(self, "_cursor_vrp_values", [])
+        if vrp_series and ix < len(vrp_series) and not np.isnan(vrp_series[ix]):
+            lines.append(f"VRP: {vrp_series[ix]:+.1f}%")
 
         if self._cursor_futures_values and ix < len(self._cursor_futures_values):
             fv = self._cursor_futures_values[ix]
