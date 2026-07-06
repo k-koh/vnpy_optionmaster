@@ -21,6 +21,7 @@ matplotlib.use('Qt5Agg')                    # noqa
 import matplotlib.pyplot as plt             # noqa
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas  # noqa
 from matplotlib.figure import Figure        # noqa
+from matplotlib.patches import Patch        # noqa
 from mpl_toolkits.mplot3d import Axes3D     # noqa
 from pylab import mpl                       # noqa
 
@@ -275,19 +276,24 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         position = self.underlying_line_positions.pop(0)
         prev_position = max(0.05, position - 0.08)
 
+        # Stagger label positions per chain so month1/month2 strike-line labels
+        # don't overlay each other when the lines sit at similar strikes.
+        chain_index = len(self.eris_p_strike_lines)
+        label_shift = chain_index * 0.08
+
         self.eris_p_strike_lines[chain_symbol] = pg.InfiniteLine(
             angle=90,
             movable=False,
             pen=p_line_pen,
             label=symbol + " プットΔ0.1",
-            labelOpts={'position': 0.95, 'color': color, 'fill': (200,200,200,50), 'movable': False}
+            labelOpts={'position': max(0.05, 0.95 - label_shift), 'color': color, 'fill': (200,200,200,50), 'movable': False}
         )
         self.eris_c_strike_lines[chain_symbol] = pg.InfiniteLine(
             angle=90,
             movable=False,
             pen=c_line_pen,
             label=symbol + " コールΔ0.1",
-            labelOpts={'position': 0.01, 'color': color, 'fill': (200,200,200,50), 'movable': False}
+            labelOpts={'position': min(0.95, 0.01 + label_shift), 'color': color, 'fill': (200,200,200,50), 'movable': False}
         )
 
         self.delta002_p_strike_lines[chain_symbol] = pg.InfiniteLine(
@@ -295,14 +301,14 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             movable=False,
             pen=p_line_pen,
             label=symbol + " プットΔ0.02",
-            labelOpts={'position': 0.92, 'color': color, 'fill': (200,200,200,50), 'movable': False}
+            labelOpts={'position': max(0.05, 0.92 - label_shift), 'color': color, 'fill': (200,200,200,50), 'movable': False}
         )
         self.delta002_c_strike_lines[chain_symbol] = pg.InfiniteLine(
             angle=90,
             movable=False,
             pen=c_line_pen,
             label=symbol + " コールΔ0.02",
-            labelOpts={'position': 0.04, 'color': color, 'fill': (200,200,200,50), 'movable': False}
+            labelOpts={'position': min(0.95, 0.04 + label_shift), 'color': color, 'fill': (200,200,200,50), 'movable': False}
         )
 
 
@@ -1348,180 +1354,6 @@ def _interpolate_iv_at_delta(
     return lo_bar.iv + t * (hi_bar.iv - lo_bar.iv)
 
 
-class IVHeatmapChart(QtWidgets.QWidget):
-    """IV残像ヒートマップ - デルタレベル別IV推移の可視化"""
-
-    # Target delta values: negative = put, positive = call
-    DELTA_TARGETS: list[tuple[str, float]] = [
-        ("Put Δ0.10", -0.10),
-        ("ATM (Δ0.50)", -0.50),
-        ("Call Δ0.10", 0.10),
-    ]
-
-    def __init__(self, option_engine: OptionEngine, portfolio_name: str) -> None:
-        super().__init__()
-
-        self.option_engine: OptionEngine = option_engine
-        self.portfolio_name: str = portfolio_name
-        self.fig: Figure = Figure(figsize=(10, 5))
-        self.canvas: FigureCanvas = FigureCanvas(self.fig)
-
-        self.init_ui()
-
-    def init_ui(self) -> None:
-        self.setWindowTitle("IV残像ヒートマップ")
-        self.resize(900, 500)
-
-        self.days_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
-        self.days_spin.setMinimum(3)
-        self.days_spin.setMaximum(90)
-        self.days_spin.setValue(45)
-        self.days_spin.setSuffix("日")
-
-        self.month_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
-        self.month_combo.setFixedWidth(100)
-
-        self.mode_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
-        self.mode_combo.addItems(["IV値 (年率%)", "前日比 (bp)"])
-
-        button: QtWidgets.QPushButton = QtWidgets.QPushButton("更新")
-        button.clicked.connect(self.run_analysis)
-
-        hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
-        hbox.addWidget(QtWidgets.QLabel("期間"))
-        hbox.addWidget(self.days_spin)
-        hbox.addWidget(QtWidgets.QLabel("限月"))
-        hbox.addWidget(self.month_combo)
-        hbox.addWidget(QtWidgets.QLabel("表示モード"))
-        hbox.addWidget(self.mode_combo)
-        hbox.addStretch()
-        hbox.addWidget(button)
-
-        vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
-        vbox.addLayout(hbox)
-        vbox.addWidget(self.canvas)
-        self.setLayout(vbox)
-
-    def build_matrix(self, bars: list[BarData]) -> tuple[np.ndarray, list[str], list[str]]:
-        """個別オプションバーからデルタレベル別×日付のIV行列を構築"""
-        # Group bars by date
-        date_bars: dict[str, list[BarData]] = {}
-        for bar in bars:
-            if bar.iv <= 0 or bar.delta == 0:
-                continue
-            date_key: str = bar.datetime.strftime("%Y-%m-%d")
-            date_bars.setdefault(date_key, []).append(bar)
-
-        sorted_dates: list[str] = sorted(date_bars.keys())
-        if not sorted_dates:
-            return np.array([]), [], []
-
-        delta_labels: list[str] = [t[0] for t in self.DELTA_TARGETS]
-        n_deltas: int = len(self.DELTA_TARGETS)
-        n_dates: int = len(sorted_dates)
-        matrix: np.ndarray = np.full((n_deltas, n_dates), np.nan)
-
-        for j, date_key in enumerate(sorted_dates):
-            day_bars: list[BarData] = date_bars[date_key]
-
-            for i, (label, target_delta) in enumerate(self.DELTA_TARGETS):
-                best_bar: BarData | None = None
-                best_diff: float = float("inf")
-
-                for bar in day_bars:
-                    diff: float = abs(bar.delta - target_delta)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best_bar = bar
-
-                if best_bar and best_diff < 0.05:
-                    matrix[i, j] = best_bar.iv * 100
-
-        return matrix, sorted_dates, delta_labels
-
-    def run_analysis(self) -> None:
-        days: int = self.days_spin.value()
-        mode: str = self.mode_combo.currentText()
-
-        all_bars: list[BarData] = _load_option_bars_with_today(days)
-        if not all_bars:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "データなし",
-                f"過去{days}日間のオプションデータが見つかりません",
-                QtWidgets.QMessageBox.Ok,
-            )
-            return
-
-        _populate_month_combo(self.month_combo, all_bars)
-        month: str = self.month_combo.currentText()
-        bars: list[BarData] = _filter_bars_by_month(all_bars, month)
-
-        matrix, date_labels, delta_labels = self.build_matrix(bars)
-        if matrix.size == 0:
-            return
-
-        if "前日比" in mode:
-            diff: np.ndarray = np.diff(matrix, axis=1)
-            matrix = diff * 100
-            date_labels = date_labels[1:]
-
-        self.update_chart(matrix, date_labels, delta_labels, mode)
-
-    def update_chart(
-        self,
-        matrix: np.ndarray,
-        date_labels: list[str],
-        delta_labels: list[str],
-        mode: str,
-    ) -> None:
-        self.fig.clear()
-        ax = self.fig.add_subplot(111)
-
-        masked: np.ma.MaskedArray = np.ma.masked_invalid(matrix)
-
-        cmap: str = "RdYlBu_r" if "IV値" in mode else "RdBu_r"
-        im = ax.pcolormesh(
-            masked,
-            cmap=cmap,
-            edgecolors="grey",
-            linewidth=0.3,
-        )
-        self.fig.colorbar(im, ax=ax, pad=0.02)
-
-        # 各セルにIV値をテキスト表示
-        n_rows, n_cols = matrix.shape
-        for i in range(n_rows):
-            for j in range(n_cols):
-                val: float = matrix[i, j]
-                if not np.isnan(val):
-                    fontsize: int = 9 if n_cols <= 15 else 7 if n_cols <= 25 else 6
-                    fmt: str = f"{val:.1f}" if "IV値" in mode else f"{val:+.0f}"
-                    ax.text(
-                        j + 0.5, i + 0.5, fmt,
-                        ha="center", va="center",
-                        fontsize=fontsize, color="black",
-                        fontweight="bold",
-                    )
-
-        n_dates: int = len(date_labels)
-        step: int = max(1, n_dates // 15)
-        tick_positions: list[float] = [i + 0.5 for i in range(0, n_dates, step)]
-        tick_labels: list[str] = [date_labels[i][5:] for i in range(0, n_dates, step)]
-        ax.set_xticks(tick_positions)
-        ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=8)
-
-        ax.set_yticks([i + 0.5 for i in range(len(delta_labels))])
-        ax.set_yticklabels(delta_labels, fontsize=9)
-
-        ax.set_title("IV残像ヒートマップ", fontsize=12)
-        ax.set_xlabel("日付")
-        ax.set_ylabel("デルタレベル")
-
-        self.fig.tight_layout()
-        self.canvas.draw()
-
-
 class IVDecayChart(QtWidgets.QWidget):
     """IV実績vs理論減衰チャート - イベント後のIV残像を定量化"""
 
@@ -2124,12 +1956,15 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
 
         return pinned_series, anchor_symbols
 
-    def _load_futures_daily_close(
+    def _load_futures_daily_ohlc(
         self, month: str, days: int
-    ) -> dict[str, float]:
-        """Load futures 1-min bars for nk-{month} and aggregate to daily close.
+    ) -> dict[str, tuple[float, float, float, float]]:
+        """Load futures 1-min bars for nk-{month} and aggregate to daily OHLC.
 
-        Returns {date_str: close_price} e.g. {"2026-04-08": 57250.0}.
+        Returns {date_str: (open, high, low, close)} e.g.
+        {"2026-04-08": (57000.0, 57400.0, 56800.0, 57250.0)}.
+        Night session (17:00+) belongs to the next day's session, so a session
+        spans from the previous day 17:00 to that day's ~15:40 close.
         """
         symbol: str = f"nk-{month}"
         now: datetime = datetime.now(DB_TZ)
@@ -2145,19 +1980,40 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             end=end,
         )
 
-        # Take the last bar per session date as the daily close
-        # Night session (17:00+) belongs to the next day's session
-        daily_close: dict[str, float] = {}
+        # Bars come sorted ascending, so within a session the first bar gives
+        # the open and the last gives the close.
+        ohlc: dict[str, tuple[float, float, float, float]] = {}
         for bar in bars:
-            bar_hour: int = bar.datetime.hour
-            if bar_hour >= 17:
+            if bar.datetime.hour >= 17:
                 session_dt = bar.datetime + timedelta(days=1)
             else:
                 session_dt = bar.datetime
             date_key: str = session_dt.strftime("%Y-%m-%d")
-            daily_close[date_key] = bar.close_price
 
-        return daily_close
+            prev = ohlc.get(date_key)
+            if prev is None:
+                ohlc[date_key] = (
+                    bar.open_price, bar.high_price, bar.low_price, bar.close_price
+                )
+            else:
+                o, h, l, _c = prev
+                ohlc[date_key] = (
+                    o,
+                    max(h, bar.high_price),
+                    min(l, bar.low_price),
+                    bar.close_price,
+                )
+
+        return ohlc
+
+    def _load_futures_daily_close(
+        self, month: str, days: int
+    ) -> dict[str, float]:
+        """Daily close per session date, derived from the daily OHLC."""
+        return {
+            d: ohlc[3]
+            for d, ohlc in self._load_futures_daily_ohlc(month, days).items()
+        }
 
     def run_analysis(self) -> None:
         days: int = self.days_spin.value()
@@ -2185,16 +2041,18 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
 
         # Load futures price for the selected month
         futures_month: str = month if month != "全て" else ""
+        futures_ohlc: dict[str, tuple[float, float, float, float]] = {}
         futures_prices: dict[str, float] = {}
         if futures_month:
-            futures_prices = self._load_futures_daily_close(futures_month, days)
+            futures_ohlc = self._load_futures_daily_ohlc(futures_month, days)
+            futures_prices = {d: v[3] for d, v in futures_ohlc.items()}
 
         delta_selection: str = self.delta_combo.currentText()
         ymin: float = self.ymin_spin.value()
         ymax: float = self.ymax_spin.value()
         self.update_chart(
             date_labels, series, delta_selection, ymin, ymax,
-            futures_prices, pinned_series, anchor_symbols,
+            futures_prices, pinned_series, anchor_symbols, futures_ohlc,
         )
 
     def update_chart(
@@ -2207,6 +2065,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         futures_prices: dict[str, float] | None = None,
         pinned_series: dict[str, list[float]] | None = None,
         anchor_symbols: dict[str, str] | None = None,
+        futures_ohlc: dict[str, tuple[float, float, float, float]] | None = None,
     ) -> None:
         self.fig.clear()
         if pinned_series is None:
@@ -2316,7 +2175,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 if mask.any():
                     ax.fill_between(
                         x, roll_lo, roll_hi, where=mask,
-                        color=color, alpha=0.1, linewidth=0,
+                        color=color, alpha=0.2, linewidth=0,
                     )
 
             ax.plot(x, values, color=color, linewidth=1.5, label=label, marker=".", markersize=3)
@@ -2526,23 +2385,78 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             elif ymax > 0:
                 ax.set_ylim(top=ymax)
 
-        # Plot futures price on secondary Y-axis
+        # Plot futures price on secondary Y-axis as daily OHLC candlesticks.
         futures_values: list[float] = []
         if futures_prices:
             for d in date_labels:
                 price = futures_prices.get(d, float("nan"))
                 futures_values.append(price)
 
-            if any(not np.isnan(v) for v in futures_values):
-                ax2 = ax.twinx()
-                ax2.plot(
-                    x, futures_values,
-                    color="#66ff66", linewidth=1.5, linestyle="-",
-                    label="先物", marker=".", markersize=3, alpha=0.8,
+        if futures_ohlc and any(d in futures_ohlc for d in date_labels):
+            ax2 = ax.twinx()
+            # Render the futures candlesticks BEHIND the IV lines: drop the twin
+            # axis below the primary axis and make the primary background
+            # transparent so its lines/labels stay readable on top.
+            ax.set_zorder(ax2.get_zorder() + 1)
+            ax.patch.set_visible(False)
+            up_color: str = "#ef5350"       # 陽線 (close >= open)
+            down_color: str = "#26a69a"     # 陰線 (close < open)
+            body_w: float = 0.6
+            lows: list[float] = []
+            highs: list[float] = []
+            for xi, d in enumerate(date_labels):
+                ov = futures_ohlc.get(d)
+                if ov is None:
+                    continue
+                o, h, l, c = ov
+                color: str = up_color if c >= o else down_color
+                body_top: float = max(o, c)
+                body_bottom: float = min(o, c)
+                # Draw the wick only as the shadows OUTSIDE the body (upper and
+                # lower), so it never overlaps / bleeds through the body.
+                if h > body_top:
+                    ax2.vlines(xi, body_top, h, color=color, linewidth=3.5, zorder=2, alpha=0.55)
+                if body_bottom > l:
+                    ax2.vlines(xi, l, body_bottom, color=color, linewidth=3.5, zorder=2, alpha=0.55)
+                # Open-close body
+                body_height: float = abs(c - o)
+                if body_height <= 0:
+                    # Doji: draw a thin sliver so the bar stays visible
+                    body_height = max((h - l) * 0.02, 0.5)
+                ax2.bar(
+                    xi, body_height, bottom=body_bottom, width=body_w,
+                    color=color, edgecolor=color, linewidth=0.5,
+                    zorder=3, align="center", alpha=0.55,
                 )
-                ax2.set_ylabel("先物価格", color="#66ff66")
-                ax2.tick_params(axis="y", labelcolor="#66ff66")
-                ax2.legend(loc="upper right", fontsize=8, framealpha=0.7)
+                lows.append(l)
+                highs.append(h)
+            if lows and highs:
+                lo, hi = min(lows), max(highs)
+                pad: float = (hi - lo) * 0.05 or 1.0
+                ax2.set_ylim(lo - pad, hi + pad)
+            ax2.set_ylabel("先物価格", color="#66ff66")
+            ax2.tick_params(axis="y", labelcolor="#66ff66")
+            ax2.legend(
+                handles=[
+                    Patch(facecolor=up_color, label="先物 陽線"),
+                    Patch(facecolor=down_color, label="先物 陰線"),
+                ],
+                loc="upper right", fontsize=8, framealpha=0.7,
+            )
+        elif futures_prices and any(not np.isnan(v) for v in futures_values):
+            # Fallback to a line when only close prices are available
+            ax2 = ax.twinx()
+            # Keep the futures line behind the IV lines (see note above).
+            ax.set_zorder(ax2.get_zorder() + 1)
+            ax.patch.set_visible(False)
+            ax2.plot(
+                x, futures_values,
+                color="#66ff66", linewidth=1.5, linestyle="-",
+                label="先物", marker=".", markersize=3, alpha=0.8,
+            )
+            ax2.set_ylabel("先物価格", color="#66ff66")
+            ax2.tick_params(axis="y", labelcolor="#66ff66")
+            ax2.legend(loc="upper right", fontsize=8, framealpha=0.7)
 
         n_dates: int = len(date_labels)
         step: int = max(1, n_dates // 15)
@@ -2657,7 +2571,6 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             self.canvas.mpl_disconnect(self._cursor_cid)
         self._cursor_cid = self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
 
-        self.fig.tight_layout()
         # Trim outer whitespace to match IVEventDecayChart compactness
         bottom_margin = 0.07 if (ax_comp is not None or ax_skew is not None) else 0.08
         self.fig.subplots_adjust(left=0.045, right=0.97, top=0.96, bottom=bottom_margin, hspace=0.05)
@@ -2706,14 +2619,6 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 short_label = label.split(" ")[0]
                 lines.append(f"{short_label}: {values[ix]:.1f}%")
 
-        # Skew values when the skew subplot is enabled
-        if getattr(self, "_cursor_skew_series", None):
-            for label, _delta, color in getattr(self, "_cursor_skew_targets", []):
-                skew_vals = self._cursor_skew_series.get(label, [])
-                if ix < len(skew_vals) and not np.isnan(skew_vals[ix]):
-                    short_label = label.split(" ")[0]
-                    lines.append(f"{short_label}−ATM: {skew_vals[ix]:+.1f}%")
-
         # Pinned (strike-anchored) IV values
         if getattr(self, "_cursor_pinned_series", None):
             anchor_syms = getattr(self, "_cursor_anchor_symbols", {})
@@ -2725,6 +2630,14 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     strike_part = sym.split("-")[-1] if sym else ""
                     suffix = f"@K{strike_part}" if strike_part else ""
                     lines.append(f"{short_label}{suffix}: {pinned_vals[ix]:.1f}%")
+
+        # Skew values when the skew subplot is enabled
+        if getattr(self, "_cursor_skew_series", None):
+            for label, _delta, color in getattr(self, "_cursor_skew_targets", []):
+                skew_vals = self._cursor_skew_series.get(label, [])
+                if ix < len(skew_vals) and not np.isnan(skew_vals[ix]):
+                    short_label = label.split(" ")[0]
+                    lines.append(f"{short_label}−ATM: {skew_vals[ix]:+.1f}%")
 
         # Realized vol
         rv_series = getattr(self, "_cursor_realized_vol", [])
