@@ -701,23 +701,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             else:
                 self.atm_strike_lines[chain.chain_symbol].hide()
 
-            # Update underlying price line
-            underlying_price = None
-            if calls:
-                underlying_price = calls[0].underlying.mid_price
-            elif puts:
-                underlying_price = puts[0].underlying.mid_price
-
-            if underlying_price:
-                line = self.underlying_price_lines[chain.chain_symbol]
-                line.setPos(underlying_price)
-                symbol = chain.chain_symbol.split(".")[0]
-                line.label.setText(f"{symbol} 先物: {underlying_price:.0f}")
-                line.show()
-            else:
-                self.underlying_price_lines[chain.chain_symbol].hide()
-
-            # Update previous day futures close line
+            # Load previous day futures close first (needed for the 先物 line's
+            # 前日差 label below and for the 前日先物 line).
             today_key: str = datetime.now(DB_TZ).strftime("%Y-%m-%d")
             if self._prev_underlying_loaded_date != today_key:
                 self.prev_underlying_prices.clear()
@@ -729,6 +714,28 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                     self.prev_underlying_prices[chain.chain_symbol] = prev_price
 
             prev_price = self.prev_underlying_prices.get(chain.chain_symbol)
+
+            # Update underlying (current futures) price line
+            underlying_price = None
+            if calls:
+                underlying_price = calls[0].underlying.mid_price
+            elif puts:
+                underlying_price = puts[0].underlying.mid_price
+
+            if underlying_price:
+                line = self.underlying_price_lines[chain.chain_symbol]
+                line.setPos(underlying_price)
+                symbol = chain.chain_symbol.split(".")[0]
+                label_text: str = f"{symbol} 先物: {underlying_price:.0f}"
+                if prev_price:
+                    diff: float = underlying_price - prev_price
+                    label_text += f" (前日差: {diff:+.0f})"
+                line.label.setText(label_text)
+                line.show()
+            else:
+                self.underlying_price_lines[chain.chain_symbol].hide()
+
+            # Update previous day futures close line
             if prev_price:
                 prev_line = self.prev_underlying_price_lines[chain.chain_symbol]
                 prev_line.setPos(prev_price)
@@ -1751,6 +1758,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             "show_realized": self.realized_check.isChecked(),
             "show_vrp": self.vrp_check.isChecked(),
             "realized_window": self.realized_window_spin.value(),
+            "auto_refresh": self.auto_refresh_check.isChecked(),
+            "refresh_interval": self.refresh_interval_spin.value(),
         }
         save_json(self.SETTING_FILENAME, data)
 
@@ -1771,8 +1780,24 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self.realized_check.setChecked(data.get("show_realized", False))
         self.vrp_check.setChecked(data.get("show_vrp", False))
         self.realized_window_spin.setValue(data.get("realized_window", 20))
+        self.refresh_interval_spin.setValue(data.get("refresh_interval", 5))
+        # Setting this checked starts the timer via _on_auto_refresh_toggled.
+        self.auto_refresh_check.setChecked(data.get("auto_refresh", False))
+
+    def _on_auto_refresh_toggled(self, checked: bool) -> None:
+        """Start/stop the auto-refresh timer when the checkbox is toggled."""
+        if checked:
+            self._refresh_timer.start(self.refresh_interval_spin.value() * 60 * 1000)
+        else:
+            self._refresh_timer.stop()
+
+    def _on_refresh_interval_changed(self, minutes: int) -> None:
+        """Apply a new interval immediately if auto-refresh is active."""
+        if self.auto_refresh_check.isChecked():
+            self._refresh_timer.start(minutes * 60 * 1000)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self._refresh_timer.stop()
         self._save_settings()
         super().closeEvent(event)
 
@@ -1825,6 +1850,24 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self.realized_window_spin.setToolTip("実現ボラ/VRP の rolling window (10/20/30 等)")
         self.vrp_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("VRP")
 
+        # Auto-refresh: interval (minutes) + enable checkbox, before 更新 button
+        self.refresh_interval_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.refresh_interval_spin.setMinimum(1)
+        self.refresh_interval_spin.setMaximum(120)
+        self.refresh_interval_spin.setValue(5)
+        self.refresh_interval_spin.setSuffix("分")
+        self.refresh_interval_spin.setFixedWidth(60)
+        self.refresh_interval_spin.setToolTip("自動更新の間隔（分）")
+        self.auto_refresh_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("自動更新")
+
+        self._refresh_timer: QtCore.QTimer = QtCore.QTimer(self)
+        self._refresh_timer.timeout.connect(self.run_analysis)
+        self.auto_refresh_check.toggled.connect(self._on_auto_refresh_toggled)
+        self.refresh_interval_spin.valueChanged.connect(self._on_refresh_interval_changed)
+
+        # Timestamp of the last refresh (manual or auto), to confirm updates
+        self.last_update_label: QtWidgets.QLabel = QtWidgets.QLabel("最終更新: ---")
+
         button: QtWidgets.QPushButton = QtWidgets.QPushButton("更新")
         button.clicked.connect(self.run_analysis)
 
@@ -1849,11 +1892,16 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         hbox.addWidget(self.realized_check)
         hbox.addWidget(self.realized_window_spin)
         hbox.addWidget(self.vrp_check)
+        hbox.addWidget(self.refresh_interval_spin)
+        hbox.addWidget(self.auto_refresh_check)
         hbox.addWidget(button)
+        hbox.addWidget(self.last_update_label)
 
         vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
         vbox.addLayout(hbox)
-        vbox.addWidget(self.canvas)
+        # stretch=1 so the canvas takes all extra vertical space and the
+        # toolbar row stays at its natural (minimal) height.
+        vbox.addWidget(self.canvas, 1)
         self.setLayout(vbox)
 
     def build_series(
@@ -2016,6 +2064,10 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         }
 
     def run_analysis(self) -> None:
+        # Stamp the refresh time (manual or auto) so updates are confirmable.
+        self.last_update_label.setText(
+            "最終更新: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
         days: int = self.days_spin.value()
 
         all_bars: list[BarData] = _load_option_bars_with_today(days)
@@ -2207,6 +2259,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     mid_x, mid_y, f"{diff_val:+.1f}",
                     ha="center", va="bottom", fontsize=fs,
                     color=color, fontweight="bold",
+                    bbox=dict(facecolor="black", alpha=0.7, edgecolor="none", pad=1),
                 )
 
         # --- Realized vol + VRP overlays ---
@@ -2305,6 +2358,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                         mid_x_s, mid_y_s, f"{diff_v:+.1f}",
                         ha="center", va="bottom", fontsize=fs_skew,
                         color=color, fontweight="bold",
+                        bbox=dict(facecolor="black", alpha=0.7, edgecolor="none", pad=1),
                     )
 
             ax_skew.axhline(0, color="#ffffff", linewidth=0.6, alpha=0.5)
@@ -2747,10 +2801,15 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         self.sim_futures_type_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
         self.sim_futures_type_combo.addItems(["先物ミニ", "先物ラージ"])
 
-        # Lots spinbox
+        # Lots spinbox for OP追加
         self.sim_lots_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
         self.sim_lots_spin.setRange(-999, 999)
-        self.sim_lots_spin.setValue(1)
+        self.sim_lots_spin.setValue(5)
+
+        # Lots spinbox for 先物追加
+        self.sim_futures_lots_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.sim_futures_lots_spin.setRange(-999, 999)
+        self.sim_futures_lots_spin.setValue(-5)
 
         # Total P&L label (unrealized: open + enabled)
         self.sim_total_pnl_label: QtWidgets.QLabel = QtWidgets.QLabel("合計損益: ---")
@@ -2763,7 +2822,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         # Simulation position table (read-only display)
         sim_table_headers: list[str] = [
             "有効", "限月", "種類", "行使価格", "枚数", "建時刻",
-            "建値", "現在値", "建IV%", "現在IV%", "IV差分", "損益",
+            "建値", "現在値", "建IV%", "現在IV%", "IV差分", "先物差", "合計損益", "損益",
             "Δ寄与", "Γ寄与", "Θ寄与", "V寄与",
             "建Δ", "建Γ", "建Θ", "建V",
             "現Δ", "現Γ", "現Θ", "現V",
@@ -2772,7 +2831,12 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         self.sim_table: QtWidgets.QTableWidget = QtWidgets.QTableWidget(0, len(sim_table_headers))
         self.sim_table.setHorizontalHeaderLabels(sim_table_headers)
         self.sim_table.horizontalHeader().setStretchLastSection(True)
-        self.sim_table.setMaximumHeight(200)
+        # Reserve height so the positions table actually shows taller. A bare
+        # setMaximumHeight has no effect here — the result_table below has
+        # stretch=1 and absorbs all the extra vertical space, so the table
+        # stays at its small content-based size hint. setMinimumHeight forces
+        # the layout to give it the space. (600 = triple the original 200.)
+        self.sim_table.setMinimumHeight(800)
         # Reduce cell padding for a tighter layout
         self.sim_table.setStyleSheet(
             "QTableWidget::item { padding: 0px 2px; }"
@@ -2800,6 +2864,8 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         sim_param_hbox.addWidget(QtWidgets.QLabel("枚数"))
         sim_param_hbox.addWidget(self.sim_lots_spin)
         sim_param_hbox.addWidget(self.sim_futures_type_combo)
+        sim_param_hbox.addWidget(QtWidgets.QLabel("枚数"))
+        sim_param_hbox.addWidget(self.sim_futures_lots_spin)
         sim_param_hbox.addStretch()
         sim_param_hbox.addWidget(add_btn)
         sim_param_hbox.addWidget(add_futures_btn)
@@ -2836,11 +2902,19 @@ class PayoffDiagramChart(QtWidgets.QWidget):
 
         self.iv_sensitivity_spin: QtWidgets.QDoubleSpinBox = QtWidgets.QDoubleSpinBox()
         self.iv_sensitivity_spin.setSuffix(" %/1000pt")
-        self.iv_sensitivity_spin.setMinimum(-5.0)
-        self.iv_sensitivity_spin.setMaximum(5.0)
+        self.iv_sensitivity_spin.setMinimum(-20.0)
+        self.iv_sensitivity_spin.setMaximum(20.0)
         self.iv_sensitivity_spin.setSingleStep(0.1)
         self.iv_sensitivity_spin.setValue(-1.0)
-        self.iv_sensitivity_spin.setDecimals(1)
+        self.iv_sensitivity_spin.setDecimals(2)
+
+        # Auto-estimate IV感応度 from historical spot-vol regression
+        self.iv_auto_btn: QtWidgets.QPushButton = QtWidgets.QPushButton("自動")
+        self.iv_auto_btn.setToolTip(
+            "過去の ATM IV 日次変化と先物日次変化の回帰から\n"
+            "IV感応度 (%/1000pt) を自動推定します"
+        )
+        self.iv_auto_btn.clicked.connect(self._auto_iv_sensitivity)
 
         self.show_legs_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("個別ポジション")
         self.show_legs_check.setChecked(True)
@@ -2914,6 +2988,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         ctrl_grid.addWidget(self.days_spin, 1, 1)
         ctrl_grid.addWidget(QtWidgets.QLabel("IV感応度"), 1, 2)
         ctrl_grid.addWidget(self.iv_sensitivity_spin, 1, 3)
+        ctrl_grid.addWidget(self.iv_auto_btn, 1, 4)
 
         btn_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         btn_hbox.addWidget(self.show_legs_check)
@@ -3274,7 +3349,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         if not chain or not chain.underlying:
             return
         underlying: UnderlyingData = chain.underlying
-        lots: int = self.sim_lots_spin.value()
+        lots: int = self.sim_futures_lots_spin.value()
         if lots == 0:
             return
 
@@ -3334,6 +3409,11 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         self.sim_table.setRowCount(len(self.sim_positions))
         total_pnl: float = 0.0
         realized_pnl: float = 0.0
+        # Per-row P&L and option/futures flag, for the per-set 合計損益 column.
+        row_pnls: list[float] = []
+        row_is_option: list[bool] = []
+        # Per-row futures diff (current − entry price); None for option rows.
+        row_fut_diffs: list[float | None] = []
 
         for row, pos in enumerate(self.sim_positions):
             month_display: str = pos["chain_symbol"].split(".")[0]
@@ -3420,6 +3500,15 @@ class PayoffDiagramChart(QtWidgets.QWidget):
 
             pnl_str: str = f"{pnl:.1f}" if (cur_price or closed) else ""
 
+            # Track for the per-set columns (filled after the loop).
+            row_pnls.append(pnl if (cur_price or closed) else 0.0)
+            is_futures_row: bool = pos["kind"] == "futures"
+            row_is_option.append(not is_futures_row)
+            if is_futures_row and cur_price:
+                row_fut_diffs.append(cur_price - entry_price)
+            else:
+                row_fut_diffs.append(None)
+
             # Column 0: checkbox for enabled state
             check_item = QtWidgets.QTableWidgetItem()
             check_item.setFlags(
@@ -3457,6 +3546,8 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 entry_iv_str,
                 current_iv,
                 iv_diff_str,
+                "",         # 先物差 (per-set) — filled after the loop
+                "",         # 合計損益 (per-set) — filled after the loop
                 pnl_str,
                 # Contributions (moved after 損益)
                 f"{delta_contrib:.1f}",
@@ -3475,9 +3566,9 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 fmt(cur_vega * lots, 2),
             ]
             # Columns with red/green coloring (plus=red, minus=green)
-            # Indices after adding 建時刻: 損益=11, 寄与=12-15
-            pnl_col: int = 11
-            contrib_cols: set[int] = {12, 13, 14, 15}
+            # Indices after inserting 先物差(11) & 合計損益(12): 損益=13, 寄与=14-17
+            pnl_col: int = 13
+            contrib_cols: set[int] = {14, 15, 16, 17}
             for i, val in enumerate(values):
                 col = i + 1
                 if row == editing_row and col == editing_col:
@@ -3502,7 +3593,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                         pass
                 self.sim_table.setItem(row, col, item)
 
-            # Column 24: 決済済 checkbox
+            # Column 26: 決済済 checkbox
             closed_item = QtWidgets.QTableWidgetItem()
             closed_item.setFlags(
                 QtCore.Qt.ItemFlag.ItemIsUserCheckable
@@ -3512,9 +3603,9 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 QtCore.Qt.CheckState.Checked if closed
                 else QtCore.Qt.CheckState.Unchecked
             )
-            self.sim_table.setItem(row, 24, closed_item)
+            self.sim_table.setItem(row, 26, closed_item)
 
-            # Column 25: 決済値 editable
+            # Column 27: 決済値 editable
             close_val_str: str = f"{close_price:.1f}" if close_price else ""
             close_val_item = QtWidgets.QTableWidgetItem(close_val_str)
             close_val_item.setFlags(
@@ -3522,7 +3613,50 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 | QtCore.Qt.ItemFlag.ItemIsSelectable
                 | QtCore.Qt.ItemFlag.ItemIsEditable
             )
-            self.sim_table.setItem(row, 25, close_val_item)
+            self.sim_table.setItem(row, 27, close_val_item)
+
+        # Per-set columns: a set = 1 option row + the 1 following futures row;
+        # a lone option (next row is another option) is its own set; an orphan
+        # futures row is its own set. Values are shown on the set's leading row.
+        #   先物差 (col 11)  = futures leg's (current − entry) in the set
+        #   合計損益 (col 12) = sum of the set's rows' P&L
+        def _colored_item(text: str, value: float) -> QtWidgets.QTableWidgetItem:
+            it = QtWidgets.QTableWidgetItem(text)
+            it.setFlags(
+                QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable
+            )
+            if value > 0:
+                it.setForeground(QtGui.QColor(255, 100, 100))
+            elif value < 0:
+                it.setForeground(QtGui.QColor(100, 255, 100))
+            return it
+
+        n_rows: int = len(self.sim_positions)
+        i: int = 0
+        while i < n_rows:
+            if row_is_option[i] and i + 1 < n_rows and not row_is_option[i + 1]:
+                set_rows = [i, i + 1]
+                i += 2
+            else:
+                set_rows = [i]
+                i += 1
+            leader: int = set_rows[0]
+
+            # 先物差: futures diff within the set (blank if no futures row)
+            fut_vals: list[float] = [
+                row_fut_diffs[r] for r in set_rows if row_fut_diffs[r] is not None
+            ]
+            if fut_vals:
+                fut_total: float = sum(fut_vals)
+                self.sim_table.setItem(
+                    leader, 11, _colored_item(f"{fut_total:+.0f}", fut_total)
+                )
+
+            # 合計損益: sum of the set's P&L
+            set_total: float = sum(row_pnls[r] for r in set_rows)
+            self.sim_table.setItem(
+                leader, 12, _colored_item(f"{set_total:.1f}", set_total)
+            )
 
         self.sim_table.blockSignals(False)
 
@@ -3586,7 +3720,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             self.sim_positions[row]["entry_price"] = new_entry_price
             self._refresh_sim_table()
             self._run_sim_analysis()
-        elif col == 24:  # 決済済 checkbox
+        elif col == 26:  # 決済済 checkbox
             new_closed: bool = item.checkState() == QtCore.Qt.CheckState.Checked
             pos_row = self.sim_positions[row]
             if pos_row.get("closed", False) == new_closed:
@@ -3605,7 +3739,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                     pos_row["close_price"] = live_price
             self._refresh_sim_table()
             self._run_sim_analysis()
-        elif col == 25:  # 決済値 editable
+        elif col == 27:  # 決済値 editable
             text: str = item.text().strip()
             try:
                 new_close_price: float = float(text) if text else 0.0
@@ -4108,16 +4242,197 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             if pos["kind"] == "futures" and pos.get("entry_price"):
                 futures_entries.append((pos["entry_price"], pos["lots"]))
 
+        # Current-value label figures (positions are already enabled & open):
+        #   現在損益 = Σ (current price − entry price)×lots×size, using each
+        #             leg's ACTUAL current mid price so it matches the table's
+        #             合計損益 and is correct per-month (the payoff curve reprices
+        #             every leg on a single underlying axis, which drifts for a
+        #             second month, so we don't interpolate it here).
+        #   先物差   = current futures price − entry price (futures legs only)
+        #   IV差     = Σ per-leg IV差分 (matching the sim table's IV差分 column)
+        sum_fut_diff: float = 0.0
+        sum_iv_diff: float = 0.0
+        current_total_pnl: float = 0.0
+        for pos in positions:
+            lots: int = pos["lots"]
+            size: int = pos["size"]
+            entry_price: float = pos.get("entry_price", 0) or 0
+            if pos["kind"] == "futures":
+                fm: float = pos.get("futures_multiplier", 1.0)
+                und = pos.get("underlying_data")
+                cur_price: float = und.mid_price if und and und.mid_price else 0
+                if cur_price:
+                    current_total_pnl += (cur_price - entry_price) * lots * size * fm
+                    if entry_price:
+                        sum_fut_diff += cur_price - entry_price
+            else:
+                opt = pos.get("option_data")
+                cur_opt_price: float = opt.mid_price if opt and opt.mid_price else 0
+                if cur_opt_price:
+                    current_total_pnl += (cur_opt_price - entry_price) * lots * size
+                entry_iv: float = pos.get("entry_iv", 0) or 0
+                cur_iv: float = (opt.mid_impv or 0) if opt else 0
+                if cur_iv and entry_iv:
+                    sum_iv_diff += (cur_iv - entry_iv) * 100
+
+        # Base price (prev-day futures close) + ATM daily IV for vertical bands,
+        # taken from the reference (first) position's chain.
+        base_price: float | None = None
+        daily_iv: float | None = None
+        ref_chain_symbol: str = positions[0]["chain_symbol"]
+        base_price = self._load_prev_day_close(ref_chain_symbol.split(".")[0])
+        portfolio_data: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
+        ref_chain: ChainData | None = portfolio_data.chains.get(ref_chain_symbol)
+        if ref_chain and ref_chain.atm_impv:
+            daily_iv = ref_chain.atm_impv / (252 ** 0.5)
+
         self._update_chart(
             prices_fine, pnl_now_arr, pnl_day_same_arr, pnl_day_adj_arr,
             pnl_expiry_arr, leg_pnl_arrs, leg_labels, ref_price, days,
             show_legs, greeks_str, futures_entries=futures_entries,
+            fut_diff=sum_fut_diff, iv_diff=sum_iv_diff,
+            current_pnl_value=current_total_pnl,
+            base_price=base_price, daily_iv=daily_iv,
         )
         self._update_greeks_charts(
             prices_fine, greeks_data, ref_price, days,
             is_sim=True, futures_entries=futures_entries,
+            fut_diff=sum_fut_diff, iv_diff=sum_iv_diff,
+            base_price=base_price, daily_iv=daily_iv,
         )
         self._update_table(table_data, days, is_sim=True)
+
+    def _load_prev_day_close(self, futures_symbol: str) -> float | None:
+        """Previous day's futures close (pre_close of the latest minute bar)."""
+        now: datetime = datetime.now(DB_TZ)
+        start: datetime = now - timedelta(days=2)
+        database: BaseDatabase = get_database()
+        bars: list[BarData] = database.load_bar_data(
+            symbol=futures_symbol,
+            exchange=Exchange.JPX,
+            interval=Interval.MINUTE,
+            start=start,
+            end=now,
+        )
+        if not bars:
+            return None
+        pre_close: float = bars[-1].pre_close
+        return pre_close if pre_close else None
+
+    def _load_futures_daily_close_series(
+        self, futures_symbol: str, days: int
+    ) -> dict[str, float]:
+        """Daily futures close per session date (night session 17:00+ → next day)."""
+        now: datetime = datetime.now(DB_TZ)
+        start: datetime = now - timedelta(days=days)
+        database: BaseDatabase = get_database()
+        bars: list[BarData] = database.load_bar_data(
+            symbol=futures_symbol, exchange=Exchange.JPX,
+            interval=Interval.MINUTE, start=start, end=now,
+        )
+        close_by_date: dict[str, float] = {}
+        for bar in bars:
+            session_dt = bar.datetime + timedelta(days=1) if bar.datetime.hour >= 17 else bar.datetime
+            close_by_date[session_dt.strftime("%Y-%m-%d")] = bar.close_price
+        return close_by_date
+
+    def _estimate_iv_per_1000(self, chain_symbol: str, days: int) -> float | None:
+        """Spot-vol beta: regress daily ΔATM_IV(%) on Δfutures, scaled per 1000pt.
+
+        Returns %-IV change per 1000 futures points (negative for the usual
+        equity-index leverage effect), or None if there isn't enough data.
+        """
+        month: str = chain_symbol.split(".")[0].split("-")[1]
+
+        # ATM IV (Δ0.5) per session date, in annualized % points.
+        all_bars: list[BarData] = _load_option_bars_with_today(days)
+        month_bars: list[BarData] = _filter_bars_by_month(all_bars, month)
+        date_bars: dict[str, list[BarData]] = {}
+        for bar in month_bars:
+            if bar.iv <= 0 or bar.delta == 0:
+                continue
+            date_bars.setdefault(bar.datetime.strftime("%Y-%m-%d"), []).append(bar)
+        atm_iv_by_date: dict[str, float] = {}
+        for date_key, day_bars in date_bars.items():
+            iv: float | None = _interpolate_iv_at_delta(day_bars, -0.5)
+            if iv and iv > 0:
+                atm_iv_by_date[date_key] = iv * 100.0
+
+        # Futures close per session date.
+        fut_close: dict[str, float] = self._load_futures_daily_close_series(
+            chain_symbol.split(".")[0], days
+        )
+
+        dates: list[str] = sorted(set(atm_iv_by_date) & set(fut_close))
+        if len(dates) < 3:
+            return None
+
+        # Least-squares slope through the origin over daily changes.
+        sxx: float = 0.0
+        sxy: float = 0.0
+        for k in range(1, len(dates)):
+            d_s: float = fut_close[dates[k]] - fut_close[dates[k - 1]]
+            d_iv: float = atm_iv_by_date[dates[k]] - atm_iv_by_date[dates[k - 1]]
+            sxx += d_s * d_s
+            sxy += d_s * d_iv
+        if sxx <= 0:
+            return None
+        return (sxy / sxx) * 1000.0
+
+    def _auto_iv_sensitivity(self) -> None:
+        """Estimate IV感応度 from history and fill the spinbox."""
+        positions: list[dict] = self.sim_positions
+        chain_symbol: str = ""
+        if positions:
+            chain_symbol = positions[0]["chain_symbol"]
+        else:
+            chain_symbol = self.sim_month_combo.currentData() or ""
+        if not chain_symbol:
+            QtWidgets.QMessageBox.warning(
+                self, "自動計算", "対象の限月がありません（ポジションを追加してください）",
+                QtWidgets.QMessageBox.Ok,
+            )
+            return
+
+        lookback_days: int = 45
+        est: float | None = self._estimate_iv_per_1000(chain_symbol, lookback_days)
+        if est is None:
+            QtWidgets.QMessageBox.warning(
+                self, "自動計算",
+                "IV感応度を推定できるデータが不足しています（過去データ不足）",
+                QtWidgets.QMessageBox.Ok,
+            )
+            return
+
+        # Clamp into the spinbox range and apply.
+        lo: float = self.iv_sensitivity_spin.minimum()
+        hi: float = self.iv_sensitivity_spin.maximum()
+        self.iv_sensitivity_spin.setValue(max(lo, min(hi, est)))
+        self._run_sim_analysis()
+
+    @staticmethod
+    def _find_upside_breakeven(
+        prices, pnl: list[float], current_price: float
+    ) -> float | None:
+        """First price above current_price where P&L crosses loss→profit.
+
+        Scans the curve upward from the current price and returns the
+        interpolated price of the first negative→positive zero crossing, or
+        None if there is none (already profitable upward, or loss everywhere).
+        """
+        n: int = min(len(prices), len(pnl))
+        for i in range(1, n):
+            if float(prices[i]) <= current_price:
+                continue
+            y0: float = pnl[i - 1]
+            y1: float = pnl[i]
+            if y0 < 0 <= y1:  # loss → profit
+                x0: float = float(prices[i - 1])
+                x1: float = float(prices[i])
+                if y1 == y0:
+                    return x1
+                return x0 + (0.0 - y0) / (y1 - y0) * (x1 - x0)
+        return None
 
     def _calc_sim_greeks_str(
         self,
@@ -4168,6 +4483,11 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         show_legs: bool,
         greeks_str: str = "",
         futures_entries: list[tuple[float, int]] | None = None,
+        fut_diff: float | None = None,
+        iv_diff: float | None = None,
+        current_pnl_value: float | None = None,
+        base_price: float | None = None,
+        daily_iv: float | None = None,
     ) -> None:
         self.pnl_ax.clear()
 
@@ -4202,18 +4522,87 @@ class PayoffDiagramChart(QtWidgets.QWidget):
 
         # Reference lines
         self.pnl_ax.axvline(
-            x=current_price, color="cyan", linestyle=":", alpha=0.5,
+            x=current_price, color="#FF00FF", linestyle=":", alpha=0.9, linewidth=2.2,
             label=f"現在値: {current_price:.0f}",
         )
-        self.pnl_ax.axhline(y=0, color="gray", linestyle="-", alpha=0.3)
+        self.pnl_ax.axhline(y=0, color="#00E676", linestyle="-", alpha=0.6)
+
+        # Base price (previous day's futures close) + ATM IV daily bands,
+        # drawn as vertical lines like vnpy.chart.item.CandleItem._draw_bar_picture:
+        # base_price × (1 ± daily_iv × mult) for mult 0.5/1.0/1.5/2.0.
+        if base_price:
+            self.pnl_ax.axvline(
+                x=base_price, color="#FFD700", linestyle=":", alpha=0.9,
+                linewidth=2.2, label=f"前日終値: {base_price:.0f}",
+            )
+            if daily_iv and daily_iv > 0:
+                for mult in (0.5, 1.0, 1.5, 2.0):
+                    upper: float = base_price * (1 + daily_iv * mult)
+                    lower: float = base_price * (1 - daily_iv * mult)
+                    self.pnl_ax.axvline(
+                        x=upper, color="#FF4B4B", linestyle="--",
+                        linewidth=1.5, alpha=0.4,
+                    )
+                    self.pnl_ax.axvline(
+                        x=lower, color="#4BFFFF", linestyle="--",
+                        linewidth=1.5, alpha=0.4,
+                    )
+
+        # Current P&L: prefer the directly-computed total (matches the table's
+        # 合計損益 and is correct per-month); fall back to interpolating the
+        # curve when it isn't supplied (e.g. portfolio mode).
+        if len(prices) and len(pnl_now):
+            if current_pnl_value is not None:
+                current_pnl: float = current_pnl_value
+            else:
+                current_pnl = float(np.interp(current_price, prices, pnl_now))
+            pnl_label: str = f"現在損益: {current_pnl:.0f}"
+            if fut_diff is not None and iv_diff is not None:
+                pnl_label += f"  先物差: {fut_diff:+.0f}  IV差: {iv_diff:+.2f}"
+            if base_price:
+                pnl_label += f"  先物前日差: {current_price - base_price:+.0f}"
+            self.pnl_ax.axhline(
+                y=current_pnl, color="#FF66FF", linestyle=":", alpha=0.7,
+                label=pnl_label,
+            )
+            # Value label at the left edge, styled like the mouse cursor label.
+            self.pnl_ax.text(
+                0.0, current_pnl, f" {pnl_label}",
+                transform=self.pnl_ax.get_yaxis_transform(),
+                fontsize=11, color="#FF66FF", va="center", ha="left",
+                bbox=dict(facecolor="black", alpha=0.7, edgecolor="none", pad=3),
+            )
+
+        # Upside break-even of the IV変動 (day_adj) curve: how far the futures
+        # must rise before the position stops losing once IV falls with the
+        # move (gamma gain overtakes vega loss). Reported vs the current price
+        # and as a multiple of the daily ATM IV (前日終値 basis).
+        if len(prices) and len(pnl_day_adj) and daily_iv and daily_iv > 0 and base_price:
+            be_price = self._find_upside_breakeven(prices, pnl_day_adj, current_price)
+            if be_price is not None:
+                sigma_mult: float = (be_price - base_price) / (base_price * daily_iv)
+                be_text: str = (
+                    f"上昇損益分岐(IV変動): {be_price:.0f}"
+                    f"　現在比 {be_price - current_price:+.0f}"
+                    f"　前日終値比 {sigma_mult:+.2f}×dailyIV"
+                )
+                be_color: str = "#FFD700"
+            else:
+                be_text = "上昇損益分岐(IV変動): 上値に交点なし（現状で利益方向 or 全域で損）"
+                be_color = "#AAAAAA"
+            self.pnl_ax.text(
+                0.5, 0.99, be_text, transform=self.pnl_ax.transAxes,
+                fontsize=10, color=be_color, ha="center", va="top",
+                bbox=dict(facecolor="black", alpha=0.7, edgecolor="none", pad=3),
+            )
 
         # Futures entry price markers
         if futures_entries:
             for entry_price, lots in futures_entries:
                 sign: str = "+" if lots > 0 else ""
                 self.pnl_ax.axvline(
-                    x=entry_price, color="#FF8C00", linestyle="--", alpha=0.6,
-                    linewidth=1, label=f"先物建値 {sign}{lots}: {entry_price:.0f}",
+                    x=entry_price, color="#8A2BE2", linestyle="--", alpha=0.9,
+                    linewidth=2.2, label=f"先物建値 {sign}{lots}: {entry_price:.0f}",
                 )
 
         title: str = "損益"
@@ -4381,6 +4770,10 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         days: int,
         is_sim: bool = False,
         futures_entries: list[tuple[float, int]] | None = None,
+        fut_diff: float | None = None,
+        iv_diff: float | None = None,
+        base_price: float | None = None,
+        daily_iv: float | None = None,
     ) -> None:
         """Plot Delta, Gamma, Theta charts.
 
@@ -4443,17 +4836,34 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             )
 
             ax.axvline(
-                x=current_price, color="cyan", linestyle=":", alpha=0.5,
+                x=current_price, color="#FF00FF", linestyle=":", alpha=0.9, linewidth=2.2,
             )
-            ax.axhline(y=0, color="gray", linestyle="-", alpha=0.3)
+            ax.axhline(y=0, color="#00E676", linestyle="-", alpha=0.6)
+
+            # Base price (前日終値) + ATM IV daily bands (same as the 損益 tab)
+            if base_price:
+                ax.axvline(
+                    x=base_price, color="#FFD700", linestyle=":", alpha=0.9,
+                    linewidth=2.2,
+                )
+                if daily_iv and daily_iv > 0:
+                    for mult in (0.5, 1.0, 1.5, 2.0):
+                        ax.axvline(
+                            x=base_price * (1 + daily_iv * mult),
+                            color="#FF4B4B", linestyle="--", linewidth=1.5, alpha=0.4,
+                        )
+                        ax.axvline(
+                            x=base_price * (1 - daily_iv * mult),
+                            color="#4BFFFF", linestyle="--", linewidth=1.5, alpha=0.4,
+                        )
 
             # Futures entry price markers
             if futures_entries:
                 for entry_price, lots in futures_entries:
                     sign: str = "+" if lots > 0 else ""
                     ax.axvline(
-                        x=entry_price, color="#FF8C00", linestyle="--",
-                        alpha=0.6, linewidth=1,
+                        x=entry_price, color="#8A2BE2", linestyle="--",
+                        alpha=0.9, linewidth=2.2,
                         label=f"先物建値 {sign}{lots}: {entry_price:.0f}",
                     )
 
@@ -4461,6 +4871,28 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             decimals: dict[str, int] = {"delta": 2, "gamma": 6, "theta": 1, "vega": 2}
             fmt: str = f"%.{decimals[key]}f"
             ax.yaxis.set_major_formatter(plt.FormatStrFormatter(fmt))
+
+            # Current value: the 現在 curve at the current underlying price,
+            # with a cursor-style value label at the left edge.
+            if len(prices):
+                now_scaled: list[float] = [v * c for v in series["now"]]
+                current_g: float = float(np.interp(current_price, prices, now_scaled))
+                dec: int = decimals[key]
+                g_label: str = f"現在{title}: {current_g:.{dec}f}"
+                if fut_diff is not None and iv_diff is not None:
+                    g_label += f"  先物差: {fut_diff:+.0f}  IV差: {iv_diff:+.2f}"
+                if base_price:
+                    g_label += f"  先物前日差: {current_price - base_price:+.0f}"
+                ax.axhline(
+                    y=current_g, color="#FF66FF", linestyle=":", alpha=0.7,
+                    label=g_label,
+                )
+                ax.text(
+                    0.0, current_g, f" {g_label}",
+                    transform=ax.get_yaxis_transform(),
+                    fontsize=11, color="#FF66FF", va="center", ha="left",
+                    bbox=dict(facecolor="black", alpha=0.7, edgecolor="none", pad=3),
+                )
 
             ax.set_title(title)
             ax.set_xlabel("原資産価格")
