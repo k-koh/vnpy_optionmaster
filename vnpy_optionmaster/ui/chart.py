@@ -655,7 +655,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 delta_text = f"{chain.eris_p_delta:.3f}" if chain.eris_p_delta is not None else "N/A"
                 iv_text = f"{chain.eris_p_iv:.3f}" if chain.eris_p_iv is not None else "N/A"
                 price_text = f"{chain.eris_p_price:.0f}" if chain.eris_p_price is not None else "N/A"
-                line.label.setText(f"{symbol} PΔ{delta_text} IV{iv_text} ¥{price_text}")
+                spread_text = f" 差{chain.eris_p_spread:.0f}" if chain.eris_p_spread is not None else ""
+                line.label.setText(f"{symbol} PΔ{delta_text} IV{iv_text} ¥{price_text}{spread_text}")
                 line.show()
             else:
                 self.eris_p_strike_lines[chain.chain_symbol].hide()
@@ -666,7 +667,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 delta_text = f"{chain.eris_c_delta:.3f}" if chain.eris_c_delta is not None else "N/A"
                 iv_text = f"{chain.eris_c_iv:.3f}" if chain.eris_c_iv is not None else "N/A"
                 price_text = f"{chain.eris_c_price:.0f}" if chain.eris_c_price is not None else "N/A"
-                line.label.setText(f"{symbol} CΔ{delta_text} IV{iv_text} ¥{price_text}")
+                spread_text = f" 差{chain.eris_c_spread:.0f}" if chain.eris_c_spread is not None else ""
+                line.label.setText(f"{symbol} CΔ{delta_text} IV{iv_text} ¥{price_text}{spread_text}")
                 line.show()
             else:
                 self.eris_c_strike_lines[chain.chain_symbol].hide()
@@ -677,7 +679,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 delta_text = f"{chain.delta002_p_delta:.3f}" if chain.delta002_p_delta is not None else "N/A"
                 iv_text = f"{chain.delta002_p_iv:.3f}" if chain.delta002_p_iv is not None else "N/A"
                 price_text = f"{chain.delta002_p_price:.0f}" if chain.delta002_p_price is not None else "N/A"
-                line.label.setText(f"{symbol} PΔ{delta_text} IV{iv_text} ¥{price_text}")
+                spread_text = f" 差{chain.delta002_p_spread:.0f}" if chain.delta002_p_spread is not None else ""
+                line.label.setText(f"{symbol} PΔ{delta_text} IV{iv_text} ¥{price_text}{spread_text}")
                 line.show()
             else:
                 self.delta002_p_strike_lines[chain.chain_symbol].hide()
@@ -688,7 +691,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 delta_text = f"{chain.delta002_c_delta:.3f}" if chain.delta002_c_delta is not None else "N/A"
                 iv_text = f"{chain.delta002_c_iv:.3f}" if chain.delta002_c_iv is not None else "N/A"
                 price_text = f"{chain.delta002_c_price:.0f}" if chain.delta002_c_price is not None else "N/A"
-                line.label.setText(f"{symbol} CΔ{delta_text} IV{iv_text} ¥{price_text}")
+                spread_text = f" 差{chain.delta002_c_spread:.0f}" if chain.delta002_c_spread is not None else ""
+                line.label.setText(f"{symbol} CΔ{delta_text} IV{iv_text} ¥{price_text}{spread_text}")
                 line.show()
             else:
                 self.delta002_c_strike_lines[chain.chain_symbol].hide()
@@ -2315,6 +2319,22 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     alpha=0.85, label=pinned_label,
                     marker="x", markersize=4,
                 )
+
+                # 前日差（固定ストライクの日次IV差）をピン留め線上に表示。
+                # デルタ線のラベルと重ならないよう点の下側 (va="top") に置く。
+                fs_pin: int = 11 if delta_selection != "全デルタ" else 9
+                for i in range(1, len(pinned_values)):
+                    prev_v: float = pinned_values[i - 1]
+                    curr_v: float = pinned_values[i]
+                    if np.isnan(prev_v) or np.isnan(curr_v):
+                        continue
+                    ax.text(
+                        (x[i - 1] + x[i]) / 2, (prev_v + curr_v) / 2,
+                        f"{curr_v - prev_v:+.1f}",
+                        ha="center", va="top", fontsize=fs_pin,
+                        color=color, fontweight="bold",
+                        bbox=dict(facecolor="black", alpha=0.7, edgecolor="none", pad=1),
+                    )
 
         ax.legend(loc="upper left", fontsize=8, framealpha=0.7)
         ax.grid(True, alpha=0.3)
