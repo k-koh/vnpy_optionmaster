@@ -1289,39 +1289,6 @@ def _populate_month_combo(combo: QtWidgets.QComboBox, bars: list[BarData]) -> No
         combo.setCurrentIndex(idx)
 
 
-def _compute_realized_vol(
-    daily_close: dict[str, float],
-    date_labels: list[str],
-    window: int = 20,
-) -> list[float]:
-    """Rolling annualized realized volatility (%) from futures daily close.
-
-    Aligns the price dict to date_labels, then computes log-return std × √252 × 100
-    over a trailing window. Days without enough data return NaN.
-    """
-    n: int = len(date_labels)
-    if n == 0:
-        return []
-    prices: np.ndarray = np.array(
-        [daily_close.get(d, np.nan) for d in date_labels], dtype=float
-    )
-    returns: np.ndarray = np.full(n, np.nan)
-    for i in range(1, n):
-        p_prev, p_curr = prices[i - 1], prices[i]
-        if not (np.isnan(p_prev) or np.isnan(p_curr)) and p_prev > 0:
-            returns[i] = float(np.log(p_curr / p_prev))
-
-    rv: np.ndarray = np.full(n, np.nan)
-    min_obs: int = max(2, window // 2)
-    for i in range(n):
-        j0 = max(1, i - window + 1)
-        win = returns[j0:i + 1]
-        valid = win[~np.isnan(win)]
-        if len(valid) >= min_obs:
-            rv[i] = float(np.std(valid, ddof=1) * np.sqrt(252) * 100)
-    return rv.tolist()
-
-
 def _interpolate_iv_at_delta(
     day_bars: list[BarData], target_delta: float
 ) -> float | None:
@@ -1756,12 +1723,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             "show_decay": self.decay_check.isChecked(),
             "show_envelope": self.envelope_check.isChecked(),
             "show_skew": self.skew_check.isChecked(),
-            "show_comp": self.comp_check.isChecked(),
-            "comp_basis_skew": self.comp_skew_check.isChecked(),
             "show_pinned": self.pinned_check.isChecked(),
-            "show_realized": self.realized_check.isChecked(),
-            "show_vrp": self.vrp_check.isChecked(),
-            "realized_window": self.realized_window_spin.value(),
+            "interval": self.interval_combo.currentText(),
             "auto_refresh": self.auto_refresh_check.isChecked(),
             "refresh_interval": self.refresh_interval_spin.value(),
         }
@@ -1778,12 +1741,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self.decay_check.setChecked(data.get("show_decay", False))
         self.envelope_check.setChecked(data.get("show_envelope", False))
         self.skew_check.setChecked(data.get("show_skew", False))
-        self.comp_check.setChecked(data.get("show_comp", True))
-        self.comp_skew_check.setChecked(data.get("comp_basis_skew", False))
         self.pinned_check.setChecked(data.get("show_pinned", False))
-        self.realized_check.setChecked(data.get("show_realized", False))
-        self.vrp_check.setChecked(data.get("show_vrp", False))
-        self.realized_window_spin.setValue(data.get("realized_window", 20))
+        self.interval_combo.setCurrentText(data.get("interval", "4H"))
         self.refresh_interval_spin.setValue(data.get("refresh_interval", 5))
         # Setting this checked starts the timer via _on_auto_refresh_toggled.
         self.auto_refresh_check.setChecked(data.get("auto_refresh", False))
@@ -1818,6 +1777,12 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self.month_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
         self.month_combo.setFixedWidth(100)
 
+        # 時間足: 1D uses per-strike option chain (current behaviour); intraday
+        # intervals resample the futures minute-bar IV (ATM / eris Δ0.1).
+        self.interval_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        self.interval_combo.addItems(["1H", "2H", "4H", "8H", "12H", "1D"])
+        self.interval_combo.setCurrentText("4H")
+
         self.delta_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
         self.delta_combo.addItem("全デルタ")
         for label, _delta, _color in self.DELTA_TARGETS:
@@ -1840,19 +1805,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self.decay_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("理論減衰")
         self.envelope_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("残像")
         self.skew_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("スキュー")
-        self.comp_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("圧縮度")
-        self.comp_check.setChecked(True)
-        self.comp_skew_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("圧縮度=スキュー基準")
         self.pinned_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("ピン留め(固定行使価格)")
-        self.realized_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("実現ボラ")
-        self.realized_window_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
-        self.realized_window_spin.setMinimum(2)
-        self.realized_window_spin.setMaximum(90)
-        self.realized_window_spin.setValue(20)
-        self.realized_window_spin.setSuffix("D")
-        self.realized_window_spin.setFixedWidth(60)
-        self.realized_window_spin.setToolTip("実現ボラ/VRP の rolling window (10/20/30 等)")
-        self.vrp_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("VRP")
 
         # Auto-refresh: interval (minutes) + enable checkbox, before 更新 button
         self.refresh_interval_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
@@ -1880,6 +1833,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         hbox.addWidget(self.days_spin)
         hbox.addWidget(QtWidgets.QLabel("限月"))
         hbox.addWidget(self.month_combo)
+        hbox.addWidget(QtWidgets.QLabel("時間足"))
+        hbox.addWidget(self.interval_combo)
         hbox.addWidget(QtWidgets.QLabel("デルタ"))
         hbox.addWidget(self.delta_combo)
         hbox.addWidget(QtWidgets.QLabel("Y軸min"))
@@ -1890,12 +1845,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         hbox.addWidget(self.decay_check)
         hbox.addWidget(self.envelope_check)
         hbox.addWidget(self.skew_check)
-        hbox.addWidget(self.comp_check)
-        hbox.addWidget(self.comp_skew_check)
         hbox.addWidget(self.pinned_check)
-        hbox.addWidget(self.realized_check)
-        hbox.addWidget(self.realized_window_spin)
-        hbox.addWidget(self.vrp_check)
         hbox.addWidget(self.refresh_interval_spin)
         hbox.addWidget(self.auto_refresh_check)
         hbox.addWidget(button)
@@ -2008,6 +1958,72 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
 
         return pinned_series, anchor_symbols
 
+    def _build_intraday_series(
+        self, month: str, days: int, hours: int
+    ) -> tuple[list[str], dict[str, list[float]], dict[str, tuple[float, float, float, float]]]:
+        """Resample futures minute-bar IV to `hours`-hour buckets.
+
+        Uses the ATM / eris Δ0.1 IV recorded on the underlying futures minute
+        bars (the only intraday IV available). Returns (labels, series,
+        futures_ohlc), where series keys match the ATM / Put Δ0.10 / Call Δ0.10
+        DELTA_TARGETS and IVs are annualized %.
+        """
+        symbol: str = f"nk-{month}"
+        now: datetime = datetime.now(DB_TZ)
+        start: datetime = now - timedelta(days=days)
+        database: BaseDatabase = get_database()
+        bars: list[BarData] = database.load_bar_data(
+            symbol=symbol, exchange=Exchange.JPX,
+            interval=Interval.MINUTE, start=start, end=now,
+        )
+        if not bars:
+            return [], {}, {}
+
+        # Bucket by N-hour floor; keep OHLC + the bucket's last IV snapshot.
+        buckets: dict[str, dict] = {}
+        for bar in bars:
+            bh: int = bar.datetime.hour - bar.datetime.hour % hours
+            bdt = bar.datetime.replace(hour=bh, minute=0, second=0, microsecond=0)
+            key: str = bdt.strftime("%Y-%m-%d %H:%M")
+            b = buckets.get(key)
+            if b is None:
+                buckets[key] = {
+                    "o": bar.open_price, "h": bar.high_price,
+                    "l": bar.low_price, "c": bar.close_price,
+                    "atm": bar.atm_iv, "ep": bar.eris_p_iv, "ec": bar.eris_c_iv,
+                }
+            else:
+                b["h"] = max(b["h"], bar.high_price)
+                b["l"] = min(b["l"], bar.low_price)
+                b["c"] = bar.close_price
+                # last non-zero IV snapshot in the bucket
+                if bar.atm_iv:
+                    b["atm"] = bar.atm_iv
+                if bar.eris_p_iv:
+                    b["ep"] = bar.eris_p_iv
+                if bar.eris_c_iv:
+                    b["ec"] = bar.eris_c_iv
+
+        labels: list[str] = sorted(buckets.keys())
+
+        def _iv_list(field: str) -> list[float]:
+            out: list[float] = []
+            for k in labels:
+                v = buckets[k].get(field)
+                out.append(v * 100.0 if v else float("nan"))
+            return out
+
+        series: dict[str, list[float]] = {
+            "ATM (Δ0.50)": _iv_list("atm"),
+            "Put Δ0.10": _iv_list("ep"),
+            "Call Δ0.10": _iv_list("ec"),
+        }
+        futures_ohlc: dict[str, tuple[float, float, float, float]] = {
+            k: (buckets[k]["o"], buckets[k]["h"], buckets[k]["l"], buckets[k]["c"])
+            for k in labels
+        }
+        return labels, series, futures_ohlc
+
     def _load_futures_daily_ohlc(
         self, month: str, days: int
     ) -> dict[str, tuple[float, float, float, float]]:
@@ -2086,22 +2102,46 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
 
         _populate_month_combo(self.month_combo, all_bars)
         month: str = self.month_combo.currentText()
-        bars: list[BarData] = _filter_bars_by_month(all_bars, month)
-
-        date_labels, series = self.build_series(bars)
-        if not date_labels:
-            return
-
-        # Strike-anchored series — pinned to the most-recent date's best-Δ contract.
-        pinned_series, anchor_symbols = self.build_strike_anchored_series(bars, date_labels)
-
-        # Load futures price for the selected month
         futures_month: str = month if month != "全て" else ""
+        interval_label: str = self.interval_combo.currentText()
+
         futures_ohlc: dict[str, tuple[float, float, float, float]] = {}
-        futures_prices: dict[str, float] = {}
-        if futures_month:
-            futures_ohlc = self._load_futures_daily_ohlc(futures_month, days)
-            futures_prices = {d: v[3] for d, v in futures_ohlc.items()}
+        pinned_series: dict[str, list[float]] = {}
+        anchor_symbols: dict[str, str] = {}
+
+        if interval_label == "1D":
+            # Daily: per-strike option chain interpolation (current behaviour).
+            bars: list[BarData] = _filter_bars_by_month(all_bars, month)
+            date_labels, series = self.build_series(bars)
+            if not date_labels:
+                return
+            pinned_series, anchor_symbols = self.build_strike_anchored_series(
+                bars, date_labels
+            )
+            if futures_month:
+                futures_ohlc = self._load_futures_daily_ohlc(futures_month, days)
+        else:
+            # Intraday: resample the futures minute-bar IV to the chosen interval.
+            if not futures_month:
+                QtWidgets.QMessageBox.warning(
+                    self, "限月未選択",
+                    "時間足(intraday)では限月を選択してください（「全て」不可）",
+                    QtWidgets.QMessageBox.Ok,
+                )
+                return
+            hours: int = {"1H": 1, "2H": 2, "4H": 4, "8H": 8, "12H": 12}[interval_label]
+            date_labels, series, futures_ohlc = self._build_intraday_series(
+                futures_month, days, hours
+            )
+            if not date_labels:
+                QtWidgets.QMessageBox.warning(
+                    self, "データなし",
+                    f"nk-{futures_month} の分足データが見つかりません",
+                    QtWidgets.QMessageBox.Ok,
+                )
+                return
+
+        futures_prices: dict[str, float] = {d: v[3] for d, v in futures_ohlc.items()}
 
         delta_selection: str = self.delta_combo.currentText()
         ymin: float = self.ymin_spin.value()
@@ -2139,13 +2179,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         show_decay: bool = self.decay_check.isChecked()
         show_envelope: bool = self.envelope_check.isChecked()
         show_skew: bool = self.skew_check.isChecked()
-        show_comp: bool = self.comp_check.isChecked() and show_decay
-        comp_basis_skew: bool = self.comp_skew_check.isChecked() and show_decay
         show_pinned: bool = self.pinned_check.isChecked() and bool(pinned_series)
-        show_realized: bool = self.realized_check.isChecked() and bool(futures_prices)
-        show_vrp: bool = self.vrp_check.isChecked() and bool(futures_prices)
         envelope_window: int = 20
-        realized_window: int = self.realized_window_spin.value()
 
         atm_label: str = "ATM (Δ0.50)"
         skew_series: dict[str, list[float]] = {}
@@ -2167,16 +2202,12 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         # Build a vertical stack of subplots based on which overlays are enabled.
         #   row 0: main IV chart (always present)
         #   row 1: skew subplot (optional)
-        #   row 2: compression bars (optional, only with 理論減衰)
         height_ratios: list[int] = [6]
         if has_skew_plot:
             height_ratios.append(2)
-        if show_comp:
-            height_ratios.append(1)
 
         ax_skew = None
         ax_skew_right = None
-        ax_comp = None
         if len(height_ratios) == 1:
             ax = self.fig.add_subplot(111)
         else:
@@ -2188,28 +2219,22 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             if has_skew_plot:
                 ax_skew = self.fig.add_subplot(gs[row_idx, 0], sharex=ax)
                 row_idx += 1
-            if show_comp:
-                ax_comp = self.fig.add_subplot(gs[row_idx, 0], sharex=ax)
 
-        # Per-target compression ratio = (actual - theory) / spike.
-        # Computed against either raw IV (default) or the skew series (when toggled).
-        compression: dict[str, np.ndarray] = {}
-
-        def _compute_compression(arr: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
-            """Return (theory_curve, compression_ratio) or (None, None) when not applicable."""
+        def _compute_theory(arr: np.ndarray) -> np.ndarray | None:
+            """Return the 1/√t decay theory curve from the most-recent peak, or None."""
             valid_mask = ~np.isnan(arr)
             if valid_mask.sum() < 3:
-                return None, None
+                return None
             peak_idx = int(np.nanargmax(arr))
             peak_v = float(arr[peak_idx])
             base_v = float(np.nanmin(arr))
             spike = peak_v - base_v
             if spike <= 0:
-                return None, None
+                return None
             theory = np.full(len(arr), np.nan)
             for j in range(peak_idx, len(arr)):
                 theory[j] = base_v + spike / np.sqrt(j - peak_idx + 1)
-            return theory, (arr - theory) / spike
+            return theory
 
         for label, target_delta, color in plot_targets:
             values: list[float] = series[label]
@@ -2239,15 +2264,13 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             # IV理論減衰 — from most-recent peak, decay ∝ 1/√(t+1)
             if show_decay:
                 arr = np.array(values, dtype=float)
-                theory, comp = _compute_compression(arr)
+                theory = _compute_theory(arr)
                 if theory is not None:
                     ax.plot(
                         x, theory,
                         color=color, linewidth=1.0, linestyle="--",
                         alpha=0.7, label=f"{label} 理論減衰",
                     )
-                    if not comp_basis_skew:
-                        compression[label] = comp
 
             # 前日比テキストを表示
             fs: int = 11 if delta_selection != "全デルタ" else 9
@@ -2265,38 +2288,6 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     color=color, fontweight="bold",
                     bbox=dict(facecolor="black", alpha=0.7, edgecolor="none", pad=1),
                 )
-
-        # --- Realized vol + VRP overlays ---
-        # Realized vol: rolling annualized std of futures log-returns.
-        # VRP: ATM IV − realized vol (= the "vol risk premium" priced into ATM).
-        # Compute realized vol once whenever any consumer (line plot or VRP) needs it.
-        realized_vol: list[float] = []
-        vrp_values: list[float] = []
-        if (show_realized or show_vrp) and futures_prices:
-            realized_vol = _compute_realized_vol(
-                futures_prices, date_labels, window=realized_window
-            )
-        if show_realized and realized_vol and any(not np.isnan(v) for v in realized_vol):
-            ax.plot(
-                x, realized_vol,
-                color="#ffd700", linewidth=1.2, linestyle="-",
-                alpha=0.85, label=f"実現ボラ({realized_window}D)",
-                marker="^", markersize=3,
-            )
-        if show_vrp and realized_vol:
-            atm_vals = series.get(atm_label, [])
-            if atm_vals:
-                vrp_values = [
-                    (a - r) if not (np.isnan(a) or np.isnan(r)) else float("nan")
-                    for a, r in zip(atm_vals, realized_vol)
-                ]
-                if any(not np.isnan(v) for v in vrp_values):
-                    ax.plot(
-                        x, vrp_values,
-                        color="#c896ff", linewidth=1.2, linestyle="-.",
-                        alpha=0.9, label=f"VRP (ATM−RV{realized_window}D)",
-                        marker="d", markersize=3,
-                    )
 
         # --- Strike-anchored (pinned) IV — dotted line on the main IV chart ---
         # Tracks one specific contract per Δ-target so its IV move is not
@@ -2395,28 +2386,6 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             else:
                 ax_skew.set_ylabel("スキュー\n(IV − ATM)", fontsize=9)
             ax_skew.tick_params(axis="y", labelsize=8)
-
-        # --- Skew-basis compression: drives the bottom comp subplot when toggled ---
-        # Computed regardless of whether the skew subplot is visible, so the user
-        # can still get skew-basis bars without devoting screen space to skew lines.
-        if comp_basis_skew:
-            for label, target_delta, color in skew_targets:
-                arr = np.array(skew_series[label], dtype=float)
-                theory, comp = _compute_compression(arr)
-                if theory is None:
-                    continue
-                if ax_skew is not None:
-                    theory_ax = (
-                        ax_skew_right
-                        if (ax_skew_right is not None and target_delta > 0)
-                        else ax_skew
-                    )
-                    theory_ax.plot(
-                        x, theory,
-                        color=color, linewidth=1.0, linestyle="--",
-                        alpha=0.7,
-                    )
-                compression[label] = comp
 
         # Tighten skew Y-axis to the actual IV−ATM data range (ignore theory
         # decay overlay so the dashed reference can't stretch the view).
@@ -2541,40 +2510,15 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         ax.set_title(title, fontsize=12)
         ax.set_ylabel("IV (年率%)")
 
-        # Compression subplot: (actual IV − theory IV) / spike. Negative = IV crush.
-        if ax_comp is not None and compression:
-            label_to_color: dict[str, str] = {lbl: col for lbl, _, col in plot_targets}
-            ordered_labels: list[str] = [
-                lbl for lbl, _, _ in plot_targets if lbl in compression
-            ]
-            n_targets = len(ordered_labels)
-            bar_width = 0.8 / max(n_targets, 1)
-            for cidx, label in enumerate(ordered_labels):
-                color = label_to_color[label]
-                comp_vals = compression[label]
-                offset = (cidx - (n_targets - 1) / 2) * bar_width
-                colors = ["#ff5050" if (not np.isnan(v) and v < 0) else color for v in comp_vals]
-                ax_comp.bar(
-                    x + offset, comp_vals, width=bar_width,
-                    color=colors, edgecolor="none", alpha=0.75,
-                )
-            ax_comp.axhline(0, color="#ffffff", linewidth=0.6, alpha=0.5)
-            ax_comp.grid(True, alpha=0.2)
-            comp_basis_label: str = "スキュー" if comp_basis_skew else "実績"
-            ax_comp.set_ylabel(f"圧縮度\n({comp_basis_label}−理論)/spike", fontsize=8)
-            ax_comp.tick_params(axis="y", labelsize=8)
-
         # X-axis labels go on the bottom-most subplot only.
-        if ax_comp is not None:
-            bottom_ax = ax_comp
-        elif ax_skew is not None:
+        if ax_skew is not None:
             bottom_ax = ax_skew
         else:
             bottom_ax = ax
         bottom_ax.set_xticks(tick_positions)
         bottom_ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=8)
         bottom_ax.set_xlabel("日付")
-        for upper_ax in (ax, ax_skew, ax_comp):
+        for upper_ax in (ax, ax_skew):
             if upper_ax is None or upper_ax is bottom_ax:
                 continue
             upper_ax.set_xticks(tick_positions)
@@ -2584,7 +2528,6 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         # Setup cursor
         self._cursor_ax = ax
         self._cursor_ax_skew = ax_skew
-        self._cursor_ax_comp = ax_comp
         self._cursor_date_labels = date_labels
         self._cursor_series = {label: series[label] for label, _, _ in plot_targets}
         self._cursor_skew_series = {
@@ -2599,12 +2542,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             if show_pinned else {}
         )
         self._cursor_anchor_symbols = dict(anchor_symbols) if show_pinned else {}
-        self._cursor_realized_vol = realized_vol if show_realized else []
-        self._cursor_vrp_values = vrp_values if show_vrp else []
-        self._cursor_realized_window = realized_window
         self._cursor_futures_values = futures_values
-        self._cursor_compression = {k: list(v) for k, v in compression.items()}
-        self._cursor_comp_basis_skew = comp_basis_skew
 
         self._cursor_vline = ax.axvline(x=0, color="#ffffff", linewidth=0.5, linestyle="--", alpha=0.5, visible=False)
         self._cursor_text = ax.text(
@@ -2624,29 +2562,12 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 x=0, color="#ffffff", linewidth=0.5, linestyle="--", alpha=0.5, visible=False,
             )
 
-        # Compression subplot cursor mirror
-        self._cursor_vline_comp = None
-        self._cursor_text_comp = None
-        if ax_comp is not None:
-            self._cursor_vline_comp = ax_comp.axvline(
-                x=0, color="#ffffff", linewidth=0.5, linestyle="--", alpha=0.5, visible=False,
-            )
-            self._cursor_text_comp = ax_comp.text(
-                0.02, 0.98, "",
-                transform=ax_comp.transAxes,
-                fontsize=8,
-                color="#ffffff",
-                verticalalignment="top",
-                bbox=dict(boxstyle="round,pad=0.3", fc="#333333", ec="#888888", alpha=0.9),
-            )
-            self._cursor_text_comp.set_visible(False)
-
         if self._cursor_cid:
             self.canvas.mpl_disconnect(self._cursor_cid)
         self._cursor_cid = self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
 
         # Trim outer whitespace to match IVEventDecayChart compactness
-        bottom_margin = 0.07 if (ax_comp is not None or ax_skew is not None) else 0.08
+        bottom_margin = 0.07 if ax_skew is not None else 0.08
         self.fig.subplots_adjust(left=0.045, right=0.97, top=0.96, bottom=bottom_margin, hspace=0.05)
         self.canvas.draw()
 
@@ -2658,10 +2579,6 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 self._cursor_text.set_visible(False)
             if getattr(self, "_cursor_vline_skew", None):
                 self._cursor_vline_skew.set_visible(False)
-            if self._cursor_vline_comp:
-                self._cursor_vline_comp.set_visible(False)
-            if self._cursor_text_comp:
-                self._cursor_text_comp.set_visible(False)
             self.canvas.draw_idle()
             return
 
@@ -2671,10 +2588,6 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             self._cursor_text.set_visible(False)
             if getattr(self, "_cursor_vline_skew", None):
                 self._cursor_vline_skew.set_visible(False)
-            if self._cursor_vline_comp:
-                self._cursor_vline_comp.set_visible(False)
-            if self._cursor_text_comp:
-                self._cursor_text_comp.set_visible(False)
             self.canvas.draw_idle()
             return
 
@@ -2713,17 +2626,6 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     short_label = label.split(" ")[0]
                     lines.append(f"{short_label}−ATM: {skew_vals[ix]:+.1f}%")
 
-        # Realized vol
-        rv_series = getattr(self, "_cursor_realized_vol", [])
-        rv_window = getattr(self, "_cursor_realized_window", 20)
-        if rv_series and ix < len(rv_series) and not np.isnan(rv_series[ix]):
-            lines.append(f"実現ボラ({rv_window}D): {rv_series[ix]:.1f}%")
-
-        # Vol Risk Premium (ATM − realized vol)
-        vrp_series = getattr(self, "_cursor_vrp_values", [])
-        if vrp_series and ix < len(vrp_series) and not np.isnan(vrp_series[ix]):
-            lines.append(f"VRP: {vrp_series[ix]:+.1f}%")
-
         if self._cursor_futures_values and ix < len(self._cursor_futures_values):
             fv = self._cursor_futures_values[ix]
             if not np.isnan(fv):
@@ -2734,36 +2636,6 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self._cursor_text.set_position((ax_frac[0] + 0.02, ax_frac[1] + 0.02))
         self._cursor_text.set_text("\n".join(lines))
         self._cursor_text.set_visible(True)
-
-        # Mirror cursor + label on the compression subplot
-        if self._cursor_vline_comp is not None and self._cursor_text_comp is not None:
-            self._cursor_vline_comp.set_xdata([ix])
-            self._cursor_vline_comp.set_visible(True)
-
-            comp_lines: list[str] = [date_str]
-            for label, _delta, color in self._cursor_plot_targets:
-                comp_vals = self._cursor_compression.get(label)
-                if not comp_vals or ix >= len(comp_vals):
-                    continue
-                v = comp_vals[ix]
-                if not np.isnan(v):
-                    short_label = label.split(" ")[0]
-                    comp_lines.append(f"{short_label}: {v:+.2f}")
-
-            if len(comp_lines) > 1:
-                # Follow the mouse horizontally but pin Y to the top of the
-                # compression subplot — the label tracks the cursor like the
-                # IV label, while staying inside the comp axis so it can never
-                # cross into the main chart where the other label lives.
-                comp_frac_x = self._cursor_ax_comp.transAxes.inverted().transform(
-                    (event.x, event.y)
-                )[0]
-                comp_frac_x = max(0.02, min(comp_frac_x + 0.02, 0.85))
-                self._cursor_text_comp.set_position((comp_frac_x, 0.98))
-                self._cursor_text_comp.set_text("\n".join(comp_lines))
-                self._cursor_text_comp.set_visible(True)
-            else:
-                self._cursor_text_comp.set_visible(False)
 
         self.canvas.draw_idle()
 
