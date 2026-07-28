@@ -2442,8 +2442,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             # transparent so its lines/labels stay readable on top.
             ax.set_zorder(ax2.get_zorder() + 1)
             ax.patch.set_visible(False)
-            up_color: str = "#ef5350"       # 陽線 (close >= open)
-            down_color: str = "#26a69a"     # 陰線 (close < open)
+            up_color: str = "#ff4b4b"       # 陽線 (close >= open) — 株価チャット UP_COLOR
+            down_color: str = "#4bffff"     # 陰線 (close < open) — 株価チャット DOWN_COLOR
             body_w: float = 0.6
             lows: list[float] = []
             highs: list[float] = []
@@ -2722,7 +2722,17 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         ]
         self.sim_table: QtWidgets.QTableWidget = QtWidgets.QTableWidget(0, len(sim_table_headers))
         self.sim_table.setHorizontalHeaderLabels(sim_table_headers)
-        self.sim_table.horizontalHeader().setStretchLastSection(True)
+        # Keep columns at their content width (don't stretch the last one to
+        # fill) so the content can overflow horizontally, and always show both
+        # scrollbars — needed for touch scrolling via Remote Desktop, like the
+        # 収益 (result) table.
+        self.sim_table.horizontalHeader().setStretchLastSection(False)
+        self.sim_table.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOn
+        )
+        self.sim_table.setVerticalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOn
+        )
         # Reserve height so the positions table actually shows taller. A bare
         # setMaximumHeight has no effect here — the result_table below has
         # stretch=1 and absorbs all the extra vertical space, so the table
