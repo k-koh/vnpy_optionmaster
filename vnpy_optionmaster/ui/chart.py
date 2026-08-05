@@ -3032,6 +3032,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 "enabled": pos.get("enabled", True),
                 "closed": pos.get("closed", False),
                 "close_price": pos.get("close_price", 0.0),
+                "manual_price": pos.get("manual_price", 0.0),
                 "label": pos["label"],
             })
 
@@ -3119,6 +3120,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 "enabled": pos_data.get("enabled", True),
                 "closed": pos_data.get("closed", False),
                 "close_price": pos_data.get("close_price", 0.0),
+                "manual_price": pos_data.get("manual_price", 0.0),
                 "label": pos_data["label"],
                 "vt_symbol": vt_symbol,
             })
@@ -3348,7 +3350,12 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 fm: float = pos.get("futures_multiplier", 1.0)
                 type_str = pos.get("label", "先物").split(" ")[0]
                 strike_str = "-"
-                cur_price: float = und.mid_price if und and und.mid_price else 0
+                # Fall back to the hand-input 現在値 when no live price (e.g.
+                # out of NK225_OP_STRIKE_SCOPE → no updates).
+                cur_price: float = (
+                    und.mid_price if und and und.mid_price
+                    else pos.get("manual_price", 0.0)
+                )
                 current_price_str = f"{cur_price:.0f}" if cur_price else ""
                 entry_iv_str = "-"
                 current_iv = "-"
@@ -3359,7 +3366,12 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 fm = 1.0
                 type_str = "コール" if pos["cp"] > 0 else "プット"
                 strike_str = f"{pos['strike']:.0f}"
-                cur_price = opt.mid_price if opt and opt.mid_price else 0
+                # Fall back to the hand-input 現在値 when no live price (e.g.
+                # out of NK225_OP_STRIKE_SCOPE → no updates).
+                cur_price = (
+                    opt.mid_price if opt and opt.mid_price
+                    else pos.get("manual_price", 0.0)
+                )
                 current_price_str = f"{cur_price:.1f}" if cur_price else ""
                 entry_iv_str = f"{entry_iv * 100:.2f}" if entry_iv else "-"
                 current_iv = f"{opt.mid_impv * 100:.2f}" if opt and opt.mid_impv else ""
@@ -3476,7 +3488,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 if row == editing_row and col == editing_col:
                     continue  # leave the in-edit cell alone
                 item = QtWidgets.QTableWidgetItem(val)
-                if col == 4 or col == 6:  # 枚数 / 建値 columns are editable
+                if col in (4, 6, 7):  # 枚数 / 建値 / 現在値(手入力) columns are editable
                     item.setFlags(
                         QtCore.Qt.ItemFlag.ItemIsEnabled
                         | QtCore.Qt.ItemFlag.ItemIsSelectable
@@ -3620,6 +3632,18 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             if self.sim_positions[row].get("entry_price", 0.0) == new_entry_price:
                 return
             self.sim_positions[row]["entry_price"] = new_entry_price
+            self._refresh_sim_table()
+            self._run_sim_analysis()
+        elif col == 7:  # 現在値 (手入力) — used when no live price is available
+            text: str = item.text().strip()
+            try:
+                new_manual_price: float = float(text) if text else 0.0
+            except ValueError:
+                self._refresh_sim_table()
+                return
+            if self.sim_positions[row].get("manual_price", 0.0) == new_manual_price:
+                return
+            self.sim_positions[row]["manual_price"] = new_manual_price
             self._refresh_sim_table()
             self._run_sim_analysis()
         elif col == 26:  # 決済済 checkbox
@@ -4159,17 +4183,24 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             lots: int = pos["lots"]
             size: int = pos["size"]
             entry_price: float = pos.get("entry_price", 0) or 0
+            # Fall back to the hand-input 現在値 (manual_price) when no live
+            # price (e.g. out of NK225_OP_STRIKE_SCOPE → no updates).
+            manual_price: float = pos.get("manual_price", 0.0) or 0.0
             if pos["kind"] == "futures":
                 fm: float = pos.get("futures_multiplier", 1.0)
                 und = pos.get("underlying_data")
-                cur_price: float = und.mid_price if und and und.mid_price else 0
+                cur_price: float = (
+                    und.mid_price if und and und.mid_price else manual_price
+                )
                 if cur_price:
                     current_total_pnl += (cur_price - entry_price) * lots * size * fm
                     if entry_price:
                         sum_fut_diff += cur_price - entry_price
             else:
                 opt = pos.get("option_data")
-                cur_opt_price: float = opt.mid_price if opt and opt.mid_price else 0
+                cur_opt_price: float = (
+                    opt.mid_price if opt and opt.mid_price else manual_price
+                )
                 if cur_opt_price:
                     current_total_pnl += (cur_opt_price - entry_price) * lots * size
                 entry_iv: float = pos.get("entry_iv", 0) or 0
