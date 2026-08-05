@@ -1912,11 +1912,21 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             date_key: str = bar.datetime.strftime("%Y-%m-%d")
             date_bars.setdefault(date_key, []).append(bar)
 
+        return self._anchor_and_follow(date_bars, date_labels)
+
+    def _anchor_and_follow(
+        self, date_bars: dict[str, list[BarData]], date_labels: list[str]
+    ) -> tuple[dict[str, list[float]], dict[str, str]]:
+        """Anchor one contract per Δ-target on the latest bucket, follow its IV.
+
+        `date_bars` maps each x-axis bucket key to that bucket's per-strike bars
+        (one representative bar per contract). Works for both daily and intraday
+        buckets. Returns (pinned_series, anchor_symbols) aligned to date_labels.
+        """
         if not date_bars or not date_labels:
             return {}, {}
 
-        # Anchor on the latest date that actually has bars (= last entry of date_labels
-        # that is also in date_bars)
+        # Anchor on the latest bucket that actually has bars.
         anchor_date: str | None = None
         for d in reversed(date_labels):
             if d in date_bars:
@@ -1957,6 +1967,41 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             pinned_series[label] = values
 
         return pinned_series, anchor_symbols
+
+    def _build_intraday_pinned(
+        self, month: str, days: int, hours: int, date_labels: list[str]
+    ) -> tuple[dict[str, list[float]], dict[str, str]]:
+        """Pinned (固定行使価格) series for intraday, from the 15m per-strike
+        option bars, bucketed to the chosen `hours`-hour interval and aligned to
+        date_labels (the futures-based main-series buckets)."""
+        now: datetime = datetime.now(DB_TZ)
+        start: datetime = now - timedelta(days=days)
+        database: BaseDatabase = get_database()
+        bars: list[BarData] = database.load_option_data(
+            symbol="", exchange=Exchange.JPX,
+            interval=Interval.MINUTE15, start=start, end=now,
+        )
+        month_bars: list[BarData] = _filter_bars_by_month(bars, month)
+
+        # Bucket by N-hour; keep the LATEST 15m bar per contract in each bucket.
+        # (load_option_data orders by symbol, not datetime, so compare dt.)
+        bucket_syms: dict[str, dict[str, BarData]] = {}
+        for bar in month_bars:
+            if bar.iv <= 0 or bar.delta == 0 or not bar.symbol:
+                continue
+            bh: int = bar.datetime.hour - bar.datetime.hour % hours
+            key: str = bar.datetime.replace(
+                hour=bh, minute=0, second=0, microsecond=0
+            ).strftime("%Y-%m-%d %H:%M")
+            syms = bucket_syms.setdefault(key, {})
+            prev = syms.get(bar.symbol)
+            if prev is None or bar.datetime > prev.datetime:
+                syms[bar.symbol] = bar
+
+        date_bars: dict[str, list[BarData]] = {
+            k: list(v.values()) for k, v in bucket_syms.items()
+        }
+        return self._anchor_and_follow(date_bars, date_labels)
 
     def _build_intraday_series(
         self, month: str, days: int, hours: int
@@ -2140,6 +2185,10 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     QtWidgets.QMessageBox.Ok,
                 )
                 return
+            # Pinned (固定行使価格) from the recorded 15m per-strike option bars.
+            pinned_series, anchor_symbols = self._build_intraday_pinned(
+                futures_month, days, hours, date_labels
+            )
 
         futures_prices: dict[str, float] = {d: v[3] for d, v in futures_ohlc.items()}
 
