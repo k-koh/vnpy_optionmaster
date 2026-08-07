@@ -2342,6 +2342,13 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         # Tracks one specific contract per Δ-target so its IV move is not
         # contaminated by the chain rolling along the smile when futures move.
         if show_pinned:
+            # Distinct colours for the pinned lines so they don't blend with the
+            # normal delta lines (ATM=white / Put=orange / Call=cyan).
+            pinned_colors: dict[str, str] = {
+                "ATM (Δ0.50)": "#e040fb",   # magenta
+                "Put Δ0.10": "#c6ff00",     # lime
+                "Call Δ0.10": "#ff6d00",    # deep orange
+            }
             for label, target_delta, color in plot_targets:
                 pinned_values = pinned_series.get(label)
                 if not pinned_values:
@@ -2349,14 +2356,15 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 arr = np.array(pinned_values, dtype=float)
                 if not np.any(~np.isnan(arr)):
                     continue
+                pin_color: str = pinned_colors.get(label, color)
                 anchor_sym = anchor_symbols.get(label, "")
                 # Pull strike out of "nk-2606-P-54000" → "54000" for the legend.
                 strike_str: str = anchor_sym.split("-")[-1] if anchor_sym else ""
                 pinned_label: str = f"{label} ピン留め(K={strike_str})" if strike_str else f"{label} ピン留め"
                 ax.plot(
                     x, pinned_values,
-                    color=color, linewidth=1.2, linestyle=":",
-                    alpha=0.85, label=pinned_label,
+                    color=pin_color, linewidth=1.6, linestyle="--",
+                    alpha=0.95, label=pinned_label,
                     marker="x", markersize=4,
                 )
 
@@ -2372,7 +2380,9 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                         (x[i - 1] + x[i]) / 2, (prev_v + curr_v) / 2,
                         f"{curr_v - prev_v:+.1f}",
                         ha="center", va="top", fontsize=fs_pin,
-                        color=color, fontweight="bold",
+                        # Match the distinct pinned-line colour so the label is
+                        # tied to the pinned line, not the normal strike line.
+                        color=pin_color, fontweight="bold",
                         bbox=dict(facecolor="black", alpha=0.7, edgecolor="none", pad=1),
                     )
 
@@ -2787,7 +2797,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         # stretch=1 and absorbs all the extra vertical space, so the table
         # stays at its small content-based size hint. setMinimumHeight forces
         # the layout to give it the space. (600 = triple the original 200.)
-        self.sim_table.setMinimumHeight(800)
+        self.sim_table.setMinimumHeight(450)
         # Reduce cell padding for a tighter layout
         self.sim_table.setStyleSheet(
             "QTableWidget::item { padding: 0px 2px; }"
