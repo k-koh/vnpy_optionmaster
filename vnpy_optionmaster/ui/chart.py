@@ -2221,9 +2221,13 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         x = np.arange(len(date_labels))
 
         if delta_selection == "全デルタ":
-            plot_targets = self.DELTA_TARGETS
+            plot_targets = list(self.DELTA_TARGETS)
         else:
             plot_targets = [t for t in self.DELTA_TARGETS if t[0] == delta_selection]
+
+        # Display order (legend & lines): Put → ATM → Call (unknown labels last).
+        _display_order = {"Put Δ0.10": 0, "ATM (Δ0.50)": 1, "Call Δ0.10": 2}
+        plot_targets.sort(key=lambda t: _display_order.get(t[0], 99))
 
         show_decay: bool = self.decay_check.isChecked()
         show_envelope: bool = self.envelope_check.isChecked()
@@ -2594,7 +2598,11 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             for label, _, _ in skew_targets
             if ax_skew is not None and label in skew_series
         }
-        self._cursor_plot_targets = list(plot_targets)
+        # Cursor label display order: Put → ATM → Call (unknown labels last).
+        _cursor_order = {"Put Δ0.10": 0, "ATM (Δ0.50)": 1, "Call Δ0.10": 2}
+        self._cursor_plot_targets = sorted(
+            plot_targets, key=lambda t: _cursor_order.get(t[0], 99)
+        )
         self._cursor_skew_targets = list(skew_targets) if ax_skew is not None else []
         self._cursor_pinned_series = (
             {label: pinned_series[label] for label in pinned_series}
