@@ -1754,6 +1754,17 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         else:
             self._refresh_timer.stop()
 
+    def _auto_refresh(self) -> None:
+        """Timer slot: refresh silently, and only while the window is open.
+
+        The widget is constructed (hidden) at OptionMaster start, so the
+        restored 自動更新 setting can start the timer before the chart is ever
+        opened. Skip when not visible, and never pop modal warnings for a
+        background refresh (e.g. month = 全て with an intraday 時間足)."""
+        if not self.isVisible():
+            return
+        self.run_analysis(show_warnings=False)
+
     def _on_refresh_interval_changed(self, minutes: int) -> None:
         """Apply a new interval immediately if auto-refresh is active."""
         if self.auto_refresh_check.isChecked():
@@ -1818,7 +1829,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self.auto_refresh_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("自動更新")
 
         self._refresh_timer: QtCore.QTimer = QtCore.QTimer(self)
-        self._refresh_timer.timeout.connect(self.run_analysis)
+        self._refresh_timer.timeout.connect(self._auto_refresh)
         self.auto_refresh_check.toggled.connect(self._on_auto_refresh_toggled)
         self.refresh_interval_spin.valueChanged.connect(self._on_refresh_interval_changed)
 
@@ -2128,7 +2139,9 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             for d, ohlc in self._load_futures_daily_ohlc(month, days).items()
         }
 
-    def run_analysis(self) -> None:
+    def run_analysis(self, *_args, show_warnings: bool = True) -> None:
+        # *_args absorbs the bool emitted by QPushButton.clicked. show_warnings
+        # is False for background auto-refresh so it never pops modal dialogs.
         # Stamp the refresh time (manual or auto) so updates are confirmable.
         self.last_update_label.setText(
             "最終更新: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2137,12 +2150,13 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
 
         all_bars: list[BarData] = _load_option_bars_with_today(days)
         if not all_bars:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "データなし",
-                f"過去{days}日間のオプションデータが見つかりません",
-                QtWidgets.QMessageBox.Ok,
-            )
+            if show_warnings:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "データなし",
+                    f"過去{days}日間のオプションデータが見つかりません",
+                    QtWidgets.QMessageBox.Ok,
+                )
             return
 
         _populate_month_combo(self.month_combo, all_bars)
@@ -2168,22 +2182,24 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         else:
             # Intraday: resample the futures minute-bar IV to the chosen interval.
             if not futures_month:
-                QtWidgets.QMessageBox.warning(
-                    self, "限月未選択",
-                    "時間足(intraday)では限月を選択してください（「全て」不可）",
-                    QtWidgets.QMessageBox.Ok,
-                )
+                if show_warnings:
+                    QtWidgets.QMessageBox.warning(
+                        self, "限月未選択",
+                        "時間足(intraday)では限月を選択してください（「全て」不可）",
+                        QtWidgets.QMessageBox.Ok,
+                    )
                 return
             hours: int = {"1H": 1, "2H": 2, "4H": 4, "8H": 8, "12H": 12}[interval_label]
             date_labels, series, futures_ohlc = self._build_intraday_series(
                 futures_month, days, hours
             )
             if not date_labels:
-                QtWidgets.QMessageBox.warning(
-                    self, "データなし",
-                    f"nk-{futures_month} の分足データが見つかりません",
-                    QtWidgets.QMessageBox.Ok,
-                )
+                if show_warnings:
+                    QtWidgets.QMessageBox.warning(
+                        self, "データなし",
+                        f"nk-{futures_month} の分足データが見つかりません",
+                        QtWidgets.QMessageBox.Ok,
+                    )
                 return
             # Pinned (固定行使価格) from the recorded 15m per-strike option bars.
             pinned_series, anchor_symbols = self._build_intraday_pinned(
