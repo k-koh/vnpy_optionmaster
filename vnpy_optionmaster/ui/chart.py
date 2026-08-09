@@ -1,4 +1,7 @@
 from datetime import datetime, timedelta
+from collections import Counter
+import os
+import re
 import pyqtgraph as pg
 from typing import cast
 
@@ -2737,6 +2740,12 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         # Simulation positions: list of dicts with live OptionData/UnderlyingData refs
         self.sim_positions: list[dict] = []
 
+        # RSS 約定取込: snapshot of the last-imported execution signatures, so
+        # each click only imports the delta (new fills) as a new batch instead
+        # of re-aggregating everything. Persisted in settings.
+        self._rss_last_execs: list[str] = []
+        self._rss_batch_seq: int = 0
+
         # Real-time update timer
         self._update_timer: QtCore.QTimer = QtCore.QTimer()
         self._update_timer.setInterval(1000)
@@ -2838,6 +2847,12 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         add_futures_btn.clicked.connect(self._add_sim_futures_row)
         del_btn: QtWidgets.QPushButton = QtWidgets.QPushButton("行削除")
         del_btn.clicked.connect(self._remove_sim_row)
+        rss_btn: QtWidgets.QPushButton = QtWidgets.QPushButton("約定取込(RSS)")
+        rss_btn.setToolTip(
+            "マーケットスピードII RSS の先物OP約定一覧から建玉を取り込みます。\n"
+            "Excel と マーケットスピードII を起動・ログインしておいてください。"
+        )
+        rss_btn.clicked.connect(self._import_rss_executions)
 
         sim_param_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         sim_param_hbox.addWidget(QtWidgets.QLabel("限月"))
@@ -2855,6 +2870,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         sim_param_hbox.addWidget(add_btn)
         sim_param_hbox.addWidget(add_futures_btn)
         sim_param_hbox.addWidget(del_btn)
+        sim_param_hbox.addWidget(rss_btn)
 
         sim_pnl_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         sim_pnl_hbox.addWidget(self.sim_total_pnl_label)
@@ -3117,6 +3133,8 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 "close_price": pos.get("close_price", 0.0),
                 "manual_price": pos.get("manual_price", 0.0),
                 "label": pos["label"],
+                "rss_imported": pos.get("rss_imported", False),
+                "rss_batch": pos.get("rss_batch", 0),
             })
 
         data: dict = {
@@ -3131,6 +3149,8 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             "window_width": self.width(),
             "window_height": self.height(),
             "splitter_sizes": self.splitter.sizes(),
+            "rss_last_execs": self._rss_last_execs,
+            "rss_batch_seq": self._rss_batch_seq,
         }
         save_json(self.SETTING_FILENAME, data)
 
@@ -3146,6 +3166,10 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         self.iv_sensitivity_spin.setValue(data.get("iv_sensitivity", -1.0))
         self.show_legs_check.setChecked(data.get("show_legs", True))
         self.show_expiry_check.setChecked(data.get("show_expiry", True))
+
+        # Restore RSS delta-import state
+        self._rss_last_execs = list(data.get("rss_last_execs", []))
+        self._rss_batch_seq = int(data.get("rss_batch_seq", 0))
 
         # Restore window size
         win_w: int = data.get("window_width", 0)
@@ -3206,6 +3230,8 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 "manual_price": pos_data.get("manual_price", 0.0),
                 "label": pos_data["label"],
                 "vt_symbol": vt_symbol,
+                "rss_imported": pos_data.get("rss_imported", False),
+                "rss_batch": pos_data.get("rss_batch", 0),
             })
 
         if self.sim_positions:
@@ -3222,6 +3248,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         """Restart the auto-refresh timer and refresh tables when reopened."""
         super().showEvent(event)
         if self.mode_combo.currentIndex() == 1:
+            self._check_rss_on_open()
             if self.sim_positions:
                 self._refresh_sim_table()
                 self._run_sim_analysis()
@@ -3372,6 +3399,278 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             "close_price": 0.0,
         })
         self._refresh_sim_table()
+
+    def _rss_file_path(self) -> str:
+        """Path to rss_fop.xlsx inside the vnpy_optionmaster package."""
+        pkg_dir: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(pkg_dir, "rss_fop.xlsx")
+
+    def _check_rss_on_open(self) -> None:
+        """On ペイオフ図 open: check that rss_fop.xlsx is open in the user's Excel.
+        If it isn't open, create it (when it doesn't exist yet) or prompt the
+        user to open it. The user must open it so the RSS add-in is loaded."""
+        if getattr(self, "_rss_checked", False):
+            return
+        self._rss_checked = True
+
+        try:
+            from . import rss_import
+        except Exception:
+            return
+        path: str = self._rss_file_path()
+
+        try:
+            _running, is_open = rss_import.workbook_status(path)
+        except Exception as e:                       # pragma: no cover
+            print(f"[RSS] status check failed: {e}")
+            return
+
+        if is_open:
+            return                                    # already open — nothing to do
+
+        if not os.path.exists(path):
+            # Never created yet → auto-create with the formula.
+            try:
+                how = rss_import.create_rss_file(path)
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(
+                    self, "RSSファイル作成失敗",
+                    f"rss_fop.xlsx を作成できませんでした:\n{e}",
+                    QtWidgets.QMessageBox.Ok,
+                )
+                return
+            if how == "excel":
+                QtWidgets.QMessageBox.information(
+                    self, "RSSファイル作成",
+                    "rss_fop.xlsx を作成し、Excelで開きました。\n"
+                    "マーケットスピードII にログインすると建玉が取り込めます。\n\n"
+                    f"{path}",
+                    QtWidgets.QMessageBox.Ok,
+                )
+            else:
+                QtWidgets.QMessageBox.information(
+                    self, "RSSファイル作成",
+                    "rss_fop.xlsx を作成しました。\n"
+                    "マーケットスピードII とExcelを起動し、次のファイルを開いてください:\n\n"
+                    f"{path}",
+                    QtWidgets.QMessageBox.Ok,
+                )
+        else:
+            # Exists but not open → ask the user to open it.
+            QtWidgets.QMessageBox.information(
+                self, "RSSファイル未オープン",
+                "先物OP約定一覧を取り込むには rss_fop.xlsx を開いてください。\n"
+                "マーケットスピードII とExcelを起動し、次のファイルを開いてください:\n\n"
+                f"{path}",
+                QtWidgets.QMessageBox.Ok,
+            )
+
+    def _find_chain_by_yymm(self, portfolio: "PortfolioData", yymm: str) -> str | None:
+        """Find the chain_symbol (e.g. 'nk-2609.JPX') whose month == yymm."""
+        for cs in portfolio.chains.keys():
+            m = re.search(r"(\d{4})", cs)
+            if m and m.group(1) == yymm:
+                return cs
+        return None
+
+    @staticmethod
+    def _find_option_by_strike(chain: "ChainData", cp: str, strike: int) -> "OptionData | None":
+        options_dict = chain.calls if cp == "C" else chain.puts
+        for option in options_dict.values():
+            if int(round(option.strike_price)) == int(strike):
+                return option
+        return None
+
+    def _import_rss_executions(self) -> None:
+        """Import 先物OP約定一覧 from マーケットスピードII RSS and build sim positions.
+
+        買建 → +枚数, 売建 → −枚数 (aggregated per contract, VWAP entry price).
+        転売 / 買戻 (closing trades) are skipped. Previously RSS-imported rows
+        are replaced; manually-added rows are kept.
+        """
+        try:
+            from .rss_import import read_fop_executions, parse_instrument
+        except Exception as e:                       # pragma: no cover
+            QtWidgets.QMessageBox.warning(
+                self, "RSS取込エラー", f"RSSモジュールの読み込みに失敗しました:\n{e}",
+                QtWidgets.QMessageBox.Ok,
+            )
+            return
+
+        try:
+            executions = read_fop_executions()
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self, "RSS取込エラー", str(e), QtWidgets.QMessageBox.Ok,
+            )
+            return
+
+        if not executions:
+            QtWidgets.QMessageBox.information(
+                self, "RSS取込",
+                "先物OP約定一覧にデータが見つかりませんでした。\n"
+                "（マーケットスピードIIにログイン済みで、当日約定があるか確認してください）",
+                QtWidgets.QMessageBox.Ok,
+            )
+            return
+
+        portfolio: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
+
+        # --- Delta since last click: only NEW fills form this batch ---------
+        # Each 約定 row has no unique id, so identify fills by a signature and
+        # take the multiset difference against the snapshot from the last click.
+        def _sig(e) -> str:
+            return f"{e.date}|{e.code}|{e.trade}|{e.qty}|{e.price}"
+
+        prev_counts = Counter(self._rss_last_execs)
+        new_execs = []
+        for ex in executions:
+            sig = _sig(ex)
+            if prev_counts.get(sig, 0) > 0:
+                prev_counts[sig] -= 1                 # already imported before
+            else:
+                new_execs.append(ex)
+
+        # Snapshot the full current list for the next diff (persisted).
+        self._rss_last_execs = [_sig(ex) for ex in executions]
+
+        if not new_execs:
+            self._save_settings()
+            QtWidgets.QMessageBox.information(
+                self, "RSS取込",
+                "前回取込から新しい約定はありませんでした。",
+                QtWidgets.QMessageBox.Ok,
+            )
+            return
+
+        # Aggregate ONLY the new fills, per contract, for THIS batch. Previous
+        # RSS batches are kept as-is (not merged) so each entry stays separate.
+        agg: dict[tuple, dict] = {}
+        unparsed: list[str] = []
+        for ex in new_execs:
+            if ex.trade not in ("買建", "売建"):
+                continue                              # skip 転売 / 買戻 / others
+            info = parse_instrument(ex.name, ex.code)
+            if info is None:
+                unparsed.append(ex.name)
+                continue
+            sign: int = 1 if ex.trade == "買建" else -1
+            # Key by side too: a 売建 open and a 買建 open of the SAME contract are
+            # separate positions (a short and a long), so they must not net to
+            # zero. 買戻/転売 (closes) are skipped, so opposite opens stay distinct.
+            key = (info["kind"], info["yymm"], info["cp"], info["strike"], info["is_mini"], ex.trade)
+            a = agg.setdefault(key, {"net": 0.0, "abs_qty": 0.0, "abs_notional": 0.0, "info": info})
+            a["net"] += sign * ex.qty
+            a["abs_qty"] += ex.qty
+            a["abs_notional"] += ex.qty * ex.price
+
+        # New batch number (appended, previous RSS batches untouched).
+        self._rss_batch_seq += 1
+        batch: int = self._rss_batch_seq
+
+        added: int = 0
+        skipped: list[str] = []
+        # Options first then futures within the batch, so the 合計損益 set-group
+        # (1 option + following future) pairs each batch's legs correctly.
+        ordered = sorted(
+            agg.items(),
+            key=lambda kv: 0 if kv[1]["info"]["kind"] == "option" else 1,
+        )
+        for key, a in ordered:
+            net = int(round(a["net"]))
+            if net == 0:
+                continue
+            info = a["info"]
+            vwap = a["abs_notional"] / a["abs_qty"] if a["abs_qty"] else 0.0
+
+            chain_symbol = self._find_chain_by_yymm(portfolio, info["yymm"])
+            if not chain_symbol:
+                skipped.append(f"{info['raw']} (限月{info['yymm']}のチェーンなし)")
+                continue
+            chain: ChainData | None = portfolio.chains.get(chain_symbol)
+            if not chain:
+                skipped.append(f"{info['raw']} (チェーン取得失敗)")
+                continue
+
+            if info["kind"] == "option":
+                option = self._find_option_by_strike(chain, info["cp"], info["strike"])
+                if option is None:
+                    skipped.append(f"{info['raw']} (行使価格{info['strike']}未検出)")
+                    continue
+                entry_underlying = option.underlying.mid_price if option.underlying else 0
+                self.sim_positions.append({
+                    "option_data": option,
+                    "underlying_data": None,
+                    "chain_symbol": chain_symbol,
+                    "kind": "option",
+                    "cp": option.option_type,
+                    "strike": option.strike_price,
+                    "lots": net,
+                    "entry_price": vwap,
+                    "entry_iv": option.mid_impv,
+                    "entry_underlying": entry_underlying,
+                    "entry_tte": option.time_to_expiry,
+                    "entry_time": datetime.now().isoformat(),
+                    "entry_delta": option.theo_delta,
+                    "entry_gamma": option.theo_gamma,
+                    "entry_theta": option.theo_theta,
+                    "entry_vega": option.theo_vega,
+                    "size": option.size,
+                    "label": f"{info['cp']}{option.strike_price:.0f}",
+                    "vt_symbol": option.vt_symbol,
+                    "enabled": True,
+                    "closed": False,
+                    "close_price": 0.0,
+                    "rss_imported": True,
+                    "rss_batch": batch,
+                })
+                added += 1
+            else:  # futures
+                underlying = chain.underlying
+                if underlying is None:
+                    skipped.append(f"{info['raw']} (先物原資産なし)")
+                    continue
+                futures_multiplier = 0.1 if info["is_mini"] else 1.0
+                futures_type = "先物ミニ" if info["is_mini"] else "先物ラージ"
+                self.sim_positions.append({
+                    "option_data": None,
+                    "underlying_data": underlying,
+                    "chain_symbol": chain_symbol,
+                    "kind": "futures",
+                    "cp": 0,
+                    "strike": 0,
+                    "lots": net,
+                    "entry_price": vwap,
+                    "entry_iv": 0,
+                    "entry_underlying": vwap,
+                    "entry_tte": 0,
+                    "entry_time": datetime.now().isoformat(),
+                    "entry_delta": underlying.size * futures_multiplier,
+                    "entry_gamma": 0,
+                    "entry_theta": 0,
+                    "entry_vega": 0,
+                    "size": underlying.size,
+                    "futures_multiplier": futures_multiplier,
+                    "label": f"{futures_type} {chain_symbol.split('.')[0]}",
+                    "vt_symbol": underlying.vt_symbol,
+                    "enabled": True,
+                    "closed": False,
+                    "close_price": 0.0,
+                    "rss_imported": True,
+                    "rss_batch": batch,
+                })
+                added += 1
+
+        self._refresh_sim_table()
+        self._save_settings()
+
+        # Summary
+        msg = f"バッチ #{batch}: 新規約定から {added} 件の建玉を追加しました。"
+        if skipped:
+            msg += "\n\n[未マッチ " + str(len(skipped)) + "件]\n" + "\n".join(skipped[:15])
+        if unparsed:
+            msg += "\n\n[銘柄名称の解析不可 " + str(len(unparsed)) + "件]\n" + "\n".join(unparsed[:15])
+        QtWidgets.QMessageBox.information(self, "RSS取込", msg, QtWidgets.QMessageBox.Ok)
 
     def _remove_sim_row(self) -> None:
         row: int = self.sim_table.currentRow()
