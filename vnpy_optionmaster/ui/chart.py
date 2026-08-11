@@ -2954,6 +2954,30 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         )
         self.iv_auto_btn.clicked.connect(self._auto_iv_sensitivity)
 
+        # Reset IV感応度 to the ATM IV変動値 per +0.5σ (recent 参照日数).
+        self.iv_reset_btn: QtWidgets.QPushButton = QtWidgets.QPushButton("ATM既定")
+        self.iv_reset_btn.setToolTip(
+            "IV感応度を「0.5σ ATM IV変動値 / +0.5σ」に設定します。\n"
+            "= 0.5 × 日次ATM IV(%) = 株価チャットのATM 0.5σバンド（≈0.9%/+0.5σ）"
+        )
+        self.iv_reset_btn.clicked.connect(self._reset_iv_sensitivity)
+
+        # 自動計算の参照日数 と デルタ種別（ポジションに合わせる）
+        self.iv_auto_days_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.iv_auto_days_spin.setSuffix(" 日")
+        self.iv_auto_days_spin.setMinimum(1)
+        self.iv_auto_days_spin.setMaximum(90)
+        self.iv_auto_days_spin.setValue(3)
+        self.iv_auto_days_spin.setToolTip("自動計算で参照する直近日数")
+
+        self.iv_auto_delta_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        self.iv_auto_delta_combo.addItems(
+            ["Put Δ0.10", "ATM (Δ0.50)", "Call Δ0.10", "全デルタ"]
+        )
+        self.iv_auto_delta_combo.setToolTip(
+            "自動計算で使うIVのデルタ種別（ポジションに合わせて選択）"
+        )
+
         self.show_legs_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("個別ポジション")
         self.show_legs_check.setChecked(True)
 
@@ -3027,6 +3051,11 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         ctrl_grid.addWidget(QtWidgets.QLabel("IV感応度"), 1, 2)
         ctrl_grid.addWidget(self.iv_sensitivity_spin, 1, 3)
         ctrl_grid.addWidget(self.iv_auto_btn, 1, 4)
+        ctrl_grid.addWidget(QtWidgets.QLabel("参照日数"), 1, 5)
+        ctrl_grid.addWidget(self.iv_auto_days_spin, 1, 6)
+        ctrl_grid.addWidget(QtWidgets.QLabel("Δ種別"), 1, 7)
+        ctrl_grid.addWidget(self.iv_auto_delta_combo, 1, 8)
+        ctrl_grid.addWidget(self.iv_reset_btn, 1, 9)
 
         btn_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         btn_hbox.addWidget(self.show_legs_check)
@@ -3182,6 +3211,8 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             "step": self.step_combo.currentText(),
             "days": self.days_spin.value(),
             "iv_sensitivity": self.iv_sensitivity_spin.value(),
+            "iv_auto_days": self.iv_auto_days_spin.value(),
+            "iv_auto_delta": self.iv_auto_delta_combo.currentText(),
             "show_legs": self.show_legs_check.isChecked(),
             "show_expiry": self.show_expiry_check.isChecked(),
             "window_width": self.width(),
@@ -3201,6 +3232,11 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         self.price_range_spin.setValue(data.get("price_range", 5000))
         self.days_spin.setValue(data.get("days", 1))
         self.iv_sensitivity_spin.setValue(data.get("iv_sensitivity", -1.0))
+        self.iv_auto_days_spin.setValue(data.get("iv_auto_days", 3))
+        _auto_delta = data.get("iv_auto_delta", "")
+        _adi = self.iv_auto_delta_combo.findText(_auto_delta)
+        if _adi >= 0:
+            self.iv_auto_delta_combo.setCurrentIndex(_adi)
         self.show_legs_check.setChecked(data.get("show_legs", True))
         self.show_expiry_check.setChecked(data.get("show_expiry", True))
 
@@ -4700,6 +4736,33 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         else:
             iv_per_1000 = iv_sens
 
+        # Total fees (千円) for enabled/open positions, subtracted from every P&L
+        # curve & table row so they match the sim table's top 合計損益 (net of
+        # fees). Split into 手数料 (実費) and 取引手数料 (決済見積り) for display.
+        fee_actual_yen: float = 0.0
+        trade_fee_yen: float = 0.0
+        for pos in positions:
+            fee_actual_yen += pos.get("fee", 0.0)
+            if pos["kind"] == "futures":
+                _und = pos.get("underlying_data")
+                _cp: float = (
+                    self._snap_price(_und.mid_price, "futures",
+                                     pos.get("futures_multiplier", 1.0) < 1.0)
+                    if _und and _und.mid_price else pos.get("manual_price", 0.0)
+                )
+            else:
+                _opt = pos.get("option_data")
+                _cp = (
+                    self._snap_price(_opt.mid_price, "option")
+                    if _opt and _opt.mid_price else pos.get("manual_price", 0.0)
+                )
+            trade_fee_yen += self._estimate_trade_fee_yen(
+                pos, _cp if _cp else pos.get("entry_price", 0)
+            )
+        fee_actual_k: float = fee_actual_yen / 1000.0
+        trade_fee_k: float = trade_fee_yen / 1000.0
+        total_fee_k: float = fee_actual_k + trade_fee_k
+
         # Build leg labels from simulation positions
         leg_labels: dict[int, str] = {}
         if show_legs:
@@ -4735,10 +4798,10 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             now, day_same, day_adj, expiry, legs = self._calculate_sim_pnl_at_price(
                 positions, sp, ref_price, time_change, iv_per_1000,
             )
-            pnl_now_arr.append(now)
-            pnl_day_same_arr.append(day_same)
-            pnl_day_adj_arr.append(day_adj)
-            pnl_expiry_arr.append(expiry)
+            pnl_now_arr.append(now - total_fee_k)
+            pnl_day_same_arr.append(day_same - total_fee_k)
+            pnl_day_adj_arr.append(day_adj - total_fee_k)
+            pnl_expiry_arr.append(expiry - total_fee_k)
 
             for key in leg_pnl_arrs:
                 leg_pnl_arrs[key].append(legs.get(key, 0))
@@ -4791,10 +4854,12 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 "iv_level": iv_level,
                 "fut_diff": sp - ref_price,
                 "iv_change": iv_change_pct,
-                "pnl_now": now,
-                "pnl_day_same": day_same,
-                "pnl_day_adj": day_adj,
-                "pnl_expiry": expiry,
+                "pnl_now": now - total_fee_k,
+                "pnl_day_same": day_same - total_fee_k,
+                "pnl_day_adj": day_adj - total_fee_k,
+                "pnl_expiry": expiry - total_fee_k,
+                "fee_actual": fee_actual_k,
+                "fee_trade": trade_fee_k,
                 "delta": g_at_p["delta"],
                 "gamma": g_at_p["gamma"],
                 "theta": g_at_p["theta"],
@@ -4869,6 +4934,15 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         # matches the table's 合計損益. Fees are in yen, P&L in 千円 → /1000.
         current_total_pnl -= sum_fee / 1000.0
         current_total_pnl -= sum_trade_fee / 1000.0
+
+        # Make the 現在 row's 現在P&L exactly equal the sim table's 合計損益 /
+        # 現在損益 label: use the live snapped-mid figure (current_total_pnl)
+        # instead of the model reprice at ref (which differs by the futures
+        # snapping and model-vs-mid).
+        for _tr in table_data:
+            if _tr.get("iv_level") == "現在":
+                _tr["pnl_now"] = current_total_pnl
+                break
 
         # Base price (prev-day futures close) + ATM daily IV for vertical bands,
         # taken from the reference (first) position's chain.
@@ -4974,8 +5048,67 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             return None
         return (sxy / sxx) * 1000.0
 
+    def _estimate_iv_per_half_sigma(
+        self, chain_symbol: str, days: int, delta_type: str,
+        base: float | None, daily_iv: float | None,
+    ) -> float | None:
+        """Regress intraday IV level(%) on futures price level over the last N
+        days for the chosen delta type, and return %IV change per +0.5σ move.
+
+        Uses the ATM / eris Δ0.1 IV recorded on the futures minute bars — the
+        same series as 株価チャット's iv_item. delta_type ∈
+        {Put Δ0.10, ATM (Δ0.50), Call Δ0.10, 全デルタ}.
+        """
+        symbol: str = chain_symbol.split(".")[0]     # e.g. nk-2609
+        now: datetime = datetime.now(DB_TZ)
+        start: datetime = now - timedelta(days=days)
+        bars: list[BarData] = get_database().load_bar_data(
+            symbol=symbol, exchange=Exchange.JPX,
+            interval=Interval.MINUTE, start=start, end=now,
+        )
+        if not bars:
+            return None
+
+        fields_map: dict[str, list[str]] = {
+            "Put Δ0.10": ["eris_p_iv"],
+            "ATM (Δ0.50)": ["atm_iv"],
+            "Call Δ0.10": ["eris_c_iv"],
+            "全デルタ": ["eris_p_iv", "atm_iv", "eris_c_iv"],
+        }
+        fields: list[str] = fields_map.get(delta_type, ["atm_iv"])
+
+        # OLS regression of IV LEVEL(%) on futures price LEVEL over the window —
+        # this captures the overall IV↔price co-movement you read off the chart
+        # (steeper than tiny per-minute deltas, which are dominated by noise and
+        # dilute the slope toward zero). For 全デルタ, average the per-series
+        # slopes (put/atm/call sit at different IV levels, so don't pool them).
+        slopes: list[float] = []
+        for field in fields:
+            pts: list[tuple[float, float]] = []
+            for bar in bars:
+                iv = getattr(bar, field, 0) or 0
+                price = bar.close_price
+                if iv > 0 and price:
+                    pts.append((price, iv * 100.0))
+            if len(pts) < 10:
+                continue
+            n: int = len(pts)
+            mx: float = sum(p for p, _ in pts) / n
+            my: float = sum(v for _, v in pts) / n
+            sxx: float = sum((p - mx) ** 2 for p, _ in pts)
+            sxy: float = sum((p - mx) * (v - my) for p, v in pts)
+            if sxx > 0:
+                slopes.append(sxy / sxx)             # %IV per futures point
+        if not slopes:
+            return None
+        slope_per_point: float = sum(slopes) / len(slopes)
+        if base and daily_iv:
+            return slope_per_point * (0.5 * daily_iv * base)   # per +0.5σ
+        return slope_per_point * 1000.0              # fallback (per 1000pt)
+
     def _auto_iv_sensitivity(self) -> None:
-        """Estimate IV感応度 from history and fill the spinbox."""
+        """Estimate IV感応度 (%IV/+0.5σ) from recent intraday IV, for the chosen
+        参照日数 and Δ種別, and fill the spinbox."""
         positions: list[dict] = self.sim_positions
         chain_symbol: str = ""
         if positions:
@@ -4989,24 +5122,52 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             )
             return
 
-        lookback_days: int = 45
-        est: float | None = self._estimate_iv_per_1000(chain_symbol, lookback_days)
+        days: int = self.iv_auto_days_spin.value()
+        delta_type: str = self.iv_auto_delta_combo.currentText()
+        base = self._load_prev_day_close(chain_symbol.split(".")[0])
+        chain = self.option_engine.get_portfolio(self.portfolio_name).chains.get(chain_symbol)
+        div = chain.atm_impv / (252 ** 0.5) if chain and chain.atm_impv else None
+
+        est: float | None = self._estimate_iv_per_half_sigma(
+            chain_symbol, days, delta_type, base, div
+        )
         if est is None:
             QtWidgets.QMessageBox.warning(
                 self, "自動計算",
-                "IV感応度を推定できるデータが不足しています（過去データ不足）",
+                "IV感応度を推定できるデータが不足しています。\n"
+                "（先物分足のIV記録が参照日数内に十分あるか確認してください）",
                 QtWidgets.QMessageBox.Ok,
             )
             return
 
-        # Convert the regression result (%IV / 1000pt) → %IV per +0.5σ using
-        # 前日終値 (base) and 日次ATM IV, to match the spinbox unit.
-        base = self._load_prev_day_close(chain_symbol.split(".")[0])
-        chain = self.option_engine.get_portfolio(self.portfolio_name).chains.get(chain_symbol)
-        div = chain.atm_impv / (252 ** 0.5) if chain and chain.atm_impv else None
-        value: float = est * (0.5 * div * base) / 1000.0 if (base and div) else est
-
         # Clamp into the spinbox range and apply.
+        lo: float = self.iv_sensitivity_spin.minimum()
+        hi: float = self.iv_sensitivity_spin.maximum()
+        self.iv_sensitivity_spin.setValue(max(lo, min(hi, est)))
+        self._run_sim_analysis()
+
+    def _reset_iv_sensitivity(self) -> None:
+        """Set IV感応度 to a simple baseline: the 0.5σ ATM IV変動値 / +0.5σ,
+        i.e. 0.5 × 現在の日次ATM IV(%) = 0.5 × (現在ATM IV年率 ÷ √252) × 100.
+        This equals 株価チャット iv_item's ATM 0.5σ band (≈0.9%/+0.5σ)."""
+        positions: list[dict] = self.sim_positions
+        chain_symbol: str = (
+            positions[0]["chain_symbol"] if positions
+            else (self.sim_month_combo.currentData() or "")
+        )
+        chain = (
+            self.option_engine.get_portfolio(self.portfolio_name).chains.get(chain_symbol)
+            if chain_symbol else None
+        )
+        if not chain or not chain.atm_impv:
+            QtWidgets.QMessageBox.warning(
+                self, "ATM既定", "現在のATM IVが取得できません（限月・データを確認してください）",
+                QtWidgets.QMessageBox.Ok,
+            )
+            return
+        # 0.5σ ATM IV変動値 = 0.5 × 日次ATM IV(%) = 0.5 × (年率ATM IV ÷ √252) × 100.
+        # Matches 株価チャット iv_item's ATM 0.5σ band.
+        value: float = chain.atm_impv / (252 ** 0.5) * 100.0 * 0.5
         lo: float = self.iv_sensitivity_spin.minimum()
         hi: float = self.iv_sensitivity_spin.maximum()
         self.iv_sensitivity_spin.setValue(max(lo, min(hi, value)))
@@ -5516,11 +5677,13 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         else:
             greek_headers = ["Δ(千円/pt)", "Γ(千円/pt²)", "Θ(千円/day)", "V(千円/1%)", "IV値(%)"]
             contrib_headers = ["Δ寄与(千円)", "Γ寄与(千円)", "Θ寄与(千円)", "V寄与(千円)"]
-        # Sim mode adds an IV水準 label and 先物差 column after 原資産価格.
+        # Sim mode adds an IV水準 label and 先物差 column after 原資産価格,
+        # and 手数料 / 取引手数料 columns after 満期P&L (already subtracted from P&L).
         front_headers: list[str] = ["IV水準", "先物差"] if is_sim else []
+        fee_headers: list[str] = ["手数料", "取引手数料"] if is_sim else []
         headers: list[str] = [
             "原資産価格", *front_headers, "IV変動(%)",
-            "現在P&L", f"+{days}日(同IV)", f"+{days}日(IV変動)", "満期P&L",
+            "現在P&L", f"+{days}日(同IV)", f"+{days}日(IV変動)", "満期P&L", *fee_headers,
             *greek_headers,
             *contrib_headers,
         ]
@@ -5539,6 +5702,9 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             cells.append((f"{data['pnl_day_same']:.1f}", True))
             cells.append((f"{data['pnl_day_adj']:.1f}", True))
             cells.append((f"{data['pnl_expiry']:.1f}", True))
+            if is_sim:
+                cells.append((f"{data.get('fee_actual', 0):.3f}", False))
+                cells.append((f"{data.get('fee_trade', 0):.3f}", False))
             cells.append((f"{data['delta']:.2f}", False))
             cells.append((f"{data['gamma']:.6f}", False))
             cells.append((f"{data['theta']:.2f}", False))
