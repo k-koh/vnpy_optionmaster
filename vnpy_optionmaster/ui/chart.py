@@ -1,7 +1,8 @@
 from datetime import datetime, timedelta
-from collections import Counter
+from collections import Counter, deque
 import os
 import re
+import math
 import pyqtgraph as pg
 from typing import cast
 
@@ -2584,9 +2585,32 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             ax2.legend(loc="upper right", fontsize=8, framealpha=0.7)
 
         n_dates: int = len(date_labels)
-        step: int = max(1, n_dates // 15)
-        tick_positions = [i for i in range(0, n_dates, step)]
-        tick_labels: list[str] = [date_labels[i][5:] for i in range(0, n_dates, step)]
+
+        # Session-boundary vertical lines (intraday buckets only):
+        #   night session start → 16:00 bucket (先物の取引日の起点、17:00立会開始)
+        #   day session start   → 08:00 bucket (8:45立会開始)
+        night_idx = [i for i, lbl in enumerate(date_labels) if lbl.endswith(" 16:00")]
+        day_idx = [i for i, lbl in enumerate(date_labels) if lbl.endswith(" 08:00")]
+        for target_ax in (ax, ax_skew):
+            if target_ax is None:
+                continue
+            for i in night_idx:
+                target_ax.axvline(x=i, color="#9aa0a6", linewidth=0.8,
+                                  linestyle="-", alpha=0.45, zorder=0)
+            for i in day_idx:
+                target_ax.axvline(x=i, color="#5f6368", linewidth=0.6,
+                                  linestyle="--", alpha=0.4, zorder=0)
+
+        if night_idx:
+            # Date labels at night-session boundaries (thin if too many).
+            lstep: int = max(1, len(night_idx) // 15)
+            sel = night_idx[::lstep]
+            tick_positions = sel
+            tick_labels: list[str] = [date_labels[i][5:] for i in sel]
+        else:
+            step: int = max(1, n_dates // 15)
+            tick_positions = [i for i in range(0, n_dates, step)]
+            tick_labels = [date_labels[i][5:] for i in range(0, n_dates, step)]
 
         title: str = f"IV時系列 — {delta_selection}" if delta_selection != "全デルタ" else "IV時系列（デルタレベル別）"
         ax.set_title(title, fontsize=12)
@@ -2740,11 +2764,12 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         # Simulation positions: list of dicts with live OptionData/UnderlyingData refs
         self.sim_positions: list[dict] = []
 
-        # RSS 約定取込: snapshot of the last-imported execution signatures, so
-        # each click only imports the delta (new fills) as a new batch instead
-        # of re-aggregating everything. Persisted in settings.
-        self._rss_last_execs: list[str] = []
-        self._rss_batch_seq: int = 0
+        # RSS 約定取込: persistent execution ledger. RSS 約定一覧 is current-day
+        # only, so we accumulate every unique fill seen across days/clicks here
+        # (deduped by signature) and FIFO-reconstruct positions from the whole
+        # ledger — this keeps prior-day opens and lets today's 転売 close them.
+        # Each entry: {date, code, name, trade, qty, price, fee, tax}.
+        self._rss_ledger: list[dict] = []
 
         # Real-time update timer
         self._update_timer: QtCore.QTimer = QtCore.QTimer()
@@ -2810,7 +2835,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             "Δ寄与", "Γ寄与", "Θ寄与", "V寄与",
             "建Δ", "建Γ", "建Θ", "建V",
             "現Δ", "現Γ", "現Θ", "現V",
-            "決済済", "決済値", "手数料",
+            "決済済", "決済値", "手数料", "取引手数料(税込)",
         ]
         self.sim_table: QtWidgets.QTableWidget = QtWidgets.QTableWidget(0, len(sim_table_headers))
         self.sim_table.setHorizontalHeaderLabels(sim_table_headers)
@@ -2853,6 +2878,12 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             "Excel と マーケットスピードII を起動・ログインしておいてください。"
         )
         rss_btn.clicked.connect(self._import_rss_executions)
+        rss_clear_btn: QtWidgets.QPushButton = QtWidgets.QPushButton("RSS履歴クリア")
+        rss_clear_btn.setToolTip(
+            "RSS約定の累計履歴（建玉ledger）を消去し、RSS取込で作成した行を\n"
+            "すべて削除します。新しい期間を始めるときに使用します（手動追加行は残ります）。"
+        )
+        rss_clear_btn.clicked.connect(self._clear_rss_history)
 
         sim_param_hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         sim_param_hbox.addWidget(QtWidgets.QLabel("限月"))
@@ -2866,6 +2897,9 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         sim_param_hbox.addWidget(self.sim_futures_type_combo)
         sim_param_hbox.addWidget(QtWidgets.QLabel("枚数"))
         sim_param_hbox.addWidget(self.sim_futures_lots_spin)
+        # RSS履歴クリア on the far left, separated from the frequently-used
+        # buttons by the stretch, to avoid an accidental click.
+        sim_param_hbox.addWidget(rss_clear_btn)
         sim_param_hbox.addStretch()
         sim_param_hbox.addWidget(add_btn)
         sim_param_hbox.addWidget(add_futures_btn)
@@ -2893,7 +2927,10 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         self.price_range_spin.setValue(5000)
 
         self.step_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
-        self.step_combo.addItems(["500", "1000"])
+        self.step_combo.addItems(["0.5σ", "1.0σ"])
+        # Re-run analysis when the price scope / step changes (auto-refresh).
+        self.price_range_spin.valueChanged.connect(self._on_scope_changed)
+        self.step_combo.currentIndexChanged.connect(self._on_scope_changed)
 
         self.days_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
         self.days_spin.setSuffix(" 日")
@@ -2902,7 +2939,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         self.days_spin.setValue(1)
 
         self.iv_sensitivity_spin: QtWidgets.QDoubleSpinBox = QtWidgets.QDoubleSpinBox()
-        self.iv_sensitivity_spin.setSuffix(" %/1000pt")
+        self.iv_sensitivity_spin.setSuffix(" %/0.5σ")
         self.iv_sensitivity_spin.setMinimum(-20.0)
         self.iv_sensitivity_spin.setMaximum(20.0)
         self.iv_sensitivity_spin.setSingleStep(0.1)
@@ -2913,7 +2950,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         self.iv_auto_btn: QtWidgets.QPushButton = QtWidgets.QPushButton("自動")
         self.iv_auto_btn.setToolTip(
             "過去の ATM IV 日次変化と先物日次変化の回帰から\n"
-            "IV感応度 (%/1000pt) を自動推定します"
+            "IV感応度 (%IV / +0.5σ) を自動推定します"
         )
         self.iv_auto_btn.clicked.connect(self._auto_iv_sensitivity)
 
@@ -3150,8 +3187,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             "window_width": self.width(),
             "window_height": self.height(),
             "splitter_sizes": self.splitter.sizes(),
-            "rss_last_execs": self._rss_last_execs,
-            "rss_batch_seq": self._rss_batch_seq,
+            "rss_ledger": self._rss_ledger,
         }
         save_json(self.SETTING_FILENAME, data)
 
@@ -3168,9 +3204,8 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         self.show_legs_check.setChecked(data.get("show_legs", True))
         self.show_expiry_check.setChecked(data.get("show_expiry", True))
 
-        # Restore RSS delta-import state
-        self._rss_last_execs = list(data.get("rss_last_execs", []))
-        self._rss_batch_seq = int(data.get("rss_batch_seq", 0))
+        # Restore RSS execution ledger
+        self._rss_ledger = list(data.get("rss_ledger", []))
 
         # Restore window size
         win_w: int = data.get("window_width", 0)
@@ -3183,7 +3218,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         if splitter_sizes and len(splitter_sizes) == self.splitter.count():
             self.splitter.setSizes([int(s) for s in splitter_sizes])
 
-        step_text: str = data.get("step", "500")
+        step_text: str = data.get("step", "0.5σ")
         idx: int = self.step_combo.findText(step_text)
         if idx >= 0:
             self.step_combo.setCurrentIndex(idx)
@@ -3476,6 +3511,97 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         return None
 
     @staticmethod
+    def _snap_price(price: float, kind: str, is_mini: bool = True) -> float:
+        """Snap a live mid price DOWN to the exchange tick grid (呼値).
+          オプション: 価格>=300 は刻み5、<300 は刻み1
+          先物:       日経225ミニ 刻み5 / 日経225先物(ラージ) 刻み10
+        e.g. option 302.5→300, futures(mini) 67478→67475.
+        """
+        if not price or price <= 0:
+            return price
+        if kind == "futures":
+            tick: float = 5.0 if is_mini else 10.0
+        else:
+            tick = 5.0 if price >= 300 else 1.0
+        return math.floor(price / tick) * tick
+
+    def _step_sigma(self) -> float:
+        """Parse the ステップ combo ('0.5σ' / '1.0σ') → float σ increment."""
+        txt = self.step_combo.currentText().replace("σ", "").strip()
+        try:
+            return float(txt)
+        except ValueError:
+            return 0.5
+
+    def _on_scope_changed(self, *_args) -> None:
+        """Re-run analysis when 価格範囲 / ステップ changes (auto-refresh)."""
+        if self.mode_combo.currentIndex() == 1:
+            if self.sim_positions:
+                self.run_analysis()
+        else:
+            self.run_analysis()
+
+    @staticmethod
+    def _build_price_levels(
+        ref_price: float, base: float | None, daily_iv: float | None,
+        price_range: float, step_sigma: float,
+    ) -> list[tuple[float, str]]:
+        """Descending (price, label) rows for the result table.
+
+        Price levels sit on a σ grid anchored at 前日終値 (base):
+        price = base × (1 + dailyIV × σ), σ stepped by step_sigma, kept within
+        [ref_price ± price_range]. Always includes 前日終値(±0) and 現在.
+        Falls back to a fixed 500pt descending grid when base/dailyIV missing.
+        """
+        lo: float = ref_price - price_range
+        hi: float = ref_price + price_range
+        levels: list[tuple[float, str]] = []
+        if base and daily_iv:
+            lo_sig: float = (lo / base - 1.0) / daily_iv
+            hi_sig: float = (hi / base - 1.0) / daily_iv
+            k_lo: int = int(math.ceil(lo_sig / step_sigma))
+            k_hi: int = int(math.floor(hi_sig / step_sigma))
+            seen_zero: bool = False
+            for k in range(k_lo, k_hi + 1):
+                sig: float = k * step_sigma
+                p: float = base * (1.0 + daily_iv * sig)
+                if abs(sig) < 1e-9:
+                    levels.append((p, "±0(前終)"))
+                    seen_zero = True
+                else:
+                    levels.append((p, f"{sig:+.1f}σ"))
+            if not seen_zero and lo <= base <= hi:
+                levels.append((base, "±0(前終)"))
+            if lo <= ref_price <= hi:
+                levels.append((ref_price, "現在"))
+            levels.sort(key=lambda t: t[0], reverse=True)
+        else:
+            p = hi
+            while p >= lo - 1e-9:
+                levels.append((float(p), ""))
+                p -= 500.0
+        return levels
+
+    @staticmethod
+    def _estimate_trade_fee_yen(pos: dict, price: float) -> float:
+        """楽天証券の取引手数料(税込, 円) 見積り。未決済ポジションの決済手数料の
+        概算に使う。https://www.rakuten-sec.co.jp/web/fop/futures/commission/
+          日経225先物:   275円/枚
+          日経225ミニ:   38円/枚 (38.5円 1円未満切捨)
+          日経225オプション: 売買代金×0.198% 最低198円 (1円未満切捨, 1取引あたり)
+        """
+        lots: int = abs(int(round(pos.get("lots", 0))))
+        if lots == 0:
+            return 0.0
+        if pos.get("kind") == "futures":
+            fm: float = pos.get("futures_multiplier", 1.0)
+            per: float = 38.0 if fm < 1.0 else 275.0     # ミニ / ラージ
+            return per * lots
+        # 日経225オプション: 売買代金(円) = 単価(pt) × 枚数 × 1000
+        notional: float = price * lots * 1000.0
+        return max(198.0, float(math.floor(notional * 0.00198)))
+
+    @staticmethod
     def _find_option_by_strike(chain: "ChainData", cp: str, strike: int) -> "OptionData | None":
         options_dict = chain.calls if cp == "C" else chain.puts
         for option in options_dict.values():
@@ -3484,11 +3610,14 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         return None
 
     def _import_rss_executions(self) -> None:
-        """Import 先物OP約定一覧 from マーケットスピードII RSS and build sim positions.
+        """Import 先物OP約定一覧 from マーケットスピードII RSS and rebuild positions.
 
-        買建 → +枚数, 売建 → −枚数 (aggregated per contract, VWAP entry price).
-        転売 / 買戻 (closing trades) are skipped. Previously RSS-imported rows
-        are replaced; manually-added rows are kept.
+        All fills (opens + closes) are read and matched per contract by FIFO
+        (先入先出): 買建/売建 open lots; 転売 closes longs, 買戻 closes shorts,
+        oldest lot first. Each closed match becomes a 決済み row (→ 実現損益);
+        remaining open lots become open rows (→ 合計損益). 手数料+税金 of both
+        the open and the close go into the 手数料 column. Previously RSS-imported
+        rows are replaced each click; manually-added rows are kept.
         """
         try:
             from .rss_import import read_fop_executions, parse_instrument
@@ -3518,74 +3647,127 @@ class PayoffDiagramChart(QtWidgets.QWidget):
 
         portfolio: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
 
-        # --- Delta since last click: only NEW fills form this batch ---------
-        # Each 約定 row has no unique id, so identify fills by a signature and
-        # take the multiset difference against the snapshot from the last click.
-        def _sig(e) -> str:
-            return f"{e.date}|{e.code}|{e.trade}|{e.qty}|{e.price}"
+        # --- Merge current fills into the persistent ledger ----------------
+        # RSS 約定一覧 is current-day only, so accumulate every unique fill seen
+        # across days/clicks and never remove prior-day fills. Dedup re-reads by
+        # a signature whose date is NORMALISED (parsed → ISO) so a re-read with a
+        # different date-string format does not look like a new fill.
+        def _exec_dt(d: dict) -> datetime:
+            s = str(d.get("date", "")).strip()
+            for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y/%m/%d",
+                        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                try:
+                    return datetime.strptime(s, fmt)
+                except ValueError:
+                    continue
+            return datetime.min
 
-        prev_counts = Counter(self._rss_last_execs)
-        new_execs = []
+        def _sig(d: dict) -> str:
+            dt = _exec_dt(d)
+            dkey = dt.isoformat() if dt != datetime.min else str(d.get("date", "")).strip()
+            return (f"{dkey}|{d['code']}|{d['trade']}|"
+                    f"{d['qty']:.4f}|{d['price']:.4f}|{d['fee']:.2f}|{d['tax']:.2f}")
+
+        ledger_counts = Counter(_sig(e) for e in self._rss_ledger)
+        added_new: int = 0
         for ex in executions:
-            sig = _sig(ex)
-            if prev_counts.get(sig, 0) > 0:
-                prev_counts[sig] -= 1                 # already imported before
+            d = {"date": ex.date, "code": ex.code, "name": ex.name,
+                 "trade": ex.trade, "qty": ex.qty, "price": ex.price,
+                 "fee": ex.fee, "tax": ex.tax}
+            sig = _sig(d)
+            if ledger_counts.get(sig, 0) > 0:
+                ledger_counts[sig] -= 1               # already in the ledger
             else:
-                new_execs.append(ex)
+                self._rss_ledger.append(d)            # new fill → keep forever
+                added_new += 1
 
-        # Snapshot the full current list for the next diff (persisted).
-        self._rss_last_execs = [_sig(ex) for ex in executions]
+        # Sort the whole ledger chronologically for FIFO matching.
+        indexed = list(enumerate(self._rss_ledger))
+        indexed.sort(key=lambda p: (_exec_dt(p[1]), p[0]))
 
-        if not new_execs:
-            self._save_settings()
-            QtWidgets.QMessageBox.information(
-                self, "RSS取込",
-                "前回取込から新しい約定はありませんでした。",
-                QtWidgets.QMessageBox.Ok,
-            )
-            return
-
-        # Aggregate ONLY the new fills, per contract, for THIS batch. Previous
-        # RSS batches are kept as-is (not merged) so each entry stays separate.
-        agg: dict[tuple, dict] = {}
+        # Group parsed fills by contract (kind/month/CP/strike/mini).
+        groups: dict[tuple, list] = {}
         unparsed: list[str] = []
-        for ex in new_execs:
-            if ex.trade not in ("買建", "売建"):
-                continue                              # skip 転売 / 買戻 / others
-            info = parse_instrument(ex.name, ex.code)
+        for _, d in indexed:
+            info = parse_instrument(d["name"], d["code"])
             if info is None:
-                unparsed.append(ex.name)
+                unparsed.append(d["name"])
                 continue
-            sign: int = 1 if ex.trade == "買建" else -1
-            # Key by side too: a 売建 open and a 買建 open of the SAME contract are
-            # separate positions (a short and a long), so they must not net to
-            # zero. 買戻/転売 (closes) are skipped, so opposite opens stay distinct.
-            key = (info["kind"], info["yymm"], info["cp"], info["strike"], info["is_mini"], ex.trade)
-            a = agg.setdefault(key, {"net": 0.0, "abs_qty": 0.0, "abs_notional": 0.0, "fee": 0.0, "info": info})
-            a["net"] += sign * ex.qty
-            a["abs_qty"] += ex.qty
-            a["abs_notional"] += ex.qty * ex.price
-            a["fee"] += ex.fee + ex.tax          # 手数料 + 税金 (cost)
+            ckey = (info["kind"], info["yymm"], info["cp"], info["strike"], info["is_mini"])
+            groups.setdefault(ckey, []).append((d, info))
 
-        # New batch number (appended, previous RSS batches untouched).
-        self._rss_batch_seq += 1
-        batch: int = self._rss_batch_seq
+        # FIFO match per contract → position specs (open + closed lots).
+        specs: list[dict] = []
+        leftover: list[str] = []
+
+        def _fifo_close(queue, q: float, price: float, fpu: float,
+                        side_sign: int, info0: dict) -> float:
+            """Close q units FIFO from queue, appending 決済み specs; return leftover."""
+            while q > 0 and queue:
+                lot = queue[0]                        # [qty, price, fee_per_unit, entry_dt]
+                m = min(lot[0], q)
+                specs.append({
+                    "info": info0, "lots": side_sign * m,
+                    "entry_price": lot[1], "closed": True,
+                    "close_price": price, "fee": m * lot[2] + m * fpu,
+                    "entry_dt": lot[3],
+                })
+                lot[0] -= m
+                q -= m
+                if lot[0] <= 0:
+                    queue.popleft()
+            return q
+
+        for ckey, items in groups.items():
+            info0 = items[0][1]
+            longs: deque = deque()                    # [qty, price, fee_per_unit, entry_dt]
+            shorts: deque = deque()
+            for d, _info in items:
+                qty = d["qty"]
+                price = d["price"]
+                fpu = (d["fee"] + d["tax"]) / qty if qty else 0.0
+                dt = _exec_dt(d)
+                trade = d["trade"]
+                if trade == "買建":
+                    longs.append([qty, price, fpu, dt])
+                elif trade == "売建":
+                    shorts.append([qty, price, fpu, dt])
+                elif trade == "転売":                  # close long
+                    rem = _fifo_close(longs, qty, price, fpu, +1, info0)
+                    if rem > 0:
+                        leftover.append(f"{info0['raw']} 転売{rem:g}(対応建玉なし)")
+                elif trade == "買戻":                  # close short
+                    rem = _fifo_close(shorts, qty, price, fpu, -1, info0)
+                    if rem > 0:
+                        leftover.append(f"{info0['raw']} 買戻{rem:g}(対応建玉なし)")
+                # else (SQ決済 等) は無視
+            for lot in longs:
+                if lot[0] > 0:
+                    specs.append({"info": info0, "lots": lot[0], "entry_price": lot[1],
+                                  "closed": False, "close_price": 0.0, "fee": lot[0] * lot[2],
+                                  "entry_dt": lot[3]})
+            for lot in shorts:
+                if lot[0] > 0:
+                    specs.append({"info": info0, "lots": -lot[0], "entry_price": lot[1],
+                                  "closed": False, "close_price": 0.0, "fee": lot[0] * lot[2],
+                                  "entry_dt": lot[3]})
+
+        # Order specs by the OPEN fill's timestamp so each option and its hedge
+        # future (entered back-to-back) stay adjacent → the 合計損益 per-set
+        # column pairs option ↔ future correctly. Stable within equal times.
+        specs.sort(key=lambda sp: sp["entry_dt"])
+
+        # Replace RSS-imported rows, keep manual ones.
+        self.sim_positions = [p for p in self.sim_positions if not p.get("rss_imported")]
 
         added: int = 0
+        closed_n: int = 0
         skipped: list[str] = []
-        # Options first then futures within the batch, so the 合計損益 set-group
-        # (1 option + following future) pairs each batch's legs correctly.
-        ordered = sorted(
-            agg.items(),
-            key=lambda kv: 0 if kv[1]["info"]["kind"] == "option" else 1,
-        )
-        for key, a in ordered:
-            net = int(round(a["net"]))
-            if net == 0:
+        for spec in specs:
+            info = spec["info"]
+            lots = int(round(spec["lots"]))
+            if lots == 0:
                 continue
-            info = a["info"]
-            vwap = a["abs_notional"] / a["abs_qty"] if a["abs_qty"] else 0.0
-
             chain_symbol = self._find_chain_by_yymm(portfolio, info["yymm"])
             if not chain_symbol:
                 skipped.append(f"{info['raw']} (限月{info['yymm']}のチェーンなし)")
@@ -3595,6 +3777,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 skipped.append(f"{info['raw']} (チェーン取得失敗)")
                 continue
 
+            is_closed: bool = spec["closed"]
             if info["kind"] == "option":
                 option = self._find_option_by_strike(chain, info["cp"], info["strike"])
                 if option is None:
@@ -3608,8 +3791,8 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                     "kind": "option",
                     "cp": option.option_type,
                     "strike": option.strike_price,
-                    "lots": net,
-                    "entry_price": vwap,
+                    "lots": lots,
+                    "entry_price": spec["entry_price"],
                     "entry_iv": option.mid_impv,
                     "entry_underlying": entry_underlying,
                     "entry_tte": option.time_to_expiry,
@@ -3622,13 +3805,12 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                     "label": f"{info['cp']}{option.strike_price:.0f}",
                     "vt_symbol": option.vt_symbol,
                     "enabled": True,
-                    "closed": False,
-                    "close_price": 0.0,
-                    "fee": a["fee"],
+                    "closed": is_closed,
+                    "close_price": spec["close_price"],
+                    "fee": spec["fee"],
                     "rss_imported": True,
-                    "rss_batch": batch,
+                    "rss_batch": 0,
                 })
-                added += 1
             else:  # futures
                 underlying = chain.underlying
                 if underlying is None:
@@ -3643,10 +3825,10 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                     "kind": "futures",
                     "cp": 0,
                     "strike": 0,
-                    "lots": net,
-                    "entry_price": vwap,
+                    "lots": lots,
+                    "entry_price": spec["entry_price"],
                     "entry_iv": 0,
-                    "entry_underlying": vwap,
+                    "entry_underlying": spec["entry_price"],
                     "entry_tte": 0,
                     "entry_time": datetime.now().isoformat(),
                     "entry_delta": underlying.size * futures_multiplier,
@@ -3658,24 +3840,53 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                     "label": f"{futures_type} {chain_symbol.split('.')[0]}",
                     "vt_symbol": underlying.vt_symbol,
                     "enabled": True,
-                    "closed": False,
-                    "close_price": 0.0,
-                    "fee": a["fee"],
+                    "closed": is_closed,
+                    "close_price": spec["close_price"],
+                    "fee": spec["fee"],
                     "rss_imported": True,
-                    "rss_batch": batch,
+                    "rss_batch": 0,
                 })
-                added += 1
+            added += 1
+            if is_closed:
+                closed_n += 1
 
         self._refresh_sim_table()
         self._save_settings()
 
         # Summary
-        msg = f"バッチ #{batch}: 新規約定から {added} 件の建玉を追加しました。"
+        msg = (f"RSS約定を再構成: {added}件（うち決済み {closed_n}件）。\n"
+               f"今回読込 {len(executions)}件（新規 {added_new}件）/ 累計 {len(self._rss_ledger)}件を保持中。")
+        if leftover:
+            msg += "\n\n[対応建玉なしの決済 " + str(len(leftover)) + "件]\n" + "\n".join(leftover[:10])
         if skipped:
-            msg += "\n\n[未マッチ " + str(len(skipped)) + "件]\n" + "\n".join(skipped[:15])
+            msg += "\n\n[未マッチ " + str(len(skipped)) + "件]\n" + "\n".join(skipped[:10])
         if unparsed:
-            msg += "\n\n[銘柄名称の解析不可 " + str(len(unparsed)) + "件]\n" + "\n".join(unparsed[:15])
+            msg += "\n\n[銘柄名称の解析不可 " + str(len(unparsed)) + "件]\n" + "\n".join(unparsed[:10])
         QtWidgets.QMessageBox.information(self, "RSS取込", msg, QtWidgets.QMessageBox.Ok)
+
+    def _clear_rss_history(self) -> None:
+        """Clear the RSS execution ledger and remove all RSS-imported rows."""
+        n_ledger: int = len(self._rss_ledger)
+        n_rows: int = sum(1 for p in self.sim_positions if p.get("rss_imported"))
+        if n_ledger == 0 and n_rows == 0:
+            QtWidgets.QMessageBox.information(
+                self, "RSS履歴クリア", "クリアする履歴はありません。",
+                QtWidgets.QMessageBox.Ok,
+            )
+            return
+        reply = QtWidgets.QMessageBox.question(
+            self, "RSS履歴クリア",
+            f"RSS約定履歴 {n_ledger}件 と RSS取込行 {n_rows}件 を削除します。\n"
+            "よろしいですか？（手動追加した行は残ります）",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        self._rss_ledger = []
+        self.sim_positions = [p for p in self.sim_positions if not p.get("rss_imported")]
+        self._refresh_sim_table()
+        self._save_settings()
 
     def _remove_sim_row(self) -> None:
         row: int = self.sim_table.currentRow()
@@ -3741,7 +3952,8 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 # Fall back to the hand-input 現在値 when no live price (e.g.
                 # out of NK225_OP_STRIKE_SCOPE → no updates).
                 cur_price: float = (
-                    und.mid_price if und and und.mid_price
+                    self._snap_price(und.mid_price, "futures", fm < 1.0)
+                    if und and und.mid_price
                     else pos.get("manual_price", 0.0)
                 )
                 current_price_str = f"{cur_price:.0f}" if cur_price else ""
@@ -3757,7 +3969,8 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 # Fall back to the hand-input 現在値 when no live price (e.g.
                 # out of NK225_OP_STRIKE_SCOPE → no updates).
                 cur_price = (
-                    opt.mid_price if opt and opt.mid_price
+                    self._snap_price(opt.mid_price, "option")
+                    if opt and opt.mid_price
                     else pos.get("manual_price", 0.0)
                 )
                 current_price_str = f"{cur_price:.1f}" if cur_price else ""
@@ -3777,9 +3990,17 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             if closed:
                 pnl = (close_price - entry_price) * lots * size * fm
 
-            # Subtract commission + tax (手数料+税金) from the P&L. Fee is in yen
-            # while P&L is in 千円, so scale the fee by /1000.
+            # Estimated Rakuten trading fee (税込) for closing an OPEN position.
+            # Closed rows already have their actual close fee inside `fee`.
+            trade_fee: float = 0.0
+            if not closed:
+                est_price: float = cur_price if cur_price else entry_price
+                trade_fee = self._estimate_trade_fee_yen(pos, est_price)
+
+            # Subtract commission + tax (手数料+税金) and the estimated close fee
+            # from the P&L. Fees are in yen while P&L is in 千円, so scale /1000.
             pnl -= fee / 1000.0
+            pnl -= trade_fee / 1000.0
 
             if enabled:
                 if closed:
@@ -3804,7 +4025,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             theta_contrib: float = entry_theta * dt_days * lots
             vega_contrib: float = entry_vega * dv_pct * lots
 
-            has_pnl: bool = bool(cur_price or closed or fee)
+            has_pnl: bool = bool(cur_price or closed or fee or trade_fee)
             pnl_str: str = f"{pnl:.1f}" if has_pnl else ""
 
             # Track for the per-set columns (filled after the loop).
@@ -3930,6 +4151,16 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             )
             self.sim_table.setItem(row, 28, fee_item)
 
+            # Column 29: 取引手数料(税込) — estimated close fee (千円) for OPEN
+            # positions, already subtracted from 損益 / 合計損益.
+            tfee_item = QtWidgets.QTableWidgetItem(
+                f"{trade_fee / 1000.0:.3f}" if trade_fee else ""
+            )
+            tfee_item.setFlags(
+                QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable
+            )
+            self.sim_table.setItem(row, 29, tfee_item)
+
         # Per-set columns: a set = 1 option row + the 1 following futures row;
         # a lone option (next row is another option) is its own set; an orphan
         # futures row is its own set. Values are shown on the set's leading row.
@@ -3982,7 +4213,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             color = "color: #64ff64;"
         else:
             color = ""
-        self.sim_total_pnl_label.setText(f"合計損益: {total_pnl:.1f}")
+        self.sim_total_pnl_label.setText(f"合計損益: {total_pnl:.3f}")
         self.sim_total_pnl_label.setStyleSheet(f"font-weight: bold; font-size: 13px; {color}")
 
         # Update realized P&L label (実現損益)
@@ -3992,7 +4223,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             r_color = "color: #64ff64;"
         else:
             r_color = ""
-        self.sim_realized_pnl_label.setText(f"実現損益: {realized_pnl:.1f}")
+        self.sim_realized_pnl_label.setText(f"実現損益: {realized_pnl:.3f}")
         self.sim_realized_pnl_label.setStyleSheet(f"font-weight: bold; font-size: 13px; {r_color}")
 
         # Auto-size columns to content for a compact layout
@@ -4299,7 +4530,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
 
         # Read parameters
         price_range: int = self.price_range_spin.value()
-        step: int = int(self.step_combo.currentText())
+        step_sigma: float = self._step_sigma()
         days: int = self.days_spin.value()
         iv_per_1000: float = self.iv_sensitivity_spin.value()
         time_change: float = days / ANNUAL_DAYS
@@ -4360,11 +4591,9 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 greeks_data[gk]["day_same"].append(g_ds[gk])
                 greeks_data[gk]["day_adj"].append(g_da[gk])
 
-        # Step-level values for the results table
-        prices_step: np.ndarray = np.arange(
-            ref_price - price_range,
-            ref_price + price_range + step,
-            step,
+        # Step-level values for the results table (descending price grid)
+        price_levels: list[tuple[float, str]] = self._build_price_levels(
+            ref_price, None, None, price_range, step_sigma,
         )
 
         # Base Greeks at ref_price for Taylor decomposition (contributions)
@@ -4373,12 +4602,11 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         )
 
         table_data: list[dict] = []
-        for sim_price in prices_step:
-            sp: float = float(sim_price)
+        for sp, _lbl in price_levels:
             now, day_same, day_adj, expiry, _ = self._calculate_pnl_at_price(
                 portfolio, sp, ref_price, time_change, iv_per_1000
             )
-            iv_change_pct: float = iv_per_1000 * ((sim_price - ref_price) / 1000.0)
+            iv_change_pct: float = iv_per_1000 * ((sp - ref_price) / 1000.0)
 
             # Greek values at sim_price (current time, current IV)
             g_at_p, _, _ = self._calculate_portfolio_greeks_at_price(
@@ -4447,11 +4675,30 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             return
 
         price_range: int = self.price_range_spin.value()
-        step: int = int(self.step_combo.currentText())
+        step_sigma: float = self._step_sigma()
         days: int = self.days_spin.value()
-        iv_per_1000: float = self.iv_sensitivity_spin.value()
         time_change: float = days / ANNUAL_DAYS
         show_legs: bool = self.show_legs_check.isChecked()
+
+        # ATM-IV daily band basis (前日終値 & 日次ATM IV): drives the σ price grid
+        # and the interpretation of IV感応度 (%IV per +0.5σ).
+        tbl_symbol: str = positions[0]["chain_symbol"]
+        tbl_base: float | None = self._load_prev_day_close(tbl_symbol.split(".")[0])
+        tbl_chain = self.option_engine.get_portfolio(self.portfolio_name).chains.get(tbl_symbol)
+        tbl_div: float | None = (
+            tbl_chain.atm_impv / (252 ** 0.5) if tbl_chain and tbl_chain.atm_impv else None
+        )
+
+        # IV感応度 input = %IV per +0.5σ futures move → convert to the internal
+        # %/1000pt used by the P&L engine.
+        iv_sens: float = self.iv_sensitivity_spin.value()
+        if tbl_base and tbl_div:
+            price_per_half_sigma: float = 0.5 * tbl_div * tbl_base
+            iv_per_1000: float = (
+                iv_sens * 1000.0 / price_per_half_sigma if price_per_half_sigma else 0.0
+            )
+        else:
+            iv_per_1000 = iv_sens
 
         # Build leg labels from simulation positions
         leg_labels: dict[int, str] = {}
@@ -4504,11 +4751,10 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 greeks_data[gk]["day_same"].append(g_ds[gk])
                 greeks_data[gk]["day_adj"].append(g_da[gk])
 
-        # Step-level values for table
-        prices_step: np.ndarray = np.arange(
-            ref_price - price_range,
-            ref_price + price_range + step,
-            step,
+        # Result-table price rows: σ grid anchored at 前日終値, within
+        # [ref ± 価格範囲], stepped by ステップ(σ), descending, incl. 現在/前終.
+        price_levels: list[tuple[float, str]] = self._build_price_levels(
+            ref_price, tbl_base, tbl_div, price_range, step_sigma,
         )
 
         # Base Greeks at ref_price for Taylor decomposition (contributions)
@@ -4522,12 +4768,11 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         )
 
         table_data: list[dict] = []
-        for sim_price in prices_step:
-            sp: float = float(sim_price)
+        for sp, iv_level in price_levels:
             now, day_same, day_adj, expiry, _ = self._calculate_sim_pnl_at_price(
                 positions, sp, ref_price, time_change, iv_per_1000,
             )
-            iv_change_pct: float = iv_per_1000 * ((sim_price - ref_price) / 1000.0)
+            iv_change_pct: float = iv_per_1000 * ((sp - ref_price) / 1000.0)
 
             # Greek values at sim_price (current time, current IV)
             g_at_p, _, _ = self._calculate_sim_greeks_at_price(
@@ -4543,6 +4788,8 @@ class PayoffDiagramChart(QtWidgets.QWidget):
 
             table_data.append({
                 "price": sp,
+                "iv_level": iv_level,
+                "fut_diff": sp - ref_price,
                 "iv_change": iv_change_pct,
                 "pnl_now": now,
                 "pnl_day_same": day_same,
@@ -4581,6 +4828,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         sum_iv_diff: float = 0.0
         current_total_pnl: float = 0.0
         sum_fee: float = 0.0
+        sum_trade_fee: float = 0.0
         for pos in positions:
             lots: int = pos["lots"]
             size: int = pos["size"]
@@ -4593,27 +4841,34 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 fm: float = pos.get("futures_multiplier", 1.0)
                 und = pos.get("underlying_data")
                 cur_price: float = (
-                    und.mid_price if und and und.mid_price else manual_price
+                    self._snap_price(und.mid_price, "futures", fm < 1.0)
+                    if und and und.mid_price else manual_price
                 )
                 if cur_price:
                     current_total_pnl += (cur_price - entry_price) * lots * size * fm
                     if entry_price:
                         sum_fut_diff += cur_price - entry_price
+                sum_trade_fee += self._estimate_trade_fee_yen(
+                    pos, cur_price if cur_price else entry_price)
             else:
                 opt = pos.get("option_data")
                 cur_opt_price: float = (
-                    opt.mid_price if opt and opt.mid_price else manual_price
+                    self._snap_price(opt.mid_price, "option")
+                    if opt and opt.mid_price else manual_price
                 )
                 if cur_opt_price:
                     current_total_pnl += (cur_opt_price - entry_price) * lots * size
+                sum_trade_fee += self._estimate_trade_fee_yen(
+                    pos, cur_opt_price if cur_opt_price else entry_price)
                 entry_iv: float = pos.get("entry_iv", 0) or 0
                 cur_iv: float = (opt.mid_impv or 0) if opt else 0
                 if cur_iv and entry_iv:
                     sum_iv_diff += (cur_iv - entry_iv) * 100
 
-        # Subtract commission + tax so 現在損益 matches the table's 合計損益.
-        # Fee is in yen while P&L is in 千円, so scale by /1000.
+        # Subtract commission + tax and the estimated close fee so 現在損益
+        # matches the table's 合計損益. Fees are in yen, P&L in 千円 → /1000.
         current_total_pnl -= sum_fee / 1000.0
+        current_total_pnl -= sum_trade_fee / 1000.0
 
         # Base price (prev-day futures close) + ATM daily IV for vertical bands,
         # taken from the reference (first) position's chain.
@@ -4744,10 +4999,17 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             )
             return
 
+        # Convert the regression result (%IV / 1000pt) → %IV per +0.5σ using
+        # 前日終値 (base) and 日次ATM IV, to match the spinbox unit.
+        base = self._load_prev_day_close(chain_symbol.split(".")[0])
+        chain = self.option_engine.get_portfolio(self.portfolio_name).chains.get(chain_symbol)
+        div = chain.atm_impv / (252 ** 0.5) if chain and chain.atm_impv else None
+        value: float = est * (0.5 * div * base) / 1000.0 if (base and div) else est
+
         # Clamp into the spinbox range and apply.
         lo: float = self.iv_sensitivity_spin.minimum()
         hi: float = self.iv_sensitivity_spin.maximum()
-        self.iv_sensitivity_spin.setValue(max(lo, min(hi, est)))
+        self.iv_sensitivity_spin.setValue(max(lo, min(hi, value)))
         self._run_sim_analysis()
 
     @staticmethod
@@ -4896,7 +5158,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 current_pnl: float = current_pnl_value
             else:
                 current_pnl = float(np.interp(current_price, prices, pnl_now))
-            pnl_label: str = f"現在損益: {current_pnl:.0f}"
+            pnl_label: str = f"現在損益: {current_pnl:.3f}"
             if fut_diff is not None and iv_diff is not None:
                 pnl_label += f"  先物差: {fut_diff:+.0f}  IV差: {iv_diff:+.2f}"
             if base_price:
@@ -5254,8 +5516,10 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         else:
             greek_headers = ["Δ(千円/pt)", "Γ(千円/pt²)", "Θ(千円/day)", "V(千円/1%)", "IV値(%)"]
             contrib_headers = ["Δ寄与(千円)", "Γ寄与(千円)", "Θ寄与(千円)", "V寄与(千円)"]
+        # Sim mode adds an IV水準 label and 先物差 column after 原資産価格.
+        front_headers: list[str] = ["IV水準", "先物差"] if is_sim else []
         headers: list[str] = [
-            "原資産価格", "IV変動(%)",
+            "原資産価格", *front_headers, "IV変動(%)",
             "現在P&L", f"+{days}日(同IV)", f"+{days}日(IV変動)", "満期P&L",
             *greek_headers,
             *contrib_headers,
@@ -5265,37 +5529,34 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         self.result_table.setHorizontalHeaderLabels(headers)
 
         for row, data in enumerate(table_data):
-            values: list[str] = [
-                f"{data['price']:.0f}",
-                f"{data['iv_change']:+.1f}",
-                f"{data['pnl_now']:.1f}",
-                f"{data['pnl_day_same']:.1f}",
-                f"{data['pnl_day_adj']:.1f}",
-                f"{data['pnl_expiry']:.1f}",
-                f"{data['delta']:.2f}",
-                f"{data['gamma']:.6f}",
-                f"{data['theta']:.2f}",
-                f"{data['vega']:.2f}",
-                f"{data['iv_value']:+.2f}",
-            ]
+            # (text, coloured?) so colouring survives the optional extra columns.
+            cells: list[tuple[str, bool]] = [(f"{data['price']:.0f}", False)]
             if is_sim:
-                values.append(f"{data.get('entry_pnl', 0):.1f}")
-            values.extend([
-                f"{data['delta_contrib']:.1f}",
-                f"{data['gamma_contrib']:.1f}",
-                f"{data['theta_contrib']:.1f}",
-                f"{data['vega_contrib']:.1f}",
-            ])
-            # P&L and contribution columns get red/green colouring
-            pnl_cols: set[int] = {2, 3, 4, 5}
-            contrib_start: int = 12 if is_sim else 11
-            colour_cols: set[int] = pnl_cols | set(range(contrib_start, len(values)))
-            for col, val in enumerate(values):
+                cells.append((data.get("iv_level", ""), False))
+                cells.append((f"{data.get('fut_diff', 0):+.0f}", True))
+            cells.append((f"{data['iv_change']:+.1f}", False))
+            cells.append((f"{data['pnl_now']:.1f}", True))
+            cells.append((f"{data['pnl_day_same']:.1f}", True))
+            cells.append((f"{data['pnl_day_adj']:.1f}", True))
+            cells.append((f"{data['pnl_expiry']:.1f}", True))
+            cells.append((f"{data['delta']:.2f}", False))
+            cells.append((f"{data['gamma']:.6f}", False))
+            cells.append((f"{data['theta']:.2f}", False))
+            cells.append((f"{data['vega']:.2f}", False))
+            cells.append((f"{data['iv_value']:+.2f}", False))
+            if is_sim:
+                cells.append((f"{data.get('entry_pnl', 0):.1f}", False))
+            cells.append((f"{data['delta_contrib']:.1f}", True))
+            cells.append((f"{data['gamma_contrib']:.1f}", True))
+            cells.append((f"{data['theta_contrib']:.1f}", True))
+            cells.append((f"{data['vega_contrib']:.1f}", True))
+
+            for col, (val, coloured) in enumerate(cells):
                 item: QtWidgets.QTableWidgetItem = QtWidgets.QTableWidgetItem(val)
                 item.setTextAlignment(
                     QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter
                 )
-                if col in colour_cols:
+                if coloured:
                     try:
                         num: float = float(val)
                         if num > 0:
