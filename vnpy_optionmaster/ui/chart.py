@@ -2855,7 +2855,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         # stretch=1 and absorbs all the extra vertical space, so the table
         # stays at its small content-based size hint. setMinimumHeight forces
         # the layout to give it the space. (600 = triple the original 200.)
-        self.sim_table.setMinimumHeight(675)
+        self.sim_table.setMinimumHeight(1013)
         # Reduce cell padding for a tighter layout
         self.sim_table.setStyleSheet(
             "QTableWidget::item { padding: 0px 2px; }"
