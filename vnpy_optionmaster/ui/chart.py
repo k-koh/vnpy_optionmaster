@@ -2810,7 +2810,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             "Δ寄与", "Γ寄与", "Θ寄与", "V寄与",
             "建Δ", "建Γ", "建Θ", "建V",
             "現Δ", "現Γ", "現Θ", "現V",
-            "決済済", "決済値",
+            "決済済", "決済値", "手数料",
         ]
         self.sim_table: QtWidgets.QTableWidget = QtWidgets.QTableWidget(0, len(sim_table_headers))
         self.sim_table.setHorizontalHeaderLabels(sim_table_headers)
@@ -3133,6 +3133,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 "close_price": pos.get("close_price", 0.0),
                 "manual_price": pos.get("manual_price", 0.0),
                 "label": pos["label"],
+                "fee": pos.get("fee", 0.0),
                 "rss_imported": pos.get("rss_imported", False),
                 "rss_batch": pos.get("rss_batch", 0),
             })
@@ -3230,6 +3231,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 "manual_price": pos_data.get("manual_price", 0.0),
                 "label": pos_data["label"],
                 "vt_symbol": vt_symbol,
+                "fee": pos_data.get("fee", 0.0),
                 "rss_imported": pos_data.get("rss_imported", False),
                 "rss_batch": pos_data.get("rss_batch", 0),
             })
@@ -3559,10 +3561,11 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             # separate positions (a short and a long), so they must not net to
             # zero. 買戻/転売 (closes) are skipped, so opposite opens stay distinct.
             key = (info["kind"], info["yymm"], info["cp"], info["strike"], info["is_mini"], ex.trade)
-            a = agg.setdefault(key, {"net": 0.0, "abs_qty": 0.0, "abs_notional": 0.0, "info": info})
+            a = agg.setdefault(key, {"net": 0.0, "abs_qty": 0.0, "abs_notional": 0.0, "fee": 0.0, "info": info})
             a["net"] += sign * ex.qty
             a["abs_qty"] += ex.qty
             a["abs_notional"] += ex.qty * ex.price
+            a["fee"] += ex.fee + ex.tax          # 手数料 + 税金 (cost)
 
         # New batch number (appended, previous RSS batches untouched).
         self._rss_batch_seq += 1
@@ -3621,6 +3624,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                     "enabled": True,
                     "closed": False,
                     "close_price": 0.0,
+                    "fee": a["fee"],
                     "rss_imported": True,
                     "rss_batch": batch,
                 })
@@ -3656,6 +3660,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                     "enabled": True,
                     "closed": False,
                     "close_price": 0.0,
+                    "fee": a["fee"],
                     "rss_imported": True,
                     "rss_batch": batch,
                 })
@@ -3718,6 +3723,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             enabled: bool = pos.get("enabled", True)
             closed: bool = pos.get("closed", False)
             close_price: float = pos.get("close_price", 0.0)
+            fee: float = pos.get("fee", 0.0)          # 手数料 + 税金 (cost)
 
             # Current greeks
             cur_delta: float = 0
@@ -3771,6 +3777,10 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             if closed:
                 pnl = (close_price - entry_price) * lots * size * fm
 
+            # Subtract commission + tax (手数料+税金) from the P&L. Fee is in yen
+            # while P&L is in 千円, so scale the fee by /1000.
+            pnl -= fee / 1000.0
+
             if enabled:
                 if closed:
                     realized_pnl += pnl
@@ -3794,10 +3804,11 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             theta_contrib: float = entry_theta * dt_days * lots
             vega_contrib: float = entry_vega * dv_pct * lots
 
-            pnl_str: str = f"{pnl:.1f}" if (cur_price or closed) else ""
+            has_pnl: bool = bool(cur_price or closed or fee)
+            pnl_str: str = f"{pnl:.1f}" if has_pnl else ""
 
             # Track for the per-set columns (filled after the loop).
-            row_pnls.append(pnl if (cur_price or closed) else 0.0)
+            row_pnls.append(pnl if has_pnl else 0.0)
             is_futures_row: bool = pos["kind"] == "futures"
             row_is_option.append(not is_futures_row)
             if is_futures_row and cur_price:
@@ -3910,6 +3921,14 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 | QtCore.Qt.ItemFlag.ItemIsEditable
             )
             self.sim_table.setItem(row, 27, close_val_item)
+
+            # Column 28: 手数料 (手数料+税金) in 千円 — read-only cost, already
+            # subtracted from the 損益 / 合計損益 columns.
+            fee_item = QtWidgets.QTableWidgetItem(f"{fee / 1000.0:.3f}" if fee else "")
+            fee_item.setFlags(
+                QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable
+            )
+            self.sim_table.setItem(row, 28, fee_item)
 
         # Per-set columns: a set = 1 option row + the 1 following futures row;
         # a lone option (next row is another option) is its own set; an orphan
@@ -4561,10 +4580,12 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         sum_fut_diff: float = 0.0
         sum_iv_diff: float = 0.0
         current_total_pnl: float = 0.0
+        sum_fee: float = 0.0
         for pos in positions:
             lots: int = pos["lots"]
             size: int = pos["size"]
             entry_price: float = pos.get("entry_price", 0) or 0
+            sum_fee += pos.get("fee", 0.0)          # 手数料 + 税金 (cost)
             # Fall back to the hand-input 現在値 (manual_price) when no live
             # price (e.g. out of NK225_OP_STRIKE_SCOPE → no updates).
             manual_price: float = pos.get("manual_price", 0.0) or 0.0
@@ -4589,6 +4610,10 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 cur_iv: float = (opt.mid_impv or 0) if opt else 0
                 if cur_iv and entry_iv:
                     sum_iv_diff += (cur_iv - entry_iv) * 100
+
+        # Subtract commission + tax so 現在損益 matches the table's 合計損益.
+        # Fee is in yen while P&L is in 千円, so scale by /1000.
+        current_total_pnl -= sum_fee / 1000.0
 
         # Base price (prev-day futures close) + ATM daily IV for vertical bands,
         # taken from the reference (first) position's chain.

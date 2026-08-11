@@ -35,6 +35,8 @@ class RssExecution:
     trade: str          # 取引: 買建 / 売建 / 転売 / 買戻 ...
     qty: float          # 約定数量
     price: float        # 約定単価
+    fee: float          # 手数料
+    tax: float          # 税金
 
 
 def _attach_running_excel():
@@ -215,6 +217,8 @@ def _parse_block(values) -> list[RssExecution]:
             trade=trade_str,
             qty=_to_float(cell(row, "約定数量")),
             price=_to_float(cell(row, "約定単価")),
+            fee=_to_float(cell(row, "手数料")),
+            tax=_to_float(cell(row, "税金")),
         ))
     return execs
 
