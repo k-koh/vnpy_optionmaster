@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt             # noqa
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas  # noqa
 from matplotlib.figure import Figure        # noqa
 from matplotlib.patches import Patch        # noqa
+from matplotlib.transforms import blended_transform_factory  # noqa
 from mpl_toolkits.mplot3d import Axes3D     # noqa
 from pylab import mpl                       # noqa
 
@@ -1728,6 +1729,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             "show_envelope": self.envelope_check.isChecked(),
             "show_skew": self.skew_check.isChecked(),
             "show_pinned": self.pinned_check.isChecked(),
+            "show_current_price": self.current_price_check.isChecked(),
             "interval": self.interval_combo.currentText(),
             "auto_refresh": self.auto_refresh_check.isChecked(),
             "refresh_interval": self.refresh_interval_spin.value(),
@@ -1746,15 +1748,23 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self.envelope_check.setChecked(data.get("show_envelope", False))
         self.skew_check.setChecked(data.get("show_skew", False))
         self.pinned_check.setChecked(data.get("show_pinned", False))
+        self.current_price_check.setChecked(data.get("show_current_price", True))
         self.interval_combo.setCurrentText(data.get("interval", "4H"))
         self.refresh_interval_spin.setValue(data.get("refresh_interval", 5))
         # Setting this checked starts the timer via _on_auto_refresh_toggled.
         self.auto_refresh_check.setChecked(data.get("auto_refresh", False))
 
     def _on_auto_refresh_toggled(self, checked: bool) -> None:
-        """Start/stop the auto-refresh timer when the checkbox is toggled."""
+        """Start/stop the auto-refresh timer when the checkbox is toggled.
+
+        When turned on while the window is visible, refresh immediately so the
+        chart (and 最終更新 stamp) update right away instead of waiting a full
+        interval. (During startup the widget is hidden, so we only arm the
+        timer — the visibility gate in _auto_refresh handles the rest.)"""
         if checked:
             self._refresh_timer.start(self.refresh_interval_spin.value() * 60 * 1000)
+            if self.isVisible():
+                self.run_analysis(show_warnings=False)
         else:
             self._refresh_timer.stop()
 
@@ -1773,6 +1783,16 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         """Apply a new interval immediately if auto-refresh is active."""
         if self.auto_refresh_check.isChecked():
             self._refresh_timer.start(minutes * 60 * 1000)
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        """The window instance is reused (the menu button just calls .show()),
+        and closeEvent stops the refresh timer — so restart it here whenever the
+        window is (re)opened while 自動更新 is on, and refresh immediately so it
+        isn't left showing a stale 最終更新 time."""
+        super().showEvent(event)
+        if self.auto_refresh_check.isChecked():
+            self._refresh_timer.start(self.refresh_interval_spin.value() * 60 * 1000)
+            self.run_analysis(show_warnings=False)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._refresh_timer.stop()
@@ -1822,6 +1842,12 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self.skew_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("スキュー")
         self.pinned_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("ピン留め(固定行使価格)")
 
+        # Futures current-value line + right-edge price tag (like 株価チャット).
+        self.current_price_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("現在値")
+        self.current_price_check.setChecked(True)
+        self.current_price_check.setToolTip("先物の現在値に水平線と価格ラベルを表示")
+        self.current_price_check.toggled.connect(self.run_analysis)
+
         # Auto-refresh: interval (minutes) + enable checkbox, before 更新 button
         self.refresh_interval_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
         self.refresh_interval_spin.setMinimum(1)
@@ -1861,6 +1887,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         hbox.addWidget(self.envelope_check)
         hbox.addWidget(self.skew_check)
         hbox.addWidget(self.pinned_check)
+        hbox.addWidget(self.current_price_check)
         hbox.addWidget(self.refresh_interval_spin)
         hbox.addWidget(self.auto_refresh_check)
         hbox.addWidget(button)
@@ -2518,6 +2545,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 price = futures_prices.get(d, float("nan"))
                 futures_values.append(price)
 
+        ax2 = None
         if futures_ohlc and any(d in futures_ohlc for d in date_labels):
             ax2 = ax.twinx()
             # Render the futures candlesticks BEHIND the IV lines: drop the twin
@@ -2583,6 +2611,30 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             ax2.set_ylabel("先物価格", color="#66ff66")
             ax2.tick_params(axis="y", labelcolor="#66ff66")
             ax2.legend(loc="upper right", fontsize=8, framealpha=0.7)
+
+        # Futures current-value: horizontal line + right-edge price tag on the
+        # secondary axis (like 株価チャット's 現在値). Toggled by the checkbox.
+        if ax2 is not None and self.current_price_check.isChecked():
+            last_futures_price: float | None = None
+            for d in reversed(date_labels):
+                v = futures_prices.get(d)
+                if v is not None and not (isinstance(v, float) and np.isnan(v)):
+                    last_futures_price = v
+                    break
+            if last_futures_price is not None:
+                ax2.axhline(
+                    y=last_futures_price, color="#66ff66",
+                    linestyle=(0, (4, 3)), linewidth=1.0, alpha=0.9, zorder=6,
+                )
+                tag_trans = blended_transform_factory(ax2.transAxes, ax2.transData)
+                ax2.text(
+                    0.999, last_futures_price, f"{last_futures_price:,.0f}",
+                    transform=tag_trans, color="black", fontsize=9,
+                    fontweight="bold", va="center", ha="right", zorder=7,
+                    clip_on=False,
+                    bbox=dict(boxstyle="round,pad=0.18", fc="#66ff66",
+                              ec="none", alpha=0.95),
+                )
 
         n_dates: int = len(date_labels)
 
