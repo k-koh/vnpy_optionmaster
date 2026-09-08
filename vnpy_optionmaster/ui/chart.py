@@ -1806,7 +1806,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self.days_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
         self.days_spin.setMinimum(3)
         self.days_spin.setMaximum(90)
-        self.days_spin.setValue(45)
+        self.days_spin.setValue(14)
         self.days_spin.setSuffix("日")
 
         self.month_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
@@ -1822,20 +1822,6 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self.delta_combo.addItem("全デルタ")
         for label, _delta, _color in self.DELTA_TARGETS:
             self.delta_combo.addItem(label)
-
-        self.ymin_spin: QtWidgets.QDoubleSpinBox = QtWidgets.QDoubleSpinBox()
-        self.ymin_spin.setMinimum(0)
-        self.ymin_spin.setMaximum(200)
-        self.ymin_spin.setValue(0)
-        self.ymin_spin.setSuffix("%")
-        self.ymin_spin.setDecimals(1)
-
-        self.ymax_spin: QtWidgets.QDoubleSpinBox = QtWidgets.QDoubleSpinBox()
-        self.ymax_spin.setMinimum(0)
-        self.ymax_spin.setMaximum(200)
-        self.ymax_spin.setValue(0)
-        self.ymax_spin.setSuffix("%")
-        self.ymax_spin.setDecimals(1)
 
         self.decay_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("理論減衰")
         self.envelope_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("残像")
@@ -1878,10 +1864,6 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         hbox.addWidget(self.interval_combo)
         hbox.addWidget(QtWidgets.QLabel("デルタ"))
         hbox.addWidget(self.delta_combo)
-        hbox.addWidget(QtWidgets.QLabel("Y軸min"))
-        hbox.addWidget(self.ymin_spin)
-        hbox.addWidget(QtWidgets.QLabel("max"))
-        hbox.addWidget(self.ymax_spin)
         hbox.addStretch()
         hbox.addWidget(self.decay_check)
         hbox.addWidget(self.envelope_check)
@@ -2240,10 +2222,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         futures_prices: dict[str, float] = {d: v[3] for d, v in futures_ohlc.items()}
 
         delta_selection: str = self.delta_combo.currentText()
-        ymin: float = self.ymin_spin.value()
-        ymax: float = self.ymax_spin.value()
         self.update_chart(
-            date_labels, series, delta_selection, ymin, ymax,
+            date_labels, series, delta_selection,
             futures_prices, pinned_series, anchor_symbols, futures_ohlc,
         )
 
@@ -2252,8 +2232,6 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         date_labels: list[str],
         series: dict[str, list[float]],
         delta_selection: str,
-        ymin: float,
-        ymax: float,
         futures_prices: dict[str, float] | None = None,
         pinned_series: dict[str, list[float]] | None = None,
         anchor_symbols: dict[str, str] | None = None,
@@ -2529,14 +2507,6 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     for v in skew_series.get(lbl, []) if not np.isnan(v)
                 ]
                 _tight_ylim(ax_skew, all_vals)
-
-        if ymin > 0 or ymax > 0:
-            if ymin > 0 and ymax > 0 and ymax > ymin:
-                ax.set_ylim(ymin, ymax)
-            elif ymin > 0:
-                ax.set_ylim(bottom=ymin)
-            elif ymax > 0:
-                ax.set_ylim(top=ymax)
 
         # Plot futures price on secondary Y-axis as daily OHLC candlesticks.
         futures_values: list[float] = []
