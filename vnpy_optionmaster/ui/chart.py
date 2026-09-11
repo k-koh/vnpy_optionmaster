@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 from collections import Counter, deque
+import copy
 import os
 import re
 import math
@@ -1263,6 +1264,13 @@ def _load_option_bars_with_today(days: int) -> list[BarData]:
     return daily_bars
 
 
+def _bucket_floor(dt: datetime, hours: int) -> datetime:
+    """Floor a datetime to the start of its `hours`-hour bucket."""
+    return dt.replace(
+        hour=dt.hour - dt.hour % hours, minute=0, second=0, microsecond=0
+    )
+
+
 def _extract_month(bar: BarData) -> str:
     """シンボル(例: nk-2604-C-35000)から限月部分を抽出"""
     parts: list[str] = bar.symbol.split("-")
@@ -1718,6 +1726,23 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self._cursor_ax = None
         self._cursor_cid = None
 
+        # Incremental refresh caches (see _load_daily_option_bars). A full
+        # refresh re-reads every bar in 期間; 自動更新 keeps what it already
+        # aggregated and re-reads only the newest bars.
+        self._daily_key: int | None = None
+        self._daily_bars: dict[str, dict[str, BarData]] = {}
+        self._fallback_bars: dict[str, BarData] = {}
+        self._fallback_dt: datetime | None = None
+        self._daily_dt: datetime | None = None
+        self._fut_key: tuple | None = None
+        self._fut_buckets: dict[str, dict] = {}
+        self._pin_key: tuple | None = None
+        self._pin_buckets: dict[str, dict[str, BarData]] = {}
+        self._pin_dt: datetime | None = None
+        self._ohlc_key: tuple | None = None
+        self._ohlc: dict[str, tuple[float, float, float, float]] = {}
+        self._ohlc_dt: datetime | None = None
+
         self.init_ui()
         self._load_settings()
 
@@ -1764,7 +1789,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         if checked:
             self._refresh_timer.start(self.refresh_interval_spin.value() * 60 * 1000)
             if self.isVisible():
-                self.run_analysis(show_warnings=False)
+                self.run_analysis(show_warnings=False, incremental=True)
         else:
             self._refresh_timer.stop()
 
@@ -1774,10 +1799,14 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         The widget is constructed (hidden) at OptionMaster start, so the
         restored 自動更新 setting can start the timer before the chart is ever
         opened. Skip when not visible, and never pop modal warnings for a
-        background refresh (e.g. month = 全て with an intraday 時間足)."""
+        background refresh (e.g. month = 全て with an intraday 時間足).
+
+        incremental=True so the tick only reads the bars recorded since the
+        previous refresh instead of re-reading (and re-aggregating) all of
+        期間 on the GUI thread. 更新 stays a full reload."""
         if not self.isVisible():
             return
-        self.run_analysis(show_warnings=False)
+        self.run_analysis(show_warnings=False, incremental=True)
 
     def _on_refresh_interval_changed(self, minutes: int) -> None:
         """Apply a new interval immediately if auto-refresh is active."""
@@ -1792,7 +1821,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         super().showEvent(event)
         if self.auto_refresh_check.isChecked():
             self._refresh_timer.start(self.refresh_interval_spin.value() * 60 * 1000)
-            self.run_analysis(show_warnings=False)
+            self.run_analysis(show_warnings=False, incremental=True)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._refresh_timer.stop()
@@ -1993,13 +2022,28 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         return pinned_series, anchor_symbols
 
     def _build_intraday_pinned(
-        self, month: str, days: int, hours: int, date_labels: list[str]
+        self, month: str, days: int, hours: int, date_labels: list[str],
+        incremental: bool = False,
     ) -> tuple[dict[str, list[float]], dict[str, str]]:
         """Pinned (固定行使価格) series for intraday, from the 15m per-strike
         option bars, bucketed to the chosen `hours`-hour interval and aligned to
-        date_labels (the futures-based main-series buckets)."""
+        date_labels (the futures-based main-series buckets).
+
+        This is by far the heaviest query in the window (every strike of 期間 at
+        15m). Each bucket only keeps the latest bar per contract, so merging is
+        idempotent: an incremental refresh reads from the newest bar already
+        merged and leaves the closed buckets alone."""
         now: datetime = datetime.now(DB_TZ)
-        start: datetime = now - timedelta(days=days)
+        key: tuple = (month, days, hours)
+
+        if not incremental or key != self._pin_key:
+            self._pin_key = key
+            self._pin_buckets = {}
+            self._pin_dt = None
+            start: datetime = now - timedelta(days=days)
+        else:
+            start = self._pin_dt or (now - timedelta(days=days))
+
         database: BaseDatabase = get_database()
         bars: list[BarData] = database.load_option_data(
             symbol="", exchange=Exchange.JPX,
@@ -2009,26 +2053,45 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
 
         # Bucket by N-hour; keep the LATEST 15m bar per contract in each bucket.
         # (load_option_data orders by symbol, not datetime, so compare dt.)
-        bucket_syms: dict[str, dict[str, BarData]] = {}
+        bucket_syms: dict[str, dict[str, BarData]] = self._pin_buckets
         for bar in month_bars:
             if bar.iv <= 0 or bar.delta == 0 or not bar.symbol:
                 continue
-            bh: int = bar.datetime.hour - bar.datetime.hour % hours
-            key: str = bar.datetime.replace(
-                hour=bh, minute=0, second=0, microsecond=0
-            ).strftime("%Y-%m-%d %H:%M")
-            syms = bucket_syms.setdefault(key, {})
+            bucket_key: str = _bucket_floor(bar.datetime, hours).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            syms = bucket_syms.setdefault(bucket_key, {})
             prev = syms.get(bar.symbol)
             if prev is None or bar.datetime > prev.datetime:
                 syms[bar.symbol] = bar
+            if self._pin_dt is None or bar.datetime > self._pin_dt:
+                self._pin_dt = bar.datetime
+
+        if self._pin_dt is None:
+            # No 15m option bars anywhere in 期間: remember that, so the next
+            # tick asks for the tail only instead of rescanning the window.
+            self._pin_dt = now - timedelta(hours=hours)
+
+        self._prune_buckets(
+            bucket_syms, _bucket_floor(now - timedelta(days=days), hours)
+        )
 
         date_bars: dict[str, list[BarData]] = {
             k: list(v.values()) for k, v in bucket_syms.items()
         }
         return self._anchor_and_follow(date_bars, date_labels)
 
+    @staticmethod
+    def _prune_buckets(buckets: dict[str, dict], cutoff: datetime) -> None:
+        """Drop cached buckets that have scrolled out of 期間.
+
+        Bucket keys are "%Y-%m-%d %H:%M", so a string compare orders them."""
+        cutoff_key: str = cutoff.strftime("%Y-%m-%d %H:%M")
+        for stale in [k for k in buckets if k < cutoff_key]:
+            del buckets[stale]
+
     def _build_intraday_series(
-        self, month: str, days: int, hours: int
+        self, month: str, days: int, hours: int, incremental: bool = False
     ) -> tuple[list[str], dict[str, list[float]], dict[str, tuple[float, float, float, float]]]:
         """Resample futures minute-bar IV to `hours`-hour buckets.
 
@@ -2036,27 +2099,43 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         bars (the only intraday IV available). Returns (labels, series,
         futures_ohlc), where series keys match the ATM / Put Δ0.10 / Call Δ0.10
         DELTA_TARGETS and IVs are annualized %.
+
+        A bucket's OHLC depends on every minute inside it, so an incremental
+        refresh discards just the newest (still forming) bucket and re-reads
+        the minutes from its start — the closed buckets are reused as-is.
         """
         symbol: str = f"nk-{month}"
         now: datetime = datetime.now(DB_TZ)
-        start: datetime = now - timedelta(days=days)
+        cache_key: tuple = (symbol, days, hours)
+
+        if not incremental or cache_key != self._fut_key:
+            self._fut_key = cache_key
+            self._fut_buckets = {}
+            start: datetime = now - timedelta(days=days)
+        elif self._fut_buckets:
+            newest: str = max(self._fut_buckets)
+            start = self._fut_buckets[newest]["dt"]
+            del self._fut_buckets[newest]
+        else:
+            start = now - timedelta(days=days)
+
         database: BaseDatabase = get_database()
         bars: list[BarData] = database.load_bar_data(
             symbol=symbol, exchange=Exchange.JPX,
             interval=Interval.MINUTE, start=start, end=now,
         )
-        if not bars:
+        if not bars and not self._fut_buckets:
             return [], {}, {}
 
         # Bucket by N-hour floor; keep OHLC + the bucket's last IV snapshot.
-        buckets: dict[str, dict] = {}
+        buckets: dict[str, dict] = self._fut_buckets
         for bar in bars:
-            bh: int = bar.datetime.hour - bar.datetime.hour % hours
-            bdt = bar.datetime.replace(hour=bh, minute=0, second=0, microsecond=0)
+            bdt: datetime = _bucket_floor(bar.datetime, hours)
             key: str = bdt.strftime("%Y-%m-%d %H:%M")
             b = buckets.get(key)
             if b is None:
                 buckets[key] = {
+                    "dt": bdt,
                     "o": bar.open_price, "h": bar.high_price,
                     "l": bar.low_price, "c": bar.close_price,
                     "atm": bar.atm_iv, "ep": bar.eris_p_iv, "ec": bar.eris_c_iv,
@@ -2072,6 +2151,10 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     b["ep"] = bar.eris_p_iv
                 if bar.eris_c_iv:
                     b["ec"] = bar.eris_c_iv
+
+        self._prune_buckets(buckets, _bucket_floor(now - timedelta(days=days), hours))
+        if not buckets:
+            return [], {}, {}
 
         labels: list[str] = sorted(buckets.keys())
 
@@ -2094,7 +2177,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         return labels, series, futures_ohlc
 
     def _load_futures_daily_ohlc(
-        self, month: str, days: int
+        self, month: str, days: int, incremental: bool = False
     ) -> dict[str, tuple[float, float, float, float]]:
         """Load futures 1-min bars for nk-{month} and aggregate to daily OHLC.
 
@@ -2102,11 +2185,22 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         {"2026-04-08": (57000.0, 57400.0, 56800.0, 57250.0)}.
         Night session (17:00+) belongs to the next day's session, so a session
         spans from the previous day 17:00 to that day's ~15:40 close.
+
+        Aggregation is a running max/min/last, so an incremental refresh just
+        keeps folding the newest minutes into the cached sessions.
         """
         symbol: str = f"nk-{month}"
         now: datetime = datetime.now(DB_TZ)
-        start: datetime = now - timedelta(days=days)
+        cache_key: tuple = (symbol, days)
         end: datetime = now
+
+        if not incremental or cache_key != self._ohlc_key or not self._ohlc:
+            self._ohlc_key = cache_key
+            self._ohlc = {}
+            self._ohlc_dt = None
+            start: datetime = now - timedelta(days=days)
+        else:
+            start = self._ohlc_dt or (now - timedelta(days=days))
 
         database: BaseDatabase = get_database()
         bars: list[BarData] = database.load_bar_data(
@@ -2119,8 +2213,10 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
 
         # Bars come sorted ascending, so within a session the first bar gives
         # the open and the last gives the close.
-        ohlc: dict[str, tuple[float, float, float, float]] = {}
+        ohlc: dict[str, tuple[float, float, float, float]] = self._ohlc
         for bar in bars:
+            if self._ohlc_dt is None or bar.datetime > self._ohlc_dt:
+                self._ohlc_dt = bar.datetime
             if bar.datetime.hour >= 17:
                 session_dt = bar.datetime + timedelta(days=1)
             else:
@@ -2141,6 +2237,10 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     bar.close_price,
                 )
 
+        cutoff: str = (now - timedelta(days=days)).strftime("%Y-%m-%d")
+        for stale in [d for d in ohlc if d < cutoff]:
+            del ohlc[stale]
+
         return ohlc
 
     def _load_futures_daily_close(
@@ -2152,34 +2252,159 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             for d, ohlc in self._load_futures_daily_ohlc(month, days).items()
         }
 
-    def run_analysis(self, *_args, show_warnings: bool = True) -> None:
+    def _load_daily_option_bars(
+        self, days: int, incremental: bool
+    ) -> list[BarData]:
+        """Option DAILY bars of 期間, reusing what previous refreshes loaded.
+
+        Same result as _load_option_bars_with_today(days), but cached: a closed
+        session's DAILY bar never changes, so an incremental (自動更新) refresh
+        re-reads only
+
+          * DAILY bars newer than the newest one already cached (normally just
+            the current session, once the recorder writes it), and
+          * the MINUTE fallback bars recorded since the previous refresh — only
+            the newest bar per contract is used, so re-reading minutes that
+            were already folded in is pure waste.
+
+        Real DAILY bars and the MINUTE fallback are kept apart so the fallback
+        can keep being replaced until the session's own DAILY bar shows up.
+        """
+        now: datetime = datetime.now(DB_TZ)
+        # 17:00以降はナイトセッション開始 = 翌営業日のデータ
+        session_date: datetime = now + timedelta(days=1) if now.hour >= 17 else now
+        session_str: str = session_date.strftime("%Y-%m-%d")
+        # DAILYバーは翌日15:45で保存されるため、endを翌日末まで拡張
+        end: datetime = session_date.replace(
+            hour=23, minute=59, second=59, microsecond=0
+        )
+
+        full: bool = not incremental or self._daily_key != days
+        if full:
+            self._daily_key = days
+            self._daily_bars = {}
+            self._daily_dt = None
+            self._fallback_bars = {}
+            self._fallback_dt = None
+            start: datetime = now - timedelta(days=days)
+        else:
+            start = self._daily_dt or (now - timedelta(days=days))
+
+        database: BaseDatabase = get_database()
+        for bar in database.load_option_data(
+            symbol="",
+            exchange=Exchange.JPX,
+            interval=Interval.DAILY,
+            start=start,
+            end=end,
+        ):
+            self._daily_bars.setdefault(
+                bar.datetime.strftime("%Y-%m-%d"), {}
+            )[bar.symbol] = bar
+            if self._daily_dt is None or bar.datetime > self._daily_dt:
+                self._daily_dt = bar.datetime
+
+        cutoff: str = (now - timedelta(days=days)).strftime("%Y-%m-%d")
+        for stale in [d for d in self._daily_bars if d < cutoff]:
+            del self._daily_bars[stale]
+
+        # 現在のセッション日のDAILYバーが無ければMINUTEバーで補完する
+        if session_str not in self._daily_bars:
+            self._merge_minute_fallback(now, full)
+        else:
+            self._fallback_bars = {}
+            self._fallback_dt = None
+
+        bars: list[BarData] = []
+        for date_key in sorted(self._daily_bars):
+            bars.extend(self._daily_bars[date_key].values())
+
+        if self._fallback_bars:
+            # セッション日の15:45として統一（キャッシュ側は元のdatetimeを保つ）
+            session_dt: datetime = session_date.replace(
+                hour=15, minute=45, second=0, microsecond=0
+            )
+            for bar in self._fallback_bars.values():
+                stamped: BarData = copy.copy(bar)
+                stamped.datetime = session_dt
+                stamped.interval = Interval.DAILY
+                bars.append(stamped)
+
+        return bars
+
+    def _merge_minute_fallback(self, now: datetime, full: bool) -> None:
+        """Keep the newest MINUTE bar per contract for the current session.
+
+        On a full refresh this reads from the night-session open (17:00); on an
+        incremental one it reads only from the newest bar already merged."""
+        if full or self._fallback_dt is None:
+            base: datetime = now if now.hour >= 17 else now - timedelta(days=1)
+            start: datetime = base.replace(
+                hour=17, minute=0, second=0, microsecond=0
+            )
+            self._fallback_bars = {}
+        else:
+            start = self._fallback_dt
+
+        for bar in get_database().load_option_data(
+            symbol="",
+            exchange=Exchange.JPX,
+            interval=Interval.MINUTE,
+            start=start,
+            end=now,
+        ):
+            existing = self._fallback_bars.get(bar.symbol)
+            if existing is None or bar.datetime > existing.datetime:
+                self._fallback_bars[bar.symbol] = bar
+            if self._fallback_dt is None or bar.datetime > self._fallback_dt:
+                self._fallback_dt = bar.datetime
+
+    def run_analysis(
+        self, *_args, show_warnings: bool = True, incremental: bool = False
+    ) -> None:
         # *_args absorbs the bool emitted by QPushButton.clicked. show_warnings
         # is False for background auto-refresh so it never pops modal dialogs.
+        # incremental is True only for 自動更新: the loaders then reuse what they
+        # already aggregated and query just the newest bars, so a tick does not
+        # re-read all of 期間 on the GUI thread. 更新 (and any control change)
+        # still does a full reload.
         # Stamp the refresh time (manual or auto) so updates are confirmable.
         self.last_update_label.setText(
             "最終更新: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         )
         days: int = self.days_spin.value()
+        interval_label: str = self.interval_combo.currentText()
+        # 限月 is discovered from the option chain, which intraday does not
+        # otherwise need — so only re-read the chain when it is actually used
+        # (1D) or when the combo has not been filled in yet.
+        needs_chain: bool = (
+            interval_label == "1D" or self.month_combo.count() <= 1 or not incremental
+        )
 
-        all_bars: list[BarData] = _load_option_bars_with_today(days)
-        if not all_bars:
-            if show_warnings:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "データなし",
-                    f"過去{days}日間のオプションデータが見つかりません",
-                    QtWidgets.QMessageBox.Ok,
-                )
-            return
+        if needs_chain:
+            all_bars: list[BarData] = self._load_daily_option_bars(days, incremental)
+            if not all_bars:
+                if show_warnings:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "データなし",
+                        f"過去{days}日間のオプションデータが見つかりません",
+                        QtWidgets.QMessageBox.Ok,
+                    )
+                return
+            _populate_month_combo(self.month_combo, all_bars)
+        else:
+            all_bars = []
 
-        _populate_month_combo(self.month_combo, all_bars)
         month: str = self.month_combo.currentText()
         futures_month: str = month if month != "全て" else ""
-        interval_label: str = self.interval_combo.currentText()
 
         futures_ohlc: dict[str, tuple[float, float, float, float]] = {}
         pinned_series: dict[str, list[float]] = {}
         anchor_symbols: dict[str, str] = {}
+        # ピン留め is the heaviest query of all (every strike of 期間); skip it
+        # entirely while the overlay is off, it is unused then.
+        want_pinned: bool = self.pinned_check.isChecked()
 
         if interval_label == "1D":
             # Daily: per-strike option chain interpolation (current behaviour).
@@ -2187,11 +2412,14 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             date_labels, series = self.build_series(bars)
             if not date_labels:
                 return
-            pinned_series, anchor_symbols = self.build_strike_anchored_series(
-                bars, date_labels
-            )
+            if want_pinned:
+                pinned_series, anchor_symbols = self.build_strike_anchored_series(
+                    bars, date_labels
+                )
             if futures_month:
-                futures_ohlc = self._load_futures_daily_ohlc(futures_month, days)
+                futures_ohlc = self._load_futures_daily_ohlc(
+                    futures_month, days, incremental
+                )
         else:
             # Intraday: resample the futures minute-bar IV to the chosen interval.
             if not futures_month:
@@ -2204,7 +2432,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 return
             hours: int = {"1H": 1, "2H": 2, "4H": 4, "8H": 8, "12H": 12}[interval_label]
             date_labels, series, futures_ohlc = self._build_intraday_series(
-                futures_month, days, hours
+                futures_month, days, hours, incremental
             )
             if not date_labels:
                 if show_warnings:
@@ -2215,9 +2443,10 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     )
                 return
             # Pinned (固定行使価格) from the recorded 15m per-strike option bars.
-            pinned_series, anchor_symbols = self._build_intraday_pinned(
-                futures_month, days, hours, date_labels
-            )
+            if want_pinned:
+                pinned_series, anchor_symbols = self._build_intraday_pinned(
+                    futures_month, days, hours, date_labels, incremental
+                )
 
         futures_prices: dict[str, float] = {d: v[3] for d, v in futures_ohlc.items()}
 
