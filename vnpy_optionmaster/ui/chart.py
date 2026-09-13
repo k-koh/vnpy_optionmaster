@@ -123,6 +123,21 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
         hbox.addStretch()
 
+        # Re-read the previous session's option data (e.g. after editing bars
+        # in the database) without restarting the app.
+        self.reload_prev_button: QtWidgets.QPushButton = QtWidgets.QPushButton(
+            "前日データ再読込"
+        )
+        self.reload_prev_button.setToolTip(
+            "前日オプションデータをDBから再読込します。\n"
+            "IVカーブの前日線・IV差分と、株価チャートのIV時系列に反映されます。"
+        )
+        self.reload_prev_button.clicked.connect(self.reload_prev_day_data)
+        hbox.addWidget(self.reload_prev_button)
+
+        self.reload_prev_label: QtWidgets.QLabel = QtWidgets.QLabel("")
+        hbox.addWidget(self.reload_prev_label)
+
         # Create graphics window
         pg.setConfigOptions(antialias=True)
 
@@ -204,6 +219,19 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
         self.update_curve_data()
         self.update_curve_visible() # Ensure visibility is updated for newly created items
+
+    def reload_prev_day_data(self) -> None:
+        """Reload the previous session's option data and redraw right away.
+
+        The engine also pushes EVENT_OPTION_PREV_DAY_DATA, which is what makes
+        株価チャート's IV series (it caches 今日IV−前日IV per bar) pick the new
+        values up."""
+        count: int = self.option_engine.reload_prev_day_option_data()
+        self.update_curve_data()
+        self.update_curve_visible()
+        self.reload_prev_label.setText(
+            f"再読込 {datetime.now().strftime('%H:%M:%S')} ({count}件)"
+        )
 
     def add_impv_curve(self, chain_symbol: str) -> None:
         """"""

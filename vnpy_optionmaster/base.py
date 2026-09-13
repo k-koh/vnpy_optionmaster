@@ -24,6 +24,9 @@ EVENT_OPTION_ALGO_LOG = "eOptionAlgoLog"
 EVENT_OPTION_RISK_NOTICE = "eOptionRiskNotice"
 EVENT_OPTION_INSTRUMENT_ADD = "eOptionInstrumentAdd"
 EVENT_OPTION_INSTRUMENT_REMOVE = "eOptionInstrumentRemove"
+# Pushed after the previous session's option data is reloaded from the
+# database, so open charts can drop what they cached from the old values.
+EVENT_OPTION_PREV_DAY_DATA = "eOptionPrevDayData"
 
 
 class InstrumentData:

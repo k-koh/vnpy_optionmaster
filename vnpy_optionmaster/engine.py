@@ -33,6 +33,7 @@ from .base import (
     EVENT_OPTION_RISK_NOTICE,
     EVENT_OPTION_INSTRUMENT_ADD,
     EVENT_OPTION_INSTRUMENT_REMOVE,
+    EVENT_OPTION_PREV_DAY_DATA,
     InstrumentData, PortfolioData, OptionData, UnderlyingData,
     get_underlying_prefix, PreviousDayOptionData, PreviousDayViData
 )
@@ -90,11 +91,19 @@ class OptionEngine(BaseEngine):
         self.save_setting()
         self.save_data()
     
-    def load_prev_day_option_data(self) -> None:
+    def load_prev_day_option_data(self) -> int:
         """
         Load option data from the previous session.
+
+        Rebuilds prev_day_option from scratch so it can be called again while
+        the app runs: add_bar keeps the first bar seen for a (datetime,
+        vt_symbol) and the derived IV dicts are only ever written per month,
+        so reusing the old container would hide any edited rows. Returns the
+        number of bars loaded.
         """
         print("开始加载上一交易日期权数据")
+
+        self.prev_day_option = PreviousDayOptionData()
 
         now: datetime = datetime.now(DB_TZ)
         session_end: datetime = now.replace(hour=15, minute=45, second=0, microsecond=0)
@@ -116,7 +125,7 @@ class OptionEngine(BaseEngine):
 
         if not bars:
             print("未加载到上一交易日 期权数据")
-            return
+            return 0
 
         for bar in bars:
             self.prev_day_option.add_bar(bar)
@@ -127,6 +136,19 @@ class OptionEngine(BaseEngine):
         dt: datetime = datetime.now(DB_TZ)
         prev_day_dt = self.prev_day_option.get_prev_day_datetime(dt)
         print(f"成功加载{len(self.prev_day_option.bars)}条上一交易日期权数据. 结束时间: {prev_day_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+        return len(bars)
+
+    def reload_prev_day_option_data(self) -> int:
+        """
+        Re-read the previous session's option data from the database.
+
+        Lets edited option bars take effect without restarting the app: the
+        data is rebuilt, then EVENT_OPTION_PREV_DAY_DATA is pushed so open
+        charts can drop whatever they cached from the old values.
+        """
+        count: int = self.load_prev_day_option_data()
+        self.event_engine.put(Event(EVENT_OPTION_PREV_DAY_DATA, count))
+        return count
 
     def load_prev_day_n225_iv_data(self):
         print("开始加载上一交易日 日経平均VI指数")
