@@ -27,11 +27,14 @@ import matplotlib.pyplot as plt             # noqa
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas  # noqa
 from matplotlib.figure import Figure        # noqa
 from matplotlib.patches import Patch, Rectangle        # noqa
+from matplotlib.lines import Line2D                   # noqa
 from matplotlib.transforms import blended_transform_factory  # noqa
 from mpl_toolkits.mplot3d import Axes3D     # noqa
 from pylab import mpl                       # noqa
 
 plt.style.use("dark_background")
+# Candle pen width, matching vnpy.chart.base.PEN_WIDTH used by CandleItem.
+PEN_WIDTH_PX: float = 1.0
 mpl.rcParams['font.sans-serif'] = ['Microsoft YaHei']   # set font for Chinese
 mpl.rcParams['axes.unicode_minus'] = False
 
@@ -2774,53 +2777,84 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
 
         ax2 = None
         if futures_ohlc and any(d in futures_ohlc for d in date_labels):
-            ax2 = ax.twinx()
-            # Render the futures candlesticks BEHIND the IV lines: drop the twin
-            # axis below the primary axis and make the primary background
-            # transparent so its lines/labels stay readable on top.
-            ax.set_zorder(ax2.get_zorder() + 1)
-            ax.patch.set_visible(False)
+            # Candles drawn exactly like 株価チャート's CandleItem:
+            #   陽線 = UP_COLOR filled, 陰線 = DOWN_COLOR hollow, 1px ヒゲ.
+            #
+            # They are painted into the IV axes (not the twin) through a
+            # price→axes-fraction transform, because matplotlib paints one
+            # whole axes before the other: anything in the twin ends up under
+            # the primary axes' grid, and the grey grid then cuts through the
+            # ヒゲ. With every artist in one axes a single z-stack holds:
+            #   grid (axisbelow) → 先物 → option IV lines.
             up_color: str = "#ff4b4b"       # 陽線 (close >= open) — 株価チャット UP_COLOR
             down_color: str = "#4bffff"     # 陰線 (close < open) — 株価チャット DOWN_COLOR
             body_w: float = 0.6
-            lows: list[float] = []
-            highs: list[float] = []
-            for xi, d in enumerate(date_labels):
-                ov = futures_ohlc.get(d)
-                if ov is None:
-                    continue
-                o, h, l, c = ov
-                color: str = up_color if c >= o else down_color
+
+            ohlc_points: list[tuple[int, tuple[float, float, float, float]]] = [
+                (xi, futures_ohlc[d])
+                for xi, d in enumerate(date_labels) if d in futures_ohlc
+            ]
+            lo: float = min(v[2] for _, v in ohlc_points)
+            hi: float = max(v[1] for _, v in ohlc_points)
+            pad: float = (hi - lo) * 0.05 or 1.0
+            lo -= pad
+            hi += pad
+            span: float = hi - lo or 1.0
+
+            # The twin only carries the right-hand price axis now.
+            ax2 = ax.twinx()
+            ax2.set_ylim(lo, hi)
+            ax2.grid(False)
+            ax.set_zorder(ax2.get_zorder() + 1)
+            ax.patch.set_visible(False)
+
+            ax.set_axisbelow(True)          # grid under every artist
+            iv_ylim: tuple[float, float] = ax.get_ylim()
+            trans = ax.get_xaxis_transform()        # x = data, y = axes fraction
+
+            def _fy(price: float) -> float:
+                return (price - lo) / span
+
+            for xi, (o, h, l, c) in ohlc_points:
+                up: bool = c >= o
+                color: str = up_color if up else down_color
                 body_top: float = max(o, c)
                 body_bottom: float = min(o, c)
-                # Draw the wick only as the shadows OUTSIDE the body (upper and
-                # lower), so it never overlaps / bleeds through the body.
+                # ヒゲ: only the shadows outside the body, so nothing runs
+                # through a hollow 陰線 (CandleItem's black body hides it).
                 if h > body_top:
-                    ax2.vlines(xi, body_top, h, color=color, linewidth=3.5, zorder=2, alpha=0.55)
+                    ax.add_line(Line2D(
+                        [xi, xi], [_fy(body_top), _fy(h)], transform=trans,
+                        color=color, linewidth=PEN_WIDTH_PX, zorder=1.2,
+                    ))
                 if body_bottom > l:
-                    ax2.vlines(xi, l, body_bottom, color=color, linewidth=3.5, zorder=2, alpha=0.55)
-                # Open-close body
-                body_height: float = abs(c - o)
-                if body_height <= 0:
-                    # Doji: draw a thin sliver so the bar stays visible
-                    body_height = max((h - l) * 0.02, 0.5)
-                ax2.bar(
-                    xi, body_height, bottom=body_bottom, width=body_w,
-                    color=color, edgecolor=color, linewidth=0.5,
-                    zorder=3, align="center", alpha=0.55,
-                )
-                lows.append(l)
-                highs.append(h)
-            if lows and highs:
-                lo, hi = min(lows), max(highs)
-                pad: float = (hi - lo) * 0.05 or 1.0
-                ax2.set_ylim(lo - pad, hi + pad)
+                    ax.add_line(Line2D(
+                        [xi, xi], [_fy(l), _fy(body_bottom)], transform=trans,
+                        color=color, linewidth=PEN_WIDTH_PX, zorder=1.2,
+                    ))
+                if body_top == body_bottom:
+                    # Doji: a flat line, as in CandleItem (both shadows above
+                    # already meet at it, so the wick reads as one line)
+                    ax.add_line(Line2D(
+                        [xi - body_w / 2, xi + body_w / 2],
+                        [_fy(o), _fy(o)], transform=trans,
+                        color=color, linewidth=PEN_WIDTH_PX, zorder=1.3,
+                    ))
+                else:
+                    ax.add_patch(Rectangle(
+                        (xi - body_w / 2, _fy(body_bottom)), body_w,
+                        _fy(body_top) - _fy(body_bottom), transform=trans,
+                        facecolor=color if up else "none",
+                        edgecolor=color, linewidth=PEN_WIDTH_PX, zorder=1.3,
+                    ))
+
+            ax.set_ylim(iv_ylim)            # the candles must not rescale IV
             ax2.set_ylabel("先物価格", color="#66ff66")
             ax2.tick_params(axis="y", labelcolor="#66ff66")
             ax2.legend(
                 handles=[
-                    Patch(facecolor=up_color, label="先物 陽線"),
-                    Patch(facecolor=down_color, label="先物 陰線"),
+                    Patch(facecolor=up_color, edgecolor=up_color, label="先物 陽線"),
+                    Patch(facecolor="none", edgecolor=down_color, label="先物 陰線"),
                 ],
                 loc="upper right", fontsize=8, framealpha=0.7,
             )
@@ -3639,11 +3673,18 @@ class EntrySignalChart(QtWidgets.QWidget):
         for i, r in enumerate(rows):
             up: bool = r["close"] >= r["open"]
             color: str = "#ff4b4b" if up else "#4bffff"
-            ax_fut.vlines(i, r["low"], r["high"], color=color, linewidth=1.0)
-            bottom: float = min(r["open"], r["close"])
-            height: float = max(abs(r["close"] - r["open"]), 0.01)
+            body_top: float = max(r["open"], r["close"])
+            body_bottom: float = min(r["open"], r["close"])
+            # ヒゲ: only the shadows outside the body, so nothing runs through
+            # a hollow 陰線 — CandleItem's black-filled body hides it the same
+            # way, and here the black ground does it.
+            if r["high"] > body_top:
+                ax_fut.vlines(i, body_top, r["high"], color=color, linewidth=1.0)
+            if body_bottom > r["low"]:
+                ax_fut.vlines(i, r["low"], body_bottom, color=color, linewidth=1.0)
+            height: float = max(body_top - body_bottom, 0.01)
             ax_fut.add_patch(Rectangle(
-                (i - body_w / 2, bottom), body_w, height,
+                (i - body_w / 2, body_bottom), body_w, height,
                 facecolor=color if up else "none",
                 edgecolor=color, linewidth=1.0
             ))
