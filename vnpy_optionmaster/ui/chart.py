@@ -26,7 +26,7 @@ matplotlib.use('Qt5Agg')                    # noqa
 import matplotlib.pyplot as plt             # noqa
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas  # noqa
 from matplotlib.figure import Figure        # noqa
-from matplotlib.patches import Patch        # noqa
+from matplotlib.patches import Patch, Rectangle        # noqa
 from matplotlib.transforms import blended_transform_factory  # noqa
 from mpl_toolkits.mplot3d import Axes3D     # noqa
 from pylab import mpl                       # noqa
@@ -3027,6 +3027,779 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self._cursor_text.set_visible(True)
 
         self.canvas.draw_idle()
+
+
+class EntrySignalChart(QtWidgets.QWidget):
+    """▲エントリー判定 - realtime grid of the 3-bar hold rule.
+
+    One column per bar of the chosen 時間足, from the session start (or a
+    start the user pins) to now:
+
+      row 0   先物 OHLC
+      row 1   ATM IV の「比較幅」前との差   (しきい値 +0.30)
+      row 2   PUT  Δ0.1 同上（行使価格変更を除いた値） (+0.20)
+      row 3   CALL Δ0.1 同上                            (+0.20)
+      row 4   判定 ○/× と連続本数、▲ が出た列を強調
+
+    The wings are roll-adjusted: eris_p_iv follows whichever strike is
+    currently Δ0.1, so a 行使価格変更 steps the series by the skew difference
+    between the two strikes (±1.0-1.9 IV pts on nk-2610) with no vol move
+    behind it. The step is absorbed into an offset, the way a rolled futures
+    contract is back-adjusted.
+    """
+
+    SETTING_FILENAME: str = "entry_signal_chart_setting.json"
+
+    INTERVALS: list[tuple[str, int]] = [
+        ("1m", 1), ("3m", 3), ("5m", 5), ("10m", 10), ("15m", 15), ("30m", 30)
+    ]
+
+    MAX_COLUMNS: int = 120
+
+    def __init__(self, option_engine: OptionEngine, portfolio_name: str) -> None:
+        super().__init__()
+
+        self.option_engine: OptionEngine = option_engine
+        self.portfolio_name: str = portfolio_name
+
+        self.fig: Figure = Figure(figsize=(14, 8))
+        self.canvas: FigureCanvas = FigureCanvas(self.fig)
+        self._truncated: bool = False
+        self._rows: list[dict] = []
+        self._cursor_lines: list = []
+        self._cursor_ix: int = -1
+        self._cursor_box = None
+
+        self.init_ui()
+        self._load_settings()
+
+    # ------------------------------------------------------------------ UI
+    def init_ui(self) -> None:
+        self.setWindowTitle("▲エントリー判定（リアルタイム）")
+        self.resize(1280, 820)
+
+        portfolio: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
+
+        self.month_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        for chain_symbol in sorted(portfolio.chains.keys()):
+            # "nk-2610.JPX" -> "2610"
+            parts: list[str] = chain_symbol.split(".")[0].split("-")
+            if len(parts) >= 2:
+                self.month_combo.addItem(parts[1])
+        self.month_combo.currentTextChanged.connect(self.run_analysis)
+
+        # Start of the window. Follows the running session unless pinned.
+        self.start_edit: QtWidgets.QDateTimeEdit = QtWidgets.QDateTimeEdit()
+        self.start_edit.setDisplayFormat("MM/dd HH:mm")
+        self.start_edit.setCalendarPopup(True)
+        self.start_edit.setFixedWidth(120)
+        self.start_edit.dateTimeChanged.connect(self._on_start_changed)
+
+        self.auto_start_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("セッション開始")
+        self.auto_start_check.setChecked(True)
+        self.auto_start_check.setToolTip(
+            "ONの間は日中(08:45)/ナイト(17:00)セッションの開始時刻に自動で合わせます。\n"
+            "OFFにすると開始時刻を手動で指定できます。"
+        )
+        self.auto_start_check.toggled.connect(self._on_auto_start_toggled)
+
+        # End of the window. Follows the clock unless pinned, so a past
+        # session can be replayed for 検証.
+        self.end_edit: QtWidgets.QDateTimeEdit = QtWidgets.QDateTimeEdit()
+        self.end_edit.setDisplayFormat("MM/dd HH:mm")
+        self.end_edit.setCalendarPopup(True)
+        self.end_edit.setFixedWidth(120)
+        self.end_edit.setEnabled(False)
+        self.end_edit.dateTimeChanged.connect(self._on_end_changed)
+
+        self.now_end_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("現在")
+        self.now_end_check.setChecked(True)
+        self.now_end_check.setToolTip(
+            "ONの間は現在時刻まで表示します。\n"
+            "OFFにすると終了時刻を固定でき、過去セッションの検証に使えます。"
+        )
+        self.now_end_check.toggled.connect(self._on_now_end_toggled)
+
+        self.interval_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        for label, _minutes in self.INTERVALS:
+            self.interval_combo.addItem(label)
+        self.interval_combo.setCurrentText("10m")
+        self.interval_combo.currentTextChanged.connect(self.run_analysis)
+
+        # 比較幅: every bar is judged against this many minutes ago.
+        self.lookback_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.lookback_spin.setRange(5, 480)
+        self.lookback_spin.setSingleStep(10)
+        self.lookback_spin.setValue(60)
+        self.lookback_spin.setSuffix("分前")
+        self.lookback_spin.setFixedWidth(85)
+        self.lookback_spin.setToolTip("各足を何分前と比べるか（既定60分）")
+        self.lookback_spin.valueChanged.connect(self.run_analysis)
+
+        # How many bars the grid may draw. 1m足 over a whole session needs a
+        # few hundred; past that the columns stop being readable.
+        self.max_bars_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.max_bars_spin.setRange(20, 1000)
+        self.max_bars_spin.setSingleStep(20)
+        self.max_bars_spin.setValue(self.MAX_COLUMNS)
+        self.max_bars_spin.setSuffix("本")
+        self.max_bars_spin.setFixedWidth(80)
+        self.max_bars_spin.setToolTip(
+            "表示する最大本数。超えた分は古い側から切り捨てます。\n"
+            "1m足でセッション全体を見るときは 400〜600 程度にしてください。"
+        )
+        self.max_bars_spin.valueChanged.connect(self.run_analysis)
+
+        self.hold_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.hold_spin.setRange(1, 12)
+        self.hold_spin.setValue(3)
+        self.hold_spin.setSuffix("本")
+        self.hold_spin.setFixedWidth(60)
+        self.hold_spin.setToolTip("条件が何本連続で成立したら▲を出すか")
+        self.hold_spin.valueChanged.connect(self.run_analysis)
+
+        self.atm_spin: QtWidgets.QDoubleSpinBox = QtWidgets.QDoubleSpinBox()
+        self.atm_spin.setRange(0.0, 5.0)
+        self.atm_spin.setSingleStep(0.05)
+        self.atm_spin.setDecimals(2)
+        self.atm_spin.setValue(0.30)
+        self.atm_spin.setFixedWidth(65)
+        self.atm_spin.setToolTip("ATM IV のしきい値")
+        self.atm_spin.valueChanged.connect(self.run_analysis)
+
+        self.wing_spin: QtWidgets.QDoubleSpinBox = QtWidgets.QDoubleSpinBox()
+        self.wing_spin.setRange(0.0, 5.0)
+        self.wing_spin.setSingleStep(0.05)
+        self.wing_spin.setDecimals(2)
+        self.wing_spin.setValue(0.20)
+        self.wing_spin.setFixedWidth(65)
+        self.wing_spin.setToolTip("Put/Call ウィングのしきい値")
+        self.wing_spin.valueChanged.connect(self.run_analysis)
+
+        self.refresh_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.refresh_spin.setRange(5, 600)
+        self.refresh_spin.setValue(30)
+        self.refresh_spin.setSuffix("秒")
+        self.refresh_spin.setFixedWidth(70)
+        self.refresh_spin.valueChanged.connect(self._on_refresh_interval_changed)
+
+        self.auto_refresh_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("自動更新")
+        self.auto_refresh_check.setChecked(True)
+        self.auto_refresh_check.toggled.connect(self._on_auto_refresh_toggled)
+
+        self._refresh_timer: QtCore.QTimer = QtCore.QTimer(self)
+        self._refresh_timer.timeout.connect(self._auto_refresh)
+
+        button: QtWidgets.QPushButton = QtWidgets.QPushButton("更新")
+        button.clicked.connect(self.run_analysis)
+
+        self.status_label: QtWidgets.QLabel = QtWidgets.QLabel("最終更新: ---")
+
+        hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        hbox.addWidget(QtWidgets.QLabel("限月"))
+        hbox.addWidget(self.month_combo)
+        hbox.addWidget(QtWidgets.QLabel("開始"))
+        hbox.addWidget(self.start_edit)
+        hbox.addWidget(self.auto_start_check)
+        hbox.addWidget(QtWidgets.QLabel("終了"))
+        hbox.addWidget(self.end_edit)
+        hbox.addWidget(self.now_end_check)
+        hbox.addWidget(QtWidgets.QLabel("時間足"))
+        hbox.addWidget(self.interval_combo)
+        hbox.addWidget(QtWidgets.QLabel("比較"))
+        hbox.addWidget(self.lookback_spin)
+        hbox.addWidget(QtWidgets.QLabel("維持"))
+        hbox.addWidget(self.hold_spin)
+        hbox.addWidget(QtWidgets.QLabel("最大"))
+        hbox.addWidget(self.max_bars_spin)
+        hbox.addWidget(QtWidgets.QLabel("ATM≧"))
+        hbox.addWidget(self.atm_spin)
+        hbox.addWidget(QtWidgets.QLabel("ウィング≧"))
+        hbox.addWidget(self.wing_spin)
+        hbox.addStretch()
+        hbox.addWidget(self.refresh_spin)
+        hbox.addWidget(self.auto_refresh_check)
+        hbox.addWidget(button)
+        hbox.addWidget(self.status_label)
+
+        # Values under the mouse, so a bar can be read without counting columns.
+        self.cursor_label: QtWidgets.QLabel = QtWidgets.QLabel(
+            "カーソルを合わせると、その足の値を表示します"
+        )
+        self.cursor_label.setFont(QtGui.QFont("Consolas", 10))
+        self.cursor_label.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+
+        vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
+        vbox.addLayout(hbox)
+        vbox.addWidget(self.canvas, 1)
+        vbox.addWidget(self.cursor_label)
+        self.setLayout(vbox)
+
+        self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+        self.canvas.mpl_connect("axes_leave_event", self._on_mouse_leave)
+
+        self._sync_start_edit()
+        self._sync_end_edit()
+
+    def _save_settings(self) -> None:
+        data: dict = {
+            "window_width": self.width(),
+            "window_height": self.height(),
+            "month": self.month_combo.currentText(),
+            "interval": self.interval_combo.currentText(),
+            "lookback": self.lookback_spin.value(),
+            "hold": self.hold_spin.value(),
+            "max_bars": self.max_bars_spin.value(),
+            "atm_threshold": self.atm_spin.value(),
+            "wing_threshold": self.wing_spin.value(),
+            "auto_start": self.auto_start_check.isChecked(),
+            "now_end": self.now_end_check.isChecked(),
+            "auto_refresh": self.auto_refresh_check.isChecked(),
+            "refresh_seconds": self.refresh_spin.value(),
+        }
+        save_json(self.SETTING_FILENAME, data)
+
+    def _load_settings(self) -> None:
+        data: dict = load_json(self.SETTING_FILENAME)
+        if not data:
+            return
+        win_w: int = data.get("window_width", 0)
+        win_h: int = data.get("window_height", 0)
+        if win_w > 0 and win_h > 0:
+            self.resize(win_w, win_h)
+        month: str = data.get("month", "")
+        if month and self.month_combo.findText(month) >= 0:
+            self.month_combo.setCurrentText(month)
+        self.interval_combo.setCurrentText(data.get("interval", "10m"))
+        self.lookback_spin.setValue(data.get("lookback", 60))
+        self.hold_spin.setValue(data.get("hold", 3))
+        self.max_bars_spin.setValue(data.get("max_bars", self.MAX_COLUMNS))
+        self.atm_spin.setValue(data.get("atm_threshold", 0.30))
+        self.wing_spin.setValue(data.get("wing_threshold", 0.20))
+        self.auto_start_check.setChecked(data.get("auto_start", True))
+        self.now_end_check.setChecked(data.get("now_end", True))
+        self.refresh_spin.setValue(data.get("refresh_seconds", 30))
+        self.auto_refresh_check.setChecked(data.get("auto_refresh", True))
+
+    # -------------------------------------------------------------- timing
+    @staticmethod
+    def _session_start(now: datetime) -> datetime:
+        """Start of the session `now` belongs to: 08:45 day / 17:00 night."""
+        day_open: datetime = now.replace(hour=8, minute=45, second=0, microsecond=0)
+        night_open: datetime = now.replace(hour=17, minute=0, second=0, microsecond=0)
+        if now >= night_open:
+            return night_open
+        if now >= day_open:
+            return day_open
+        # before 08:45 — still in the night session that began yesterday 17:00
+        return night_open - timedelta(days=1)
+
+    def _sync_start_edit(self) -> None:
+        """Point the start field at the running session (auto mode only)."""
+        if not self.auto_start_check.isChecked():
+            return
+        start: datetime = self._session_start(datetime.now(DB_TZ))
+        self.start_edit.blockSignals(True)
+        self.start_edit.setDateTime(QtCore.QDateTime(
+            QtCore.QDate(start.year, start.month, start.day),
+            QtCore.QTime(start.hour, start.minute)
+        ))
+        self.start_edit.blockSignals(False)
+        self.start_edit.setEnabled(False)
+
+    def _on_auto_start_toggled(self, checked: bool) -> None:
+        self.start_edit.setEnabled(not checked)
+        if checked:
+            self._sync_start_edit()
+        self.run_analysis()
+
+    def _on_start_changed(self, *_args) -> None:
+        if not self.auto_start_check.isChecked():
+            self.run_analysis()
+
+    def _sync_end_edit(self) -> None:
+        """Point the end field at the clock (現在 mode only)."""
+        if not self.now_end_check.isChecked():
+            return
+        now: datetime = datetime.now(DB_TZ)
+        self.end_edit.blockSignals(True)
+        self.end_edit.setDateTime(QtCore.QDateTime(
+            QtCore.QDate(now.year, now.month, now.day),
+            QtCore.QTime(now.hour, now.minute)
+        ))
+        self.end_edit.blockSignals(False)
+        self.end_edit.setEnabled(False)
+
+    def _on_now_end_toggled(self, checked: bool) -> None:
+        self.end_edit.setEnabled(not checked)
+        if checked:
+            self._sync_end_edit()
+        self.run_analysis()
+
+    def _on_end_changed(self, *_args) -> None:
+        if not self.now_end_check.isChecked():
+            self.run_analysis()
+
+    def _on_auto_refresh_toggled(self, checked: bool) -> None:
+        if checked:
+            self._refresh_timer.start(self.refresh_spin.value() * 1000)
+            if self.isVisible():
+                self.run_analysis()
+        else:
+            self._refresh_timer.stop()
+
+    def _on_refresh_interval_changed(self, seconds: int) -> None:
+        if self.auto_refresh_check.isChecked():
+            self._refresh_timer.start(seconds * 1000)
+
+    def _auto_refresh(self) -> None:
+        # A pinned 終了 makes the window static — nothing new can arrive.
+        if not self.isVisible() or not self.now_end_check.isChecked():
+            return
+        self._sync_start_edit()
+        self._sync_end_edit()
+        self.run_analysis()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self._sync_start_edit()
+        self._sync_end_edit()
+        if self.auto_refresh_check.isChecked():
+            self._refresh_timer.start(self.refresh_spin.value() * 1000)
+        self.run_analysis()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self._refresh_timer.stop()
+        self._save_settings()
+        super().closeEvent(event)
+
+    # ---------------------------------------------------------------- data
+    def _interval_minutes(self) -> int:
+        label: str = self.interval_combo.currentText()
+        for name, minutes in self.INTERVALS:
+            if name == label:
+                return minutes
+        return 10
+
+    def _start_datetime(self) -> datetime:
+        qdt: QtCore.QDateTime = self.start_edit.dateTime()
+        py: datetime = qdt.toPython() if hasattr(qdt, "toPython") else qdt.toPyDateTime()
+        return py.replace(tzinfo=DB_TZ)
+
+    def _end_datetime(self) -> datetime:
+        """End of the window: the clock, or the pinned 終了 for 検証."""
+        if self.now_end_check.isChecked():
+            return datetime.now(DB_TZ)
+        qdt: QtCore.QDateTime = self.end_edit.dateTime()
+        py: datetime = qdt.toPython() if hasattr(qdt, "toPython") else qdt.toPyDateTime()
+        end: datetime = py.replace(tzinfo=DB_TZ)
+        start: datetime = self._start_datetime()
+        if end <= start:
+            end = start + timedelta(minutes=self._interval_minutes())
+        return end
+
+    def build_buckets(self) -> list[dict]:
+        """Aggregate the futures minute bars into `時間足` buckets.
+
+        Loads from (start − 比較幅) so the first displayed bar already has a
+        comparison point. Each bucket keeps OHLC plus the last non-zero IV
+        snapshot and the Δ0.1 strikes recorded on the minute bars.
+        """
+        month: str = self.month_combo.currentText()
+        if not month:
+            return []
+
+        minutes: int = self._interval_minutes()
+        start: datetime = self._start_datetime()
+        end: datetime = self._end_datetime()
+        query_start: datetime = start - timedelta(minutes=self.lookback_spin.value() + minutes)
+
+        database: BaseDatabase = get_database()
+        bars: list[BarData] = database.load_bar_data(
+            symbol=f"nk-{month}", exchange=Exchange.JPX,
+            interval=Interval.MINUTE, start=query_start, end=end,
+        )
+        if not bars:
+            return []
+
+        buckets: dict[datetime, dict] = {}
+        for bar in bars:
+            floor: datetime = bar.datetime.replace(
+                minute=bar.datetime.minute - bar.datetime.minute % minutes,
+                second=0, microsecond=0
+            )
+            b = buckets.get(floor)
+            if b is None:
+                buckets[floor] = b = {
+                    "dt": floor,
+                    "open": bar.open_price, "high": bar.high_price,
+                    "low": bar.low_price, "close": bar.close_price,
+                    "atm": 0.0, "put": 0.0, "call": 0.0,
+                    "ps": 0, "cs": 0,
+                }
+            else:
+                b["high"] = max(b["high"], bar.high_price)
+                b["low"] = min(b["low"], bar.low_price)
+                b["close"] = bar.close_price
+            # last non-zero snapshot inside the bucket
+            if bar.atm_iv:
+                b["atm"] = bar.atm_iv * 100
+            if bar.eris_p_iv:
+                b["put"] = bar.eris_p_iv * 100
+            if bar.eris_c_iv:
+                b["call"] = bar.eris_c_iv * 100
+            if bar.eris_p_strike:
+                b["ps"] = int(bar.eris_p_strike)
+            if bar.eris_c_strike:
+                b["cs"] = int(bar.eris_c_strike)
+
+        rows: list[dict] = [buckets[k] for k in sorted(buckets) if buckets[k]["atm"]]
+
+        # Back-adjust the wings for 行使価格変更.
+        off_p: float = 0.0
+        off_c: float = 0.0
+        for i, r in enumerate(rows):
+            r["roll"] = False
+            if i:
+                prev = rows[i - 1]
+                if r["ps"] and prev["ps"] and r["ps"] != prev["ps"]:
+                    off_p += r["put"] - prev["put"]
+                    r["roll"] = True
+                if r["cs"] and prev["cs"] and r["cs"] != prev["cs"]:
+                    off_c += r["call"] - prev["call"]
+                    r["roll"] = True
+            r["put_adj"] = r["put"] - off_p
+            r["call_adj"] = r["call"] - off_c
+
+        return rows
+
+    def evaluate(self, rows: list[dict]) -> list[dict]:
+        """Attach the per-bar judgement: the three deltas, ○/×, streak, ▲."""
+        lookback: timedelta = timedelta(minutes=self.lookback_spin.value())
+        minutes: int = self._interval_minutes()
+        tolerance: timedelta = timedelta(minutes=minutes + 1)
+        atm_th: float = self.atm_spin.value()
+        wing_th: float = self.wing_spin.value()
+        hold: int = self.hold_spin.value()
+
+        streak: int = 0
+        armed: bool = True
+        for i, r in enumerate(rows):
+            # the last bar at or before "lookback ago"
+            want: datetime = r["dt"] - lookback
+            j: int = i
+            while j > 0 and rows[j]["dt"] > want:
+                j -= 1
+            base = rows[j]
+            if i == j or (r["dt"] - base["dt"]) > lookback + tolerance:
+                r.update(d_atm=None, d_put=None, d_call=None, ok=False,
+                         streak=0, fire=False)
+                streak = 0
+                continue
+
+            r["d_atm"] = r["atm"] - base["atm"]
+            r["d_put"] = r["put_adj"] - base["put_adj"]
+            r["d_call"] = r["call_adj"] - base["call_adj"]
+            r["ok"] = (r["d_atm"] >= atm_th and r["d_put"] >= wing_th
+                       and r["d_call"] >= wing_th)
+            if r["ok"]:
+                streak += 1
+            else:
+                streak = 0
+                armed = True
+            r["streak"] = streak
+            r["fire"] = bool(r["ok"] and streak >= hold and armed and not r["roll"])
+            if r["fire"]:
+                armed = False
+        return rows
+
+    # -------------------------------------------------------------- cursor
+    def _on_mouse_move(self, event) -> None:
+        """Show the values of the bar under the mouse."""
+        rows: list[dict] = getattr(self, "_rows", [])
+        if not rows or event.inaxes is None or event.xdata is None:
+            return
+
+        ix: int = int(round(event.xdata))
+        ix = max(0, min(len(rows) - 1, ix))
+        if ix == self._cursor_ix:
+            return          # same bar — no redraw on every pixel of movement
+        self._cursor_ix = ix
+        r: dict = rows[ix]
+
+        def d(key: str) -> str:
+            v = r.get(key)
+            return "  ---" if v is None else f"{v:+5.2f}"
+
+        parts: list[str] = [
+            r["dt"].strftime("%m/%d %H:%M"),
+            f"先物 {r['close']:,.0f} (O {r['open']:,.0f} H {r['high']:,.0f} L {r['low']:,.0f})",
+            f"ATM {r['atm']:5.2f} ({d('d_atm')})",
+            f"PUT {r['put_adj']:5.2f} ({d('d_put')})",
+            f"CALL {r['call_adj']:5.2f} ({d('d_call')})",
+            f"判定 {'○' if r.get('ok') else '×'}",
+            f"連続 {int(r.get('streak') or 0)}",
+        ]
+        if r.get("fire"):
+            parts.append("▲ ENTRY")
+        if r.get("roll"):
+            parts.append(f"行使価格変更 P{r['ps']}/C{r['cs']}")
+        self.cursor_label.setText("　|　".join(parts))
+
+        for line in getattr(self, "_cursor_lines", []):
+            line.set_xdata([ix, ix])
+            line.set_visible(True)
+
+        if self._cursor_box is not None:
+            lines: list[str] = [
+                r["dt"].strftime("%m/%d %H:%M"),
+                f"先物 {r['close']:,.0f}",
+                f"  H {r['high']:,.0f}  L {r['low']:,.0f}",
+                f"ATM  {r['atm']:6.2f} ({d('d_atm')})",
+                f"PUT  {r['put_adj']:6.2f} ({d('d_put')})",
+                f"CALL {r['call_adj']:6.2f} ({d('d_call')})",
+                f"判定 {'○' if r.get('ok') else '×'}   連続 {int(r.get('streak') or 0)}",
+            ]
+            if r.get("fire"):
+                lines.append("▲ ENTRY")
+            if r.get("roll"):
+                lines.append("行使価格変更")
+            n_bars: int = len(rows)
+            flip: bool = ix > n_bars - 1 - (n_bars - 1) * 0.2
+            self._cursor_box.set_ha("right" if flip else "left")
+            self._cursor_box.set_position((ix + (-0.5 if flip else 0.5), 0.985))
+            self._cursor_box.set_text("\n".join(lines))
+            self._cursor_box.set_visible(True)
+
+        self.canvas.draw_idle()
+
+    def _on_mouse_leave(self, event) -> None:
+        self._cursor_ix = -1
+        for line in getattr(self, "_cursor_lines", []):
+            line.set_visible(False)
+        if self._cursor_box is not None:
+            self._cursor_box.set_visible(False)
+        self.canvas.draw_idle()
+
+    # -------------------------------------------------------------- render
+    def run_analysis(self, *_args) -> None:
+        self.status_label.setText(
+            "最終更新: " + datetime.now().strftime("%H:%M:%S")
+        )
+        rows: list[dict] = self.evaluate(self.build_buckets())
+        start: datetime = self._start_datetime()
+        shown: list[dict] = [r for r in rows if r["dt"] >= start]
+
+        # A pinned start plus a fine 時間足 can run to hundreds of columns;
+        # keep the newest 最大本数 so the grid stays readable.
+        max_bars: int = self.max_bars_spin.value()
+        self._truncated = len(shown) > max_bars
+        if self._truncated:
+            shown = shown[-max_bars:]
+
+        self.update_chart(shown)
+
+    def update_chart(self, rows: list[dict]) -> None:
+        self.fig.clear()
+        self._rows = rows
+        self._cursor_lines = []
+        self._cursor_ix = -1
+        self._cursor_box = None
+
+        if not rows:
+            ax = self.fig.add_subplot(111)
+            ax.axis("off")
+            ax.text(0.5, 0.5, "データなし（限月・開始/終了時刻を確認してください）",
+                    ha="center", va="center", color="#888888", fontsize=13)
+            self.canvas.draw()
+            self.cursor_label.setText("データなし")
+            return
+
+        atm_th: float = self.atm_spin.value()
+        wing_th: float = self.wing_spin.value()
+        n: int = len(rows)
+        x = np.arange(n)
+
+        gs = self.fig.add_gridspec(
+            5, 1, height_ratios=[3.2, 1.5, 1.5, 1.5, 0.9], hspace=0.12,
+            left=0.055, right=0.995, top=0.94, bottom=0.02
+        )
+        ax_fut = self.fig.add_subplot(gs[0, 0])
+        ax_atm = self.fig.add_subplot(gs[1, 0], sharex=ax_fut)
+        ax_put = self.fig.add_subplot(gs[2, 0], sharex=ax_fut)
+        ax_call = self.fig.add_subplot(gs[3, 0], sharex=ax_fut)
+        ax_mark = self.fig.add_subplot(gs[4, 0], sharex=ax_fut)
+
+        fire_ix: list[int] = [i for i, r in enumerate(rows) if r["fire"]]
+
+        # ---- futures OHLC bars
+        body_w: float = 0.62
+        for i, r in enumerate(rows):
+            up: bool = r["close"] >= r["open"]
+            color: str = "#ff4b4b" if up else "#4bffff"
+            ax_fut.vlines(i, r["low"], r["high"], color=color, linewidth=1.0)
+            bottom: float = min(r["open"], r["close"])
+            height: float = max(abs(r["close"] - r["open"]), 0.01)
+            ax_fut.add_patch(Rectangle(
+                (i - body_w / 2, bottom), body_w, height,
+                facecolor=color if up else "none",
+                edgecolor=color, linewidth=1.0
+            ))
+        ax_fut.set_ylabel("先物", color="#cccccc", fontsize=10)
+        ax_fut.tick_params(labelbottom=False, labelsize=9)
+        ax_fut.grid(True, axis="y", alpha=0.15)
+        last = rows[-1]
+        ax_fut.set_title(
+            f"nk-{self.month_combo.currentText()}   "
+            f"{rows[0]['dt'].strftime('%m/%d %H:%M')} – {last['dt'].strftime('%H:%M')}   "
+            f"{self.interval_combo.currentText()}足   "
+            f"{self.lookback_spin.value()}分前と比較   "
+            f"{self.hold_spin.value()}本維持で▲"
+            + ("　（直近{}本のみ表示）".format(len(rows)) if self._truncated else ""),
+            color="#dddddd", fontsize=11, loc="left"
+        )
+
+        # ---- the three condition rows
+        specs = [
+            (ax_atm, "d_atm", atm_th, "#00e58a", "ATM"),
+            (ax_put, "d_put", wing_th, "#3987e5", "PUT"),
+            (ax_call, "d_call", wing_th, "#eb6834", "CALL"),
+        ]
+        for ax, key, th, color, label in specs:
+            values: list[float] = [
+                r[key] if r.get(key) is not None else 0.0 for r in rows
+            ]
+            colors: list[str] = [
+                color if (r.get(key) is not None and r[key] >= th) else "#4a5058"
+                for r in rows
+            ]
+            ax.bar(x, values, width=body_w, color=colors)
+            ax.axhline(0, color="#888888", linewidth=0.8)
+            ax.axhline(th, color=color, linewidth=1.0, linestyle="--", alpha=0.8)
+            ax.set_ylabel(f"{label}\n≧{th:+.2f}", color=color, fontsize=9)
+            ax.tick_params(labelbottom=False, labelleft=False, labelsize=8)
+            ax.grid(False)
+            for spine in ("top", "right", "left"):
+                ax.spines[spine].set_visible(False)
+
+            # value labels: at most ~40 of them, and none at all once the
+            # columns are too narrow to read a number on.
+            step: int = max(1, math.ceil(n / 40))
+            span: float = max(abs(v) for v in values) or 1.0
+            for i, r in enumerate(rows):
+                v = r.get(key)
+                if n > 240 or v is None or (i % step and i != n - 1):
+                    continue
+                passed: bool = v >= th
+                ax.text(
+                    i, v + (span * 0.12 if v >= 0 else -span * 0.12),
+                    f"{v:+.2f}", ha="center",
+                    va="bottom" if v >= 0 else "top",
+                    color=color if passed else "#6b7280", fontsize=7.5,
+                    fontweight="bold" if passed else "normal"
+                )
+            ax.set_ylim(min(0.0, min(values)) - span * 0.42,
+                        max(th, max(values)) + span * 0.42)
+
+        # ---- verdict row
+        ax_mark.set_ylim(0, 1.0)
+        ax_mark.axis("off")
+        # ○/× per bar while the columns are wide enough to read; past that a
+        # ribbon (green = 成立) carries the same information legibly.
+        dense: bool = n > 150
+        if dense:
+            ax_mark.bar(
+                x, [0.42] * n, bottom=0.5, width=0.92,
+                color=["#00e58a" if r.get("ok") else "#3a4048" for r in rows]
+            )
+            for i, r in enumerate(rows):
+                if r["fire"]:
+                    ax_mark.text(i, 0.30, str(int(r["streak"])), ha="center", va="center",
+                                 color="#00e58a", fontsize=7.5, fontweight="bold")
+        else:
+            mark_size: float = max(6.0, min(11.0, 11.0 * 40.0 / max(n, 1)))
+            for i, r in enumerate(rows):
+                ok: bool = bool(r.get("ok"))
+                ax_mark.text(i, 0.72, "○" if ok else "×", ha="center", va="center",
+                             color="#00e58a" if ok else "#5a6068",
+                             fontsize=mark_size, fontweight="bold")
+                streak: int = int(r.get("streak") or 0)
+                if streak:
+                    ax_mark.text(i, 0.36, str(streak), ha="center", va="center",
+                                 color="#00e58a" if r["fire"] else "#9aa3ad",
+                                 fontsize=max(5.0, mark_size * 0.8),
+                                 fontweight="bold" if r["fire"] else "normal")
+
+        # time labels along the bottom
+        label_step: int = max(1, math.ceil(n / 14))
+        for i, r in enumerate(rows):
+            if i % label_step and i != n - 1:
+                continue
+            ax_mark.text(i, 0.02, r["dt"].strftime("%H:%M"), ha="center", va="bottom",
+                         color="#9aa3ad", fontsize=8)
+
+        # ---- highlight the ▲ columns across every row
+        for i in fire_ix:
+            for ax in (ax_fut, ax_atm, ax_put, ax_call, ax_mark):
+                ax.axvspan(i - 0.5, i + 0.5, color="#00e58a", alpha=0.13, zorder=0)
+            ax_fut.annotate(
+                "▲", xy=(i, 0.985), xycoords=("data", "axes fraction"),
+                ha="center", va="top", color="#00e58a",
+                fontsize=13, fontweight="bold"
+            )
+
+        # 行使価格変更 markers (the signal is suppressed on those bars)
+        for i, r in enumerate(rows):
+            if not r.get("roll"):
+                continue
+            for ax in (ax_atm, ax_put, ax_call):
+                ax.axvline(i, color="#ffcc00", linewidth=0.8, linestyle=":", alpha=0.55)
+
+        ax_mark.set_xlim(-0.8, n - 0.2)
+
+        # one hair-line per panel, moved by the mouse
+        for ax in (ax_fut, ax_atm, ax_put, ax_call, ax_mark):
+            line = ax.axvline(0, color="#dddddd", linewidth=0.8, alpha=0.55,
+                              visible=False, zorder=5)
+            self._cursor_lines.append(line)
+
+        # …and the read-out that travels with it, like 株価チャート's cursor
+        # label: pinned to the top of the futures panel at the cursor's bar,
+        # flipping to the left of the line in the right fifth of the window.
+        self._cursor_box = ax_fut.text(
+            0, 0.985, "",
+            transform=ax_fut.get_xaxis_transform(),
+            fontsize=8.5, color="#e8e8e8", va="top", ha="left", linespacing=1.45,
+            bbox=dict(boxstyle="round,pad=0.4", fc="#12161b", ec="#5a6068", alpha=0.94),
+            zorder=6,
+        )
+        self._cursor_box.set_visible(False)
+
+        # ---- status line: what the latest bar says
+        latest = rows[-1]
+        if latest.get("d_atm") is None:
+            state = "比較対象となる過去データが不足しています"
+        elif latest["fire"]:
+            state = f"▲ エントリー条件成立（連続{latest['streak']}本）"
+        elif latest["ok"]:
+            state = (f"○ 条件成立中 — あと{max(0, self.hold_spin.value() - latest['streak'])}本で▲"
+                     f"（連続{latest['streak']}本）")
+        else:
+            missing: list[str] = []
+            if latest["d_atm"] < atm_th:
+                missing.append(f"ATM {latest['d_atm']:+.2f}")
+            if latest["d_put"] < wing_th:
+                missing.append(f"PUT {latest['d_put']:+.2f}")
+            if latest["d_call"] < wing_th:
+                missing.append(f"CALL {latest['d_call']:+.2f}")
+            state = "× 未成立 — " + " / ".join(missing)
+        self.status_label.setText(
+            "最終更新: " + datetime.now().strftime("%H:%M:%S") + "　" + state
+        )
+
+        self.canvas.draw()
 
 
 class PayoffDiagramChart(QtWidgets.QWidget):
