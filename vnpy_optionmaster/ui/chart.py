@@ -81,6 +81,11 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
         self.iv_diff_pos_bars: dict[str, pg.BarGraphItem] = {}
         self.iv_diff_neg_bars: dict[str, pg.BarGraphItem] = {}
+        # IV分解: the same 前日比IV split into 面の上下 (the surface moving at
+        # constant moneyness) and 滑り (the fixed strike sliding along today's
+        # curve because the futures moved). The two always sum to 前日比IV.
+        self.iv_level_bars: dict[str, pg.BarGraphItem] = {}
+        self.iv_slide_bars: dict[str, pg.BarGraphItem] = {}
         self.iv_diff_pos_text_items: dict[str, list[pg.TextItem]] = {} # Added for IV diff text
         self.iv_diff_neg_text_items: dict[str, list[pg.TextItem]] = {} # Added for IV diff text
         self.total_volume_text_items: dict[str, list[pg.TextItem]] = {} # Added for Volume text
@@ -126,6 +131,17 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             self.chain_checks[chain_symbol] = chain_check
 
         hbox.addStretch()
+
+        # Split 前日比IV into its two causes (see iv_level_bars).
+        self.decomp_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("IV分解")
+        self.decomp_check.setToolTip(
+            "前日比IVを「面の上下」と「滑り」に分解して積み上げ表示します。\n"
+            "面の上下 = 同じモネネス K/F で測ったIVの変化（ボラ水準そのものの動き）\n"
+            "滑り     = 先物が動いて K/F がカーブ上を移動した分\n"
+            "2つの合計は前日比IVに一致します。"
+        )
+        self.decomp_check.toggled.connect(self._on_decomp_toggled)
+        hbox.addWidget(self.decomp_check)
 
         # Re-read the previous session's option data (e.g. after editing bars
         # in the database) without restarting the app.
@@ -223,6 +239,14 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
         self.update_curve_data()
         self.update_curve_visible() # Ensure visibility is updated for newly created items
+
+    def _on_decomp_toggled(self, checked: bool) -> None:
+        """Switch the bottom subplot between 前日比IV and its decomposition."""
+        self.iv_diff_chart.setTitle(
+            "前日比IV　＝　面の上下（緑）＋ 滑り（橙）" if checked else "前日比IV"
+        )
+        self.update_curve_data()
+        self.update_curve_visible()
 
     def reload_prev_day_data(self) -> None:
         """Reload the previous session's option data and redraw right away.
@@ -414,6 +438,24 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.iv_diff_chart.addItem(self.iv_diff_pos_bars[chain_symbol])
         self.iv_diff_chart.addItem(self.iv_diff_neg_bars[chain_symbol])
 
+        # IV分解の積み上げ2本（既定では非表示）
+        self.iv_level_bars[chain_symbol] = pg.BarGraphItem(
+            x=[], height=[], y0=[], width=1.0,
+            brush=pg.mkBrush(color=(0, 229, 138)),
+            pen=pg.mkPen(color=(0, 229, 138)),
+            name=f"{symbol} 面の上下",
+        )
+        self.iv_slide_bars[chain_symbol] = pg.BarGraphItem(
+            x=[], height=[], y0=[], width=1.0,
+            brush=pg.mkBrush(color=(255, 170, 51)),
+            pen=pg.mkPen(color=(255, 170, 51)),
+            name=f"{symbol} 滑り",
+        )
+        self.iv_diff_chart.addItem(self.iv_level_bars[chain_symbol])
+        self.iv_diff_chart.addItem(self.iv_slide_bars[chain_symbol])
+        self.iv_level_bars[chain_symbol].hide()
+        self.iv_slide_bars[chain_symbol].hide()
+
         self.iv_diff_pos_text_items[chain_symbol] = [] # Initialize list for text items
         self.iv_diff_neg_text_items[chain_symbol] = []
         self.total_volume_text_items[chain_symbol] = []
@@ -600,6 +642,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             # Calculate IV difference
             iv_diff_strikes = []
             iv_diff_heights = []
+            today_iv_map: dict[float, float] = {}
+            prev_iv_map: dict[float, float] = {}
 
             all_strikes = sorted(list(set(call_strikes + put_strikes)))
             prev_call_iv_map = {s: v for s, v in zip(call_strikes, prev_call_ivs)}
@@ -642,7 +686,10 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 else:
                     continue
 
+                if current_iv > 0:
+                    today_iv_map[strike] = current_iv
                 if prev_iv != 0:
+                    prev_iv_map[strike] = prev_iv
                     iv_diff_strikes.append(strike)
                     iv_diff_heights.append(current_iv - prev_iv)
 
@@ -842,6 +889,55 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             self.iv_diff_pos_bars[chain.chain_symbol].setOpts(x=pos_strikes, height=pos_heights, width=bar_width_diff)
             self.iv_diff_neg_bars[chain.chain_symbol].setOpts(x=neg_strikes, height=neg_heights, width=bar_width_diff)
 
+            # ---- IV分解: 前日比IV = 面の上下 + 滑り -------------------------
+            # For a strike K held from yesterday to today:
+            #   moneyness yesterday  m      = K / F_prev
+            #   same moneyness today K_same = m * F_today
+            #   面の上下 = IV_today(K_same) - IV_prev(K)   (curve level move)
+            #   滑り     = IV_today(K)      - IV_today(K_same)  (move along it)
+            # The two sum to IV_today(K) - IV_prev(K), i.e. the bar above.
+            level_x: list[float] = []
+            level_h: list[float] = []
+            slide_y0: list[float] = []
+            slide_h: list[float] = []
+            if self.decomp_check.isChecked() and prev_price and underlying_price:
+                curve_x: list[float] = sorted(today_iv_map.keys())
+
+                def _iv_today_at(k: float) -> float | None:
+                    """Today's blended IV at any strike, linearly interpolated."""
+                    if len(curve_x) < 2 or k < curve_x[0] or k > curve_x[-1]:
+                        return None
+                    for a, b in zip(curve_x, curve_x[1:]):
+                        if a <= k <= b:
+                            if b == a:
+                                return today_iv_map[a]
+                            va, vb = today_iv_map[a], today_iv_map[b]
+                            return va + (vb - va) * (k - a) / (b - a)
+                    return None
+
+                for strike in sorted(prev_iv_map.keys()):
+                    if strike not in today_iv_map:
+                        continue
+                    k_same: float = strike / prev_price * underlying_price
+                    iv_same = _iv_today_at(k_same)
+                    if iv_same is None:
+                        continue
+                    level: float = iv_same - prev_iv_map[strike]
+                    slide: float = today_iv_map[strike] - iv_same
+                    level_x.append(strike)
+                    level_h.append(level)
+                    slide_y0.append(level)
+                    slide_h.append(slide)
+
+            self.iv_level_bars[chain.chain_symbol].setOpts(
+                x=level_x, height=level_h, y0=[0.0] * len(level_x),
+                width=bar_width_diff * 0.9,
+            )
+            self.iv_slide_bars[chain.chain_symbol].setOpts(
+                x=level_x, height=slide_h, y0=slide_y0,
+                width=bar_width_diff * 0.9,
+            )
+
             # Add text labels for IV diff bars
             chain_color = self.chain_colors[chain.chain_symbol]
             font = QtGui.QFont()
@@ -918,6 +1014,16 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             total_volume_bar = self.total_volume_bars[chain_symbol]
             iv_diff_pos_bar = self.iv_diff_pos_bars[chain_symbol]
             iv_diff_neg_bar = self.iv_diff_neg_bars[chain_symbol]
+            level_bar = self.iv_level_bars[chain_symbol]
+            slide_bar = self.iv_slide_bars[chain_symbol]
+            decomp: bool = self.decomp_check.isChecked()
+
+            if checkbox.isChecked() and decomp:
+                level_bar.show()
+                slide_bar.show()
+            else:
+                level_bar.hide()
+                slide_bar.hide()
 
             if checkbox.isChecked():
                 call_mid_curve.show()
@@ -930,12 +1036,16 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 prev_call_curve.show()
                 prev_put_curve.show()
                 total_volume_bar.show()
-                iv_diff_pos_bar.show()
-                iv_diff_neg_bar.show()
+                if decomp:
+                    iv_diff_pos_bar.hide()
+                    iv_diff_neg_bar.hide()
+                else:
+                    iv_diff_pos_bar.show()
+                    iv_diff_neg_bar.show()
                 for text_item in self.iv_diff_pos_text_items[chain_symbol]:
-                    text_item.show()
+                    text_item.setVisible(not decomp)
                 for text_item in self.iv_diff_neg_text_items[chain_symbol]:
-                    text_item.show()
+                    text_item.setVisible(not decomp)
                 for text_item in self.total_volume_text_items[chain_symbol]:
                     text_item.show()
             else:
