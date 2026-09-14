@@ -28,6 +28,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure        # noqa
 from matplotlib.patches import Patch, Rectangle        # noqa
 from matplotlib.lines import Line2D                   # noqa
+from matplotlib.collections import LineCollection, PolyCollection   # noqa
 from matplotlib.transforms import blended_transform_factory  # noqa
 from mpl_toolkits.mplot3d import Axes3D     # noqa
 from pylab import mpl                       # noqa
@@ -3103,6 +3104,9 @@ class EntrySignalChart(QtWidgets.QWidget):
         self._cursor_lines: list = []
         self._cursor_ix: int = -1
         self._cursor_box = None
+        # Blitting: the cursor artists are `animated`, so a normal draw skips
+        # them; we cache that clean canvas and repaint only the cursor on top.
+        self._background = None
 
         self.init_ui()
         self._load_settings()
@@ -3212,7 +3216,7 @@ class EntrySignalChart(QtWidgets.QWidget):
 
         self.refresh_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
         self.refresh_spin.setRange(5, 600)
-        self.refresh_spin.setValue(30)
+        self.refresh_spin.setValue(10)
         self.refresh_spin.setSuffix("秒")
         self.refresh_spin.setFixedWidth(70)
         self.refresh_spin.valueChanged.connect(self._on_refresh_interval_changed)
@@ -3273,6 +3277,7 @@ class EntrySignalChart(QtWidgets.QWidget):
 
         self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
         self.canvas.mpl_connect("axes_leave_event", self._on_mouse_leave)
+        self.canvas.mpl_connect("draw_event", self._on_draw)
 
         self._sync_start_edit()
         self._sync_end_edit()
@@ -3314,7 +3319,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         self.wing_spin.setValue(data.get("wing_threshold", 0.20))
         self.auto_start_check.setChecked(data.get("auto_start", True))
         self.now_end_check.setChecked(data.get("now_end", True))
-        self.refresh_spin.setValue(data.get("refresh_seconds", 30))
+        self.refresh_spin.setValue(data.get("refresh_seconds", 10))
         self.auto_refresh_check.setChecked(data.get("auto_refresh", True))
 
     # -------------------------------------------------------------- timing
@@ -3550,6 +3555,29 @@ class EntrySignalChart(QtWidgets.QWidget):
         return rows
 
     # -------------------------------------------------------------- cursor
+    def _on_draw(self, event) -> None:
+        """Cache the freshly drawn canvas (cursor artists are excluded)."""
+        try:
+            self._background = self.canvas.copy_from_bbox(self.fig.bbox)
+        except Exception:
+            self._background = None
+
+    def _blit_cursor(self) -> None:
+        """Repaint just the cursor over the cached canvas.
+
+        A full redraw of this grid costs 0.2-1.5s depending on the bar count,
+        which would make the cursor unusable; blitting keeps it instant."""
+        if self._background is None:
+            self.canvas.draw_idle()
+            return
+        self.canvas.restore_region(self._background)
+        for line in self._cursor_lines:
+            if line.axes is not None:
+                line.axes.draw_artist(line)
+        if self._cursor_box is not None and self._cursor_box.get_visible():
+            self._cursor_box.axes.draw_artist(self._cursor_box)
+        self.canvas.blit(self.fig.bbox)
+
     def _on_mouse_move(self, event) -> None:
         """Show the values of the bar under the mouse."""
         rows: list[dict] = getattr(self, "_rows", [])
@@ -3607,7 +3635,7 @@ class EntrySignalChart(QtWidgets.QWidget):
             self._cursor_box.set_text("\n".join(lines))
             self._cursor_box.set_visible(True)
 
-        self.canvas.draw_idle()
+        self._blit_cursor()
 
     def _on_mouse_leave(self, event) -> None:
         self._cursor_ix = -1
@@ -3615,7 +3643,7 @@ class EntrySignalChart(QtWidgets.QWidget):
             line.set_visible(False)
         if self._cursor_box is not None:
             self._cursor_box.set_visible(False)
-        self.canvas.draw_idle()
+        self._blit_cursor()
 
     # -------------------------------------------------------------- render
     def run_analysis(self, *_args) -> None:
@@ -3641,6 +3669,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         self._cursor_lines = []
         self._cursor_ix = -1
         self._cursor_box = None
+        self._background = None
 
         if not rows:
             ax = self.fig.add_subplot(111)
@@ -3669,25 +3698,54 @@ class EntrySignalChart(QtWidgets.QWidget):
         fire_ix: list[int] = [i for i, r in enumerate(rows) if r["fire"]]
 
         # ---- futures OHLC bars
+        # Batched into three collections instead of ~3 artists per bar: at 600
+        # bars that is the difference between ~1.5s and ~0.2s per redraw.
         body_w: float = 0.62
+        up_color: str = "#ff4b4b"
+        down_color: str = "#4bffff"
+        wick_segs: list = []
+        wick_colors: list[str] = []
+        filled_bodies: list = []        # 陽線
+        hollow_bodies: list = []        # 陰線
         for i, r in enumerate(rows):
             up: bool = r["close"] >= r["open"]
-            color: str = "#ff4b4b" if up else "#4bffff"
+            color: str = up_color if up else down_color
             body_top: float = max(r["open"], r["close"])
             body_bottom: float = min(r["open"], r["close"])
             # ヒゲ: only the shadows outside the body, so nothing runs through
             # a hollow 陰線 — CandleItem's black-filled body hides it the same
             # way, and here the black ground does it.
             if r["high"] > body_top:
-                ax_fut.vlines(i, body_top, r["high"], color=color, linewidth=1.0)
+                wick_segs.append([(i, body_top), (i, r["high"])])
+                wick_colors.append(color)
             if body_bottom > r["low"]:
-                ax_fut.vlines(i, r["low"], body_bottom, color=color, linewidth=1.0)
-            height: float = max(body_top - body_bottom, 0.01)
-            ax_fut.add_patch(Rectangle(
-                (i - body_w / 2, body_bottom), body_w, height,
-                facecolor=color if up else "none",
-                edgecolor=color, linewidth=1.0
+                wick_segs.append([(i, r["low"]), (i, body_bottom)])
+                wick_colors.append(color)
+            top: float = body_bottom + max(body_top - body_bottom, 0.01)
+            verts = [
+                (i - body_w / 2, body_bottom), (i + body_w / 2, body_bottom),
+                (i + body_w / 2, top), (i - body_w / 2, top),
+            ]
+            (filled_bodies if up else hollow_bodies).append(verts)
+
+        if wick_segs:
+            ax_fut.add_collection(LineCollection(
+                wick_segs, colors=wick_colors, linewidths=1.0
             ))
+        if filled_bodies:
+            ax_fut.add_collection(PolyCollection(
+                filled_bodies, facecolors=up_color, edgecolors=up_color, linewidths=1.0
+            ))
+        if hollow_bodies:
+            ax_fut.add_collection(PolyCollection(
+                hollow_bodies, facecolors="none", edgecolors=down_color, linewidths=1.0
+            ))
+
+        # Collections do not autoscale the view, so set the price range here.
+        lo_px: float = min(r["low"] for r in rows)
+        hi_px: float = max(r["high"] for r in rows)
+        pad_px: float = (hi_px - lo_px) * 0.06 or 1.0
+        ax_fut.set_ylim(lo_px - pad_px, hi_px + pad_px)
         ax_fut.set_ylabel("先物", color="#cccccc", fontsize=10)
         ax_fut.tick_params(labelbottom=False, labelsize=9)
         ax_fut.grid(True, axis="y", alpha=0.15)
@@ -3695,10 +3753,11 @@ class EntrySignalChart(QtWidgets.QWidget):
         ax_fut.set_title(
             f"nk-{self.month_combo.currentText()}   "
             f"{rows[0]['dt'].strftime('%m/%d %H:%M')} – {last['dt'].strftime('%H:%M')}   "
-            f"{self.interval_combo.currentText()}足   "
+            f"{self.interval_combo.currentText()}足 {n}本   "
             f"{self.lookback_spin.value()}分前と比較   "
             f"{self.hold_spin.value()}本維持で▲"
-            + ("　（直近{}本のみ表示）".format(len(rows)) if self._truncated else ""),
+            + ("　（最大{}本のため古い側を省略）".format(self.max_bars_spin.value())
+               if self._truncated else ""),
             color="#dddddd", fontsize=11, loc="left"
         )
 
@@ -3716,7 +3775,14 @@ class EntrySignalChart(QtWidgets.QWidget):
                 color if (r.get(key) is not None and r[key] >= th) else "#4a5058"
                 for r in rows
             ]
-            ax.bar(x, values, width=body_w, color=colors)
+            ax.add_collection(PolyCollection(
+                [
+                    [(i - body_w / 2, 0.0), (i + body_w / 2, 0.0),
+                     (i + body_w / 2, v), (i - body_w / 2, v)]
+                    for i, v in enumerate(values)
+                ],
+                facecolors=colors, edgecolors="none",
+            ))
             ax.axhline(0, color="#888888", linewidth=0.8)
             ax.axhline(th, color=color, linewidth=1.0, linestyle="--", alpha=0.8)
             ax.set_ylabel(f"{label}\n≧{th:+.2f}", color=color, fontsize=9)
@@ -3751,10 +3817,14 @@ class EntrySignalChart(QtWidgets.QWidget):
         # ribbon (green = 成立) carries the same information legibly.
         dense: bool = n > 150
         if dense:
-            ax_mark.bar(
-                x, [0.42] * n, bottom=0.5, width=0.92,
-                color=["#00e58a" if r.get("ok") else "#3a4048" for r in rows]
-            )
+            ax_mark.add_collection(PolyCollection(
+                [
+                    [(i - 0.46, 0.5), (i + 0.46, 0.5), (i + 0.46, 0.92), (i - 0.46, 0.92)]
+                    for i in range(n)
+                ],
+                facecolors=["#00e58a" if r.get("ok") else "#3a4048" for r in rows],
+                edgecolors="none",
+            ))
             for i, r in enumerate(rows):
                 if r["fire"]:
                     ax_mark.text(i, 0.30, str(int(r["streak"])), ha="center", va="center",
@@ -3803,7 +3873,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         # one hair-line per panel, moved by the mouse
         for ax in (ax_fut, ax_atm, ax_put, ax_call, ax_mark):
             line = ax.axvline(0, color="#dddddd", linewidth=0.8, alpha=0.55,
-                              visible=False, zorder=5)
+                              visible=False, zorder=5, animated=True)
             self._cursor_lines.append(line)
 
         # …and the read-out that travels with it, like 株価チャート's cursor
@@ -3814,7 +3884,7 @@ class EntrySignalChart(QtWidgets.QWidget):
             transform=ax_fut.get_xaxis_transform(),
             fontsize=8.5, color="#e8e8e8", va="top", ha="left", linespacing=1.45,
             bbox=dict(boxstyle="round,pad=0.4", fc="#12161b", ec="#5a6068", alpha=0.94),
-            zorder=6,
+            zorder=6, animated=True,
         )
         self._cursor_box.set_visible(False)
 
