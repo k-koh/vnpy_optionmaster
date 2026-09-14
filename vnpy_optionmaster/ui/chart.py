@@ -8,7 +8,7 @@ import pyqtgraph as pg
 from typing import cast
 
 from vnpy.trader.ui import QtWidgets, QtCore, QtGui
-from vnpy.trader.event import EVENT_TIMER
+from vnpy.trader.event import EVENT_TIMER, EVENT_TICK
 from vnpy.trader.constant import Exchange, Interval
 from vnpy.trader.database import DB_TZ, get_database, BaseDatabase
 from vnpy.trader.object import BarData
@@ -3201,16 +3201,27 @@ class EntrySignalChart(QtWidgets.QWidget):
 
     MAX_COLUMNS: int = 120
 
+    # Ticks arrive many times per second; the chart repaints at most this often.
+    LIVE_REDRAW_MS: int = 1000
+
+    signal_tick: QtCore.Signal = QtCore.Signal(Event)
+
     def __init__(self, option_engine: OptionEngine, portfolio_name: str) -> None:
         super().__init__()
 
         self.option_engine: OptionEngine = option_engine
         self.portfolio_name: str = portfolio_name
+        self.event_engine: EventEngine = option_engine.event_engine
 
         self.fig: Figure = Figure(figsize=(14, 8))
         self.canvas: FigureCanvas = FigureCanvas(self.fig)
         self._truncated: bool = False
         self._rows: list[dict] = []
+        # The full evaluated history, including the rows before 開始 that the
+        # lookback needs. _rows is the visible slice of it.
+        self._all_rows: list[dict] = []
+        self._tick_price: float = 0.0
+        self._tick_dirty: bool = False
         self._cursor_lines: list = []
         self._cursor_ix: int = -1
         self._cursor_box = None
@@ -3324,19 +3335,25 @@ class EntrySignalChart(QtWidgets.QWidget):
         self.wing_spin.setToolTip("Put/Call ウィングのしきい値")
         self.wing_spin.valueChanged.connect(self.run_analysis)
 
-        self.refresh_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
-        self.refresh_spin.setRange(5, 600)
-        self.refresh_spin.setValue(10)
-        self.refresh_spin.setSuffix("秒")
-        self.refresh_spin.setFixedWidth(70)
-        self.refresh_spin.valueChanged.connect(self._on_refresh_interval_changed)
+        # Tick更新 is the only automatic refresh: the chart follows the tick
+        # stream, so there is no periodic DB reload to configure. 更新 reloads
+        # from the database on demand.
+        self.tick_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("Tick更新")
+        self.tick_check.setChecked(True)
+        self.tick_check.setToolTip(
+            "ティックが来るたびに、形成中の足だけをライブ値で描き直します。\n"
+            "先物値はティック、ATM/PUT/CALLのIVはOptionMasterのチェーンから直接読むので\n"
+            "DBは読みません。描画は最大1秒に1回にまとめます。\n"
+            "DBから読み直すときは「更新」を押してください。"
+        )
+        self.tick_check.toggled.connect(self._on_tick_toggled)
 
-        self.auto_refresh_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("自動更新")
-        self.auto_refresh_check.setChecked(True)
-        self.auto_refresh_check.toggled.connect(self._on_auto_refresh_toggled)
+        # Coalescing timer: ticks only set a flag, this repaints at most 1/s.
+        self._live_timer: QtCore.QTimer = QtCore.QTimer(self)
+        self._live_timer.timeout.connect(self._live_refresh)
 
-        self._refresh_timer: QtCore.QTimer = QtCore.QTimer(self)
-        self._refresh_timer.timeout.connect(self._auto_refresh)
+        self.signal_tick.connect(self._process_tick_event)
+        self.event_engine.register(EVENT_TICK, self.signal_tick.emit)
 
         button: QtWidgets.QPushButton = QtWidgets.QPushButton("更新")
         button.clicked.connect(self.run_analysis)
@@ -3365,8 +3382,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         hbox.addWidget(QtWidgets.QLabel("ウィング≧"))
         hbox.addWidget(self.wing_spin)
         hbox.addStretch()
-        hbox.addWidget(self.refresh_spin)
-        hbox.addWidget(self.auto_refresh_check)
+        hbox.addWidget(self.tick_check)
         hbox.addWidget(button)
         hbox.addWidget(self.status_label)
 
@@ -3405,8 +3421,7 @@ class EntrySignalChart(QtWidgets.QWidget):
             "wing_threshold": self.wing_spin.value(),
             "auto_start": self.auto_start_check.isChecked(),
             "now_end": self.now_end_check.isChecked(),
-            "auto_refresh": self.auto_refresh_check.isChecked(),
-            "refresh_seconds": self.refresh_spin.value(),
+            "tick_update": self.tick_check.isChecked(),
         }
         save_json(self.SETTING_FILENAME, data)
 
@@ -3429,8 +3444,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         self.wing_spin.setValue(data.get("wing_threshold", 0.20))
         self.auto_start_check.setChecked(data.get("auto_start", True))
         self.now_end_check.setChecked(data.get("now_end", True))
-        self.refresh_spin.setValue(data.get("refresh_seconds", 10))
-        self.auto_refresh_check.setChecked(data.get("auto_refresh", True))
+        self.tick_check.setChecked(data.get("tick_update", True))
 
     # -------------------------------------------------------------- timing
     @staticmethod
@@ -3491,36 +3505,37 @@ class EntrySignalChart(QtWidgets.QWidget):
         if not self.now_end_check.isChecked():
             self.run_analysis()
 
-    def _on_auto_refresh_toggled(self, checked: bool) -> None:
-        if checked:
-            self._refresh_timer.start(self.refresh_spin.value() * 1000)
-            if self.isVisible():
-                self.run_analysis()
+    def _on_tick_toggled(self, checked: bool) -> None:
+        if checked and self.isVisible():
+            self._live_timer.start(self.LIVE_REDRAW_MS)
         else:
-            self._refresh_timer.stop()
+            self._live_timer.stop()
 
-    def _on_refresh_interval_changed(self, seconds: int) -> None:
-        if self.auto_refresh_check.isChecked():
-            self._refresh_timer.start(seconds * 1000)
-
-    def _auto_refresh(self) -> None:
-        # A pinned 終了 makes the window static — nothing new can arrive.
-        if not self.isVisible() or not self.now_end_check.isChecked():
+    def _process_tick_event(self, event: Event) -> None:
+        """Remember the newest futures print; the repaint is coalesced."""
+        if not self.tick_check.isChecked() or not self.isVisible():
             return
-        self._sync_start_edit()
-        self._sync_end_edit()
-        self.run_analysis()
+        if not self.now_end_check.isChecked():
+            return                      # a pinned 終了 is a static window
+        tick = event.data
+        if tick.vt_symbol != f"nk-{self.month_combo.currentText()}.JPX":
+            return
+        price: float = tick.last_price or 0.0
+        if not price:
+            return
+        self._tick_price = price
+        self._tick_dirty = True
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
         self._sync_start_edit()
         self._sync_end_edit()
-        if self.auto_refresh_check.isChecked():
-            self._refresh_timer.start(self.refresh_spin.value() * 1000)
+        if self.tick_check.isChecked():
+            self._live_timer.start(self.LIVE_REDRAW_MS)
         self.run_analysis()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        self._refresh_timer.stop()
+        self._live_timer.stop()
         self._save_settings()
         super().closeEvent(event)
 
@@ -3619,6 +3634,10 @@ class EntrySignalChart(QtWidgets.QWidget):
                 if r["cs"] and prev["cs"] and r["cs"] != prev["cs"]:
                     off_c += r["call"] - prev["call"]
                     r["roll"] = True
+            # Kept per row so a live tick can extend the tail without redoing
+            # the whole back-adjustment.
+            r["off_p"] = off_p
+            r["off_c"] = off_c
             r["put_adj"] = r["put"] - off_p
             r["call_adj"] = r["call"] - off_c
 
@@ -3755,23 +3774,124 @@ class EntrySignalChart(QtWidgets.QWidget):
             self._cursor_box.set_visible(False)
         self._blit_cursor()
 
+    # ---------------------------------------------------------------- live
+    def _live_chain(self):
+        """The ChainData for the selected 限月, or None."""
+        month: str = self.month_combo.currentText()
+        if not month:
+            return None
+        try:
+            portfolio = self.option_engine.get_portfolio(self.portfolio_name)
+        except Exception:
+            return None
+        for chain_symbol, chain in portfolio.chains.items():
+            if chain_symbol.split(".")[0].endswith(month):
+                return chain
+        return None
+
+    def _live_refresh(self) -> None:
+        """Fold the newest tick into the forming bar and repaint.
+
+        No database access at all: the futures price comes from the tick and
+        ATM / Δ0.1 Put / Δ0.1 Call IV straight from OptionMaster's live chain —
+        the very same values the recorder writes onto the minute bars. Only the
+        last bucket is touched; the history stays as the last DB load left it.
+        """
+        if not self._tick_dirty or not self.isVisible():
+            return
+        self._tick_dirty = False
+
+        rows: list[dict] = self._all_rows
+        if not rows or not self._tick_price:
+            return
+
+        # Follow the running session. A rollover (day → night) moves 開始, and
+        # that is the one case the tick path cannot patch up — reload instead.
+        if self.auto_start_check.isChecked():
+            before: datetime = self._start_datetime()
+            self._sync_start_edit()
+            if self._start_datetime() != before:
+                self.run_analysis()
+                return
+        self._sync_end_edit()
+
+        minutes: int = self._interval_minutes()
+        now: datetime = datetime.now(DB_TZ)
+        floor: datetime = now.replace(
+            minute=now.minute - now.minute % minutes, second=0, microsecond=0
+        )
+        last: dict = rows[-1]
+        price: float = self._tick_price
+
+        if floor == last["dt"]:
+            last["high"] = max(last["high"], price)
+            last["low"] = min(last["low"], price)
+            last["close"] = price
+        elif floor > last["dt"]:
+            last = dict(
+                dt=floor, open=price, high=price, low=price, close=price,
+                atm=last["atm"], put=last["put"], call=last["call"],
+                ps=last["ps"], cs=last["cs"],
+            )
+            rows.append(last)
+        else:
+            return                      # tick belongs to a closed bucket
+
+        # live IVs from the chain (same fields the recorder stores on the bar)
+        chain = self._live_chain()
+        if chain is not None:
+            if chain.atm_impv:
+                last["atm"] = chain.atm_impv * 100
+            if chain.eris_p_iv:
+                last["put"] = chain.eris_p_iv * 100
+            if chain.eris_c_iv:
+                last["call"] = chain.eris_c_iv * 100
+            if chain.eris_p_strike:
+                last["ps"] = int(chain.eris_p_strike)
+            if chain.eris_c_strike:
+                last["cs"] = int(chain.eris_c_strike)
+
+        # re-run the 行使価格変更 back-adjustment for this one row
+        prev = rows[-2] if len(rows) > 1 else None
+        off_p: float = prev["off_p"] if prev else 0.0
+        off_c: float = prev["off_c"] if prev else 0.0
+        last["roll"] = False
+        if prev:
+            if last["ps"] and prev["ps"] and last["ps"] != prev["ps"]:
+                off_p += last["put"] - prev["put"]
+                last["roll"] = True
+            if last["cs"] and prev["cs"] and last["cs"] != prev["cs"]:
+                off_c += last["call"] - prev["call"]
+                last["roll"] = True
+        last["off_p"] = off_p
+        last["off_c"] = off_c
+        last["put_adj"] = last["put"] - off_p
+        last["call_adj"] = last["call"] - off_c
+
+        self.evaluate(rows)             # O(n), microseconds
+        self._show(rows)
+
     # -------------------------------------------------------------- render
+    def _show(self, rows: list[dict]) -> None:
+        """Slice the evaluated history to 開始 + 最大本数 and draw it."""
+        start: datetime = self._start_datetime()
+        shown: list[dict] = [r for r in rows if r["dt"] >= start]
+        max_bars: int = self.max_bars_spin.value()
+        self._truncated = len(shown) > max_bars
+        if self._truncated:
+            shown = shown[-max_bars:]
+        self.update_chart(shown)
+
     def run_analysis(self, *_args) -> None:
         self.status_label.setText(
             "最終更新: " + datetime.now().strftime("%H:%M:%S")
         )
         rows: list[dict] = self.evaluate(self.build_buckets())
-        start: datetime = self._start_datetime()
-        shown: list[dict] = [r for r in rows if r["dt"] >= start]
-
+        self._all_rows = rows
+        self._tick_dirty = False
         # A pinned start plus a fine 時間足 can run to hundreds of columns;
-        # keep the newest 最大本数 so the grid stays readable.
-        max_bars: int = self.max_bars_spin.value()
-        self._truncated = len(shown) > max_bars
-        if self._truncated:
-            shown = shown[-max_bars:]
-
-        self.update_chart(shown)
+        # _show keeps the newest 最大本数 so the grid stays readable.
+        self._show(rows)
 
     def update_chart(self, rows: list[dict]) -> None:
         self.fig.clear()
