@@ -9,7 +9,7 @@ from typing import cast
 
 from vnpy.trader.ui import QtWidgets, QtCore, QtGui
 from vnpy.trader.event import EVENT_TIMER, EVENT_TICK
-from vnpy.trader.constant import Exchange, Interval
+from vnpy.trader.constant import Exchange, Interval, OptionPrevIvType
 from vnpy.trader.database import DB_TZ, get_database, BaseDatabase
 from vnpy.trader.object import BarData
 
@@ -3290,16 +3290,6 @@ class EntrySignalChart(QtWidgets.QWidget):
         self.interval_combo.setCurrentText("10m")
         self.interval_combo.currentTextChanged.connect(self.run_analysis)
 
-        # 比較幅: every bar is judged against this many minutes ago.
-        self.lookback_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
-        self.lookback_spin.setRange(5, 480)
-        self.lookback_spin.setSingleStep(10)
-        self.lookback_spin.setValue(60)
-        self.lookback_spin.setSuffix("分前")
-        self.lookback_spin.setFixedWidth(85)
-        self.lookback_spin.setToolTip("各足を何分前と比べるか（既定60分）")
-        self.lookback_spin.valueChanged.connect(self.run_analysis)
-
         # How many bars the grid may draw. 1m足 over a whole session needs a
         # few hundred; past that the columns stop being readable.
         self.max_bars_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
@@ -3314,21 +3304,13 @@ class EntrySignalChart(QtWidgets.QWidget):
         )
         self.max_bars_spin.valueChanged.connect(self.run_analysis)
 
-        self.hold_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
-        self.hold_spin.setRange(1, 12)
-        self.hold_spin.setValue(3)
-        self.hold_spin.setSuffix("本")
-        self.hold_spin.setFixedWidth(60)
-        self.hold_spin.setToolTip("条件が何本連続で成立したら▲を出すか")
-        self.hold_spin.valueChanged.connect(self.run_analysis)
-
         self.atm_spin: QtWidgets.QDoubleSpinBox = QtWidgets.QDoubleSpinBox()
         self.atm_spin.setRange(0.0, 5.0)
         self.atm_spin.setSingleStep(0.05)
         self.atm_spin.setDecimals(2)
         self.atm_spin.setValue(0.30)
         self.atm_spin.setFixedWidth(65)
-        self.atm_spin.setToolTip("ATM IV のしきい値")
+        self.atm_spin.setToolTip("ATM IV 前日比の色分けしきい値")
         self.atm_spin.valueChanged.connect(self.run_analysis)
 
         self.wing_spin: QtWidgets.QDoubleSpinBox = QtWidgets.QDoubleSpinBox()
@@ -3337,7 +3319,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         self.wing_spin.setDecimals(2)
         self.wing_spin.setValue(0.20)
         self.wing_spin.setFixedWidth(65)
-        self.wing_spin.setToolTip("Put/Call ウィングのしきい値")
+        self.wing_spin.setToolTip("Put/Call ウィング 前日比の色分けしきい値")
         self.wing_spin.valueChanged.connect(self.run_analysis)
 
         # Tick更新 is the only automatic refresh: the chart follows the tick
@@ -3376,10 +3358,6 @@ class EntrySignalChart(QtWidgets.QWidget):
         hbox.addWidget(self.now_end_check)
         hbox.addWidget(QtWidgets.QLabel("時間足"))
         hbox.addWidget(self.interval_combo)
-        hbox.addWidget(QtWidgets.QLabel("比較"))
-        hbox.addWidget(self.lookback_spin)
-        hbox.addWidget(QtWidgets.QLabel("維持"))
-        hbox.addWidget(self.hold_spin)
         hbox.addWidget(QtWidgets.QLabel("最大"))
         hbox.addWidget(self.max_bars_spin)
         hbox.addWidget(QtWidgets.QLabel("ATM≧"))
@@ -3419,8 +3397,6 @@ class EntrySignalChart(QtWidgets.QWidget):
             "window_height": self.height(),
             "month": self.month_combo.currentText(),
             "interval": self.interval_combo.currentText(),
-            "lookback": self.lookback_spin.value(),
-            "hold": self.hold_spin.value(),
             "max_bars": self.max_bars_spin.value(),
             "atm_threshold": self.atm_spin.value(),
             "wing_threshold": self.wing_spin.value(),
@@ -3442,8 +3418,6 @@ class EntrySignalChart(QtWidgets.QWidget):
         if month and self.month_combo.findText(month) >= 0:
             self.month_combo.setCurrentText(month)
         self.interval_combo.setCurrentText(data.get("interval", "10m"))
-        self.lookback_spin.setValue(data.get("lookback", 60))
-        self.hold_spin.setValue(data.get("hold", 3))
         self.max_bars_spin.setValue(data.get("max_bars", self.MAX_COLUMNS))
         self.atm_spin.setValue(data.get("atm_threshold", 0.30))
         self.wing_spin.setValue(data.get("wing_threshold", 0.20))
@@ -3583,7 +3557,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         minutes: int = self._interval_minutes()
         start: datetime = self._start_datetime()
         end: datetime = self._end_datetime()
-        query_start: datetime = start - timedelta(minutes=self.lookback_spin.value() + minutes)
+        query_start: datetime = start - timedelta(minutes=minutes)
 
         database: BaseDatabase = get_database()
         bars: list[BarData] = database.load_bar_data(
@@ -3626,67 +3600,48 @@ class EntrySignalChart(QtWidgets.QWidget):
 
         rows: list[dict] = [buckets[k] for k in sorted(buckets) if buckets[k]["atm"]]
 
-        # Back-adjust the wings for 行使価格変更.
-        off_p: float = 0.0
-        off_c: float = 0.0
         for i, r in enumerate(rows):
-            r["roll"] = False
-            if i:
-                prev = rows[i - 1]
-                if r["ps"] and prev["ps"] and r["ps"] != prev["ps"]:
-                    off_p += r["put"] - prev["put"]
-                    r["roll"] = True
-                if r["cs"] and prev["cs"] and r["cs"] != prev["cs"]:
-                    off_c += r["call"] - prev["call"]
-                    r["roll"] = True
-            # Kept per row so a live tick can extend the tail without redoing
-            # the whole back-adjustment.
-            r["off_p"] = off_p
-            r["off_c"] = off_c
-            r["put_adj"] = r["put"] - off_p
-            r["call_adj"] = r["call"] - off_c
+            # Mark 行使価格変更 only; no back-adjustment is needed because the
+            # comparison is strike-for-strike against the previous day.
+            prev = rows[i - 1] if i else None
+            r["roll"] = bool(
+                prev and (
+                    (r["ps"] and prev["ps"] and r["ps"] != prev["ps"])
+                    or (r["cs"] and prev["cs"] and r["cs"] != prev["cs"])
+                )
+            )
+            self.apply_prev_day_diff(r)
 
         return rows
 
-    def evaluate(self, rows: list[dict]) -> list[dict]:
-        """Attach the per-bar judgement: the three deltas, ○/×, streak, ▲."""
-        lookback: timedelta = timedelta(minutes=self.lookback_spin.value())
-        minutes: int = self._interval_minutes()
-        tolerance: timedelta = timedelta(minutes=minutes + 1)
-        atm_th: float = self.atm_spin.value()
-        wing_th: float = self.wing_spin.value()
-        hold: int = self.hold_spin.value()
+    def apply_prev_day_diff(self, r: dict) -> None:
+        """Attach 前日比 for ATM / Δ0.1 Put / Δ0.1 Call to one bucket.
 
-        streak: int = 0
-        armed: bool = True
-        for i, r in enumerate(rows):
-            # the last bar at or before "lookback ago"
-            want: datetime = r["dt"] - lookback
-            j: int = i
-            while j > 0 and rows[j]["dt"] > want:
-                j -= 1
-            base = rows[j]
-            if i == j or (r["dt"] - base["dt"]) > lookback + tolerance:
-                r.update(d_atm=None, d_put=None, d_call=None, ok=False,
-                         streak=0, fire=False)
-                streak = 0
-                continue
+        Same definition as 株価チャート's iv_item: today's IV minus the
+        previous session's IV **of the same strike** (OptionPrevIvType.
+        SAME_STRIKE), in IV points. ATM uses the 1,000-yen rounded futures
+        price as its strike, exactly as iv_item does.
+        """
+        month: str = self.month_combo.currentText()
+        r["d_atm"] = r["d_put"] = r["d_call"] = None
+        if not month:
+            return
 
-            r["d_atm"] = r["atm"] - base["atm"]
-            r["d_put"] = r["put_adj"] - base["put_adj"]
-            r["d_call"] = r["call_adj"] - base["call_adj"]
-            r["ok"] = (r["d_atm"] >= atm_th and r["d_put"] >= wing_th
-                       and r["d_call"] >= wing_th)
-            if r["ok"]:
-                streak += 1
-            else:
-                streak = 0
-                armed = True
-            r["streak"] = streak
-            r["fire"] = bool(r["ok"] and streak >= hold and armed and not r["roll"])
-            if r["fire"]:
-                armed = False
-        return rows
+        atm_strike: int = int(round(r["close"] / 1000) * 1000)
+        try:
+            p_prev, c_prev, a_prev = self.option_engine.get_prev_day_option_iv(
+                f"nk-{month}", OptionPrevIvType.SAME_STRIKE,
+                r["ps"], r["cs"], atm_strike, r["dt"],
+            )
+        except Exception:
+            return
+
+        if r["atm"] and a_prev:
+            r["d_atm"] = r["atm"] - a_prev * 100
+        if r["put"] and p_prev:
+            r["d_put"] = r["put"] - p_prev * 100
+        if r["call"] and c_prev:
+            r["d_call"] = r["call"] - c_prev * 100
 
     # -------------------------------------------------------------- cursor
     def _on_draw(self, event) -> None:
@@ -3771,14 +3726,10 @@ class EntrySignalChart(QtWidgets.QWidget):
         parts: list[str] = [
             r["dt"].strftime("%m/%d %H:%M"),
             f"先物 {r['close']:,.0f} (O {r['open']:,.0f} H {r['high']:,.0f} L {r['low']:,.0f})",
-            f"ATM {r['atm']:5.2f} ({d('d_atm')})",
-            f"PUT {r['put_adj']:5.2f} ({d('d_put')})",
-            f"CALL {r['call_adj']:5.2f} ({d('d_call')})",
-            f"判定 {'○' if r.get('ok') else '×'}",
-            f"連続 {int(r.get('streak') or 0)}",
+            f"ATM {r['atm']:5.2f} (前日比 {d('d_atm')})",
+            f"PUT {r['put']:5.2f} (前日比 {d('d_put')})",
+            f"CALL {r['call']:5.2f} (前日比 {d('d_call')})",
         ]
-        if r.get("fire"):
-            parts.append("▲ ENTRY")
         if r.get("roll"):
             parts.append(f"行使価格変更 P{r['ps']}/C{r['cs']}")
         self.cursor_label.setText("　|　".join(parts))
@@ -3793,12 +3744,10 @@ class EntrySignalChart(QtWidgets.QWidget):
                 f"先物 {r['close']:,.0f}",
                 f"  H {r['high']:,.0f}  L {r['low']:,.0f}",
                 f"ATM  {r['atm']:6.2f} ({d('d_atm')})",
-                f"PUT  {r['put_adj']:6.2f} ({d('d_put')})",
-                f"CALL {r['call_adj']:6.2f} ({d('d_call')})",
-                f"判定 {'○' if r.get('ok') else '×'}   連続 {int(r.get('streak') or 0)}",
+                f"PUT  {r['put']:6.2f} ({d('d_put')})",
+                f"CALL {r['call']:6.2f} ({d('d_call')})",
+                "   前日比",
             ]
-            if r.get("fire"):
-                lines.append("▲ ENTRY")
             if r.get("roll"):
                 lines.append("行使価格変更")
             self._cursor_box.set_ha("left" if box_on_right else "right")
@@ -3898,24 +3847,14 @@ class EntrySignalChart(QtWidgets.QWidget):
             if chain.eris_c_strike:
                 last["cs"] = int(chain.eris_c_strike)
 
-        # re-run the 行使価格変更 back-adjustment for this one row
         prev = rows[-2] if len(rows) > 1 else None
-        off_p: float = prev["off_p"] if prev else 0.0
-        off_c: float = prev["off_c"] if prev else 0.0
-        last["roll"] = False
-        if prev:
-            if last["ps"] and prev["ps"] and last["ps"] != prev["ps"]:
-                off_p += last["put"] - prev["put"]
-                last["roll"] = True
-            if last["cs"] and prev["cs"] and last["cs"] != prev["cs"]:
-                off_c += last["call"] - prev["call"]
-                last["roll"] = True
-        last["off_p"] = off_p
-        last["off_c"] = off_c
-        last["put_adj"] = last["put"] - off_p
-        last["call_adj"] = last["call"] - off_c
-
-        self.evaluate(rows)             # O(n), microseconds
+        last["roll"] = bool(
+            prev and (
+                (last["ps"] and prev["ps"] and last["ps"] != prev["ps"])
+                or (last["cs"] and prev["cs"] and last["cs"] != prev["cs"])
+            )
+        )
+        self.apply_prev_day_diff(last)
         self._show(rows)
 
     # -------------------------------------------------------------- render
@@ -3933,7 +3872,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         self.status_label.setText(
             "最終更新: " + datetime.now().strftime("%H:%M:%S")
         )
-        rows: list[dict] = self.evaluate(self.build_buckets())
+        rows: list[dict] = self.build_buckets()
         self._all_rows = rows
         self._tick_dirty = False
         # A pinned start plus a fine 時間足 can run to hundreds of columns;
@@ -3981,8 +3920,6 @@ class EntrySignalChart(QtWidgets.QWidget):
         ax_atm = self.fig.add_subplot(gs[1, 0], sharex=ax_fut)
         ax_put = self.fig.add_subplot(gs[2, 0], sharex=ax_fut)
         ax_call = self.fig.add_subplot(gs[3, 0], sharex=ax_fut)
-
-        fire_ix: list[int] = [i for i, r in enumerate(rows) if r["fire"]]
 
         # ---- futures OHLC bars
         # Batched into three collections instead of ~3 artists per bar: at 600
@@ -4041,8 +3978,7 @@ class EntrySignalChart(QtWidgets.QWidget):
             f"nk-{self.month_combo.currentText()}   "
             f"{rows[0]['dt'].strftime('%m/%d %H:%M')} – {last['dt'].strftime('%H:%M')}   "
             f"{self.interval_combo.currentText()}足 {n}本   "
-            f"{self.lookback_spin.value()}分前と比較   "
-            f"{self.hold_spin.value()}本維持で▲"
+            f"前日比IV（同一行使価格）"
             + ("　（最大{}本のため古い側を省略）".format(self.max_bars_spin.value())
                if self._truncated else ""),
             color="#dddddd", fontsize=11, loc="left", pad=4
@@ -4072,7 +4008,7 @@ class EntrySignalChart(QtWidgets.QWidget):
             ))
             ax.axhline(0, color="#888888", linewidth=0.8)
             ax.axhline(th, color=color, linewidth=1.0, linestyle="--", alpha=0.8)
-            ax.set_ylabel(f"{label}\n≧{th:+.2f}", color=color, fontsize=9)
+            ax.set_ylabel(f"{label}\n前日比", color=color, fontsize=9)
             ax.tick_params(labelbottom=False, labelleft=False, labelsize=8)
             ax.set_xticks([])
             ax.grid(False)
@@ -4110,16 +4046,6 @@ class EntrySignalChart(QtWidgets.QWidget):
             color="#9aa3ad", fontsize=8,
         )
         ax_call.tick_params(axis="x", labelbottom=True, colors="#9aa3ad", length=3)
-
-        # ---- highlight the ▲ columns across every row
-        for i in fire_ix:
-            for ax in (ax_fut, ax_atm, ax_put, ax_call):
-                ax.axvspan(i - 0.5, i + 0.5, color="#00e58a", alpha=0.13, zorder=0)
-            ax_fut.annotate(
-                "▲", xy=(i, 0.985), xycoords=("data", "axes fraction"),
-                ha="center", va="top", color="#00e58a",
-                fontsize=13, fontweight="bold"
-            )
 
         # 行使価格変更 markers (the signal is suppressed on those bars)
         for i, r in enumerate(rows):
@@ -4166,24 +4092,16 @@ class EntrySignalChart(QtWidgets.QWidget):
         )
         self._cursor_box.set_visible(False)
 
-        # ---- status line: what the latest bar says
+        # ---- status line: the latest bar's 前日比
         latest = rows[-1]
-        if latest.get("d_atm") is None:
-            state = "比較対象となる過去データが不足しています"
-        elif latest["fire"]:
-            state = f"▲ エントリー条件成立（連続{latest['streak']}本）"
-        elif latest["ok"]:
-            state = (f"○ 条件成立中 — あと{max(0, self.hold_spin.value() - latest['streak'])}本で▲"
-                     f"（連続{latest['streak']}本）")
+        if all(latest.get(k) is None for k in ("d_atm", "d_put", "d_call")):
+            state = "前日IVが取得できません（OptionMasterの「前日データ再読込」をお試しください）"
         else:
-            missing: list[str] = []
-            if latest["d_atm"] < atm_th:
-                missing.append(f"ATM {latest['d_atm']:+.2f}")
-            if latest["d_put"] < wing_th:
-                missing.append(f"PUT {latest['d_put']:+.2f}")
-            if latest["d_call"] < wing_th:
-                missing.append(f"CALL {latest['d_call']:+.2f}")
-            state = "× 未成立 — " + " / ".join(missing)
+            def _s(key: str) -> str:
+                v = latest.get(key)
+                return "---" if v is None else f"{v:+.2f}"
+            state = (f"前日比　ATM {_s('d_atm')} / PUT {_s('d_put')} / "
+                     f"CALL {_s('d_call')}")
         self.status_label.setText(
             "最終更新: " + datetime.now().strftime("%H:%M:%S") + "　" + state
         )
