@@ -3223,7 +3223,12 @@ class EntrySignalChart(QtWidgets.QWidget):
         self._tick_price: float = 0.0
         self._tick_dirty: bool = False
         self._cursor_lines: list = []
+        # Horizontal half of the crosshair: one line + one value tag per value
+        # panel, shown only in the panel the mouse is actually in.
+        self._cursor_hlines: list = []
+        self._cursor_tags: list = []
         self._cursor_ix: int = -1
+        self._cursor_key: tuple = ()
         self._cursor_box = None
         # Blitting: the cursor artists are `animated`, so a normal draw skips
         # them; we cache that clean canvas and repaint only the cursor on top.
@@ -3703,6 +3708,11 @@ class EntrySignalChart(QtWidgets.QWidget):
         for line in self._cursor_lines:
             if line.axes is not None:
                 line.axes.draw_artist(line)
+        for (ax, hline, _kind), tag in zip(self._cursor_hlines, self._cursor_tags):
+            if hline.get_visible():
+                ax.draw_artist(hline)
+            if tag.get_visible():
+                ax.draw_artist(tag)
         if self._cursor_box is not None and self._cursor_box.get_visible():
             self._cursor_box.axes.draw_artist(self._cursor_box)
         self.canvas.blit(self.fig.bbox)
@@ -3715,10 +3725,44 @@ class EntrySignalChart(QtWidgets.QWidget):
 
         ix: int = int(round(event.xdata))
         ix = max(0, min(len(rows) - 1, ix))
-        if ix == self._cursor_ix:
-            return          # same bar — no redraw on every pixel of movement
+        # Repaint when the bar changes or the pointer moves a pixel vertically
+        # (the horizontal hair has to follow it), but not on identical events.
+        key: tuple = (ix, int(event.y or 0), id(event.inaxes))
+        if key == self._cursor_key:
+            return
+        self._cursor_key = key
+        same_bar: bool = ix == self._cursor_ix
         self._cursor_ix = ix
         r: dict = rows[ix]
+
+        # --- horizontal hair + value tag, only in the hovered panel
+        n_bars: int = len(rows)
+        box_on_right: bool = ix <= n_bars - 1 - (n_bars - 1) * 0.2
+        for (ax, hline, kind), tag in zip(self._cursor_hlines, self._cursor_tags):
+            if ax is event.inaxes and event.ydata is not None:
+                y: float = float(event.ydata)
+                hline.set_ydata([y, y])
+                hline.set_visible(True)
+                # The tag sits on the LEFT of the hair by default: that keeps
+                # it inside the axes at the right edge (where it used to be
+                # clipped by the window) and clear of the info box, which
+                # extends to the right. Only at the very left does it flip.
+                x0, x1 = ax.get_xlim()
+                near_left: bool = event.xdata < x0 + (x1 - x0) * 0.10
+                tag.set_ha("left" if near_left else "right")
+                tag.set_position((event.xdata + (0.8 if near_left else -0.8), y))
+                tag.set_text(f"{y:,.0f}" if kind == "price" else f"{y:+.2f}")
+                tag.set_visible(True)
+            else:
+                hline.set_visible(False)
+                tag.set_visible(False)
+
+        if same_bar:
+            # nothing else changed — just move the hair
+            for line in self._cursor_lines:
+                line.set_visible(True)
+            self._blit_cursor()
+            return
 
         def d(key: str) -> str:
             v = r.get(key)
@@ -3757,10 +3801,8 @@ class EntrySignalChart(QtWidgets.QWidget):
                 lines.append("▲ ENTRY")
             if r.get("roll"):
                 lines.append("行使価格変更")
-            n_bars: int = len(rows)
-            flip: bool = ix > n_bars - 1 - (n_bars - 1) * 0.2
-            self._cursor_box.set_ha("right" if flip else "left")
-            self._cursor_box.set_position((ix + (-0.5 if flip else 0.5), 0.985))
+            self._cursor_box.set_ha("left" if box_on_right else "right")
+            self._cursor_box.set_position((ix + (0.5 if box_on_right else -0.5), 0.985))
             self._cursor_box.set_text("\n".join(lines))
             self._cursor_box.set_visible(True)
 
@@ -3768,8 +3810,13 @@ class EntrySignalChart(QtWidgets.QWidget):
 
     def _on_mouse_leave(self, event) -> None:
         self._cursor_ix = -1
+        self._cursor_key = ()
         for line in getattr(self, "_cursor_lines", []):
             line.set_visible(False)
+        for _ax, hline, _kind in getattr(self, "_cursor_hlines", []):
+            hline.set_visible(False)
+        for tag in getattr(self, "_cursor_tags", []):
+            tag.set_visible(False)
         if self._cursor_box is not None:
             self._cursor_box.set_visible(False)
         self._blit_cursor()
@@ -3897,7 +3944,10 @@ class EntrySignalChart(QtWidgets.QWidget):
         self.fig.clear()
         self._rows = rows
         self._cursor_lines = []
+        self._cursor_hlines = []
+        self._cursor_tags = []
         self._cursor_ix = -1
+        self._cursor_key = ()
         self._cursor_box = None
         self._background = None
 
@@ -3915,15 +3965,22 @@ class EntrySignalChart(QtWidgets.QWidget):
         n: int = len(rows)
         x = np.arange(n)
 
+        # Margins in pixels rather than fractions: on a tall window a 6% top
+        # margin turns into a wide empty band above the 先物 panel, and a 5.5%
+        # left margin wastes an inch on a wide one.
+        w_px: float = max(1.0, self.fig.get_size_inches()[0] * self.fig.dpi)
+        h_px: float = max(1.0, self.fig.get_size_inches()[1] * self.fig.dpi)
         gs = self.fig.add_gridspec(
-            5, 1, height_ratios=[3.2, 1.5, 1.5, 1.5, 0.9], hspace=0.12,
-            left=0.055, right=0.995, top=0.94, bottom=0.02
+            4, 1, height_ratios=[3.2, 1.5, 1.5, 1.5], hspace=0.10,
+            left=min(0.12, 58.0 / w_px),
+            right=1.0 - min(0.05, 10.0 / w_px),
+            top=1.0 - min(0.12, 26.0 / h_px),
+            bottom=min(0.12, 28.0 / h_px),
         )
         ax_fut = self.fig.add_subplot(gs[0, 0])
         ax_atm = self.fig.add_subplot(gs[1, 0], sharex=ax_fut)
         ax_put = self.fig.add_subplot(gs[2, 0], sharex=ax_fut)
         ax_call = self.fig.add_subplot(gs[3, 0], sharex=ax_fut)
-        ax_mark = self.fig.add_subplot(gs[4, 0], sharex=ax_fut)
 
         fire_ix: list[int] = [i for i, r in enumerate(rows) if r["fire"]]
 
@@ -3988,7 +4045,7 @@ class EntrySignalChart(QtWidgets.QWidget):
             f"{self.hold_spin.value()}本維持で▲"
             + ("　（最大{}本のため古い側を省略）".format(self.max_bars_spin.value())
                if self._truncated else ""),
-            color="#dddddd", fontsize=11, loc="left"
+            color="#dddddd", fontsize=11, loc="left", pad=4
         )
 
         # ---- the three condition rows
@@ -4017,6 +4074,7 @@ class EntrySignalChart(QtWidgets.QWidget):
             ax.axhline(th, color=color, linewidth=1.0, linestyle="--", alpha=0.8)
             ax.set_ylabel(f"{label}\n≧{th:+.2f}", color=color, fontsize=9)
             ax.tick_params(labelbottom=False, labelleft=False, labelsize=8)
+            ax.set_xticks([])
             ax.grid(False)
             for spine in ("top", "right", "left"):
                 ax.spines[spine].set_visible(False)
@@ -4040,50 +4098,22 @@ class EntrySignalChart(QtWidgets.QWidget):
             ax.set_ylim(min(0.0, min(values)) - span * 0.42,
                         max(th, max(values)) + span * 0.42)
 
-        # ---- verdict row
-        ax_mark.set_ylim(0, 1.0)
-        ax_mark.axis("off")
-        # ○/× per bar while the columns are wide enough to read; past that a
-        # ribbon (green = 成立) carries the same information legibly.
-        dense: bool = n > 150
-        if dense:
-            ax_mark.add_collection(PolyCollection(
-                [
-                    [(i - 0.46, 0.5), (i + 0.46, 0.5), (i + 0.46, 0.92), (i - 0.46, 0.92)]
-                    for i in range(n)
-                ],
-                facecolors=["#00e58a" if r.get("ok") else "#3a4048" for r in rows],
-                edgecolors="none",
-            ))
-            for i, r in enumerate(rows):
-                if r["fire"]:
-                    ax_mark.text(i, 0.30, str(int(r["streak"])), ha="center", va="center",
-                                 color="#00e58a", fontsize=7.5, fontweight="bold")
-        else:
-            mark_size: float = max(6.0, min(11.0, 11.0 * 40.0 / max(n, 1)))
-            for i, r in enumerate(rows):
-                ok: bool = bool(r.get("ok"))
-                ax_mark.text(i, 0.72, "○" if ok else "×", ha="center", va="center",
-                             color="#00e58a" if ok else "#5a6068",
-                             fontsize=mark_size, fontweight="bold")
-                streak: int = int(r.get("streak") or 0)
-                if streak:
-                    ax_mark.text(i, 0.36, str(streak), ha="center", va="center",
-                                 color="#00e58a" if r["fire"] else "#9aa3ad",
-                                 fontsize=max(5.0, mark_size * 0.8),
-                                 fontweight="bold" if r["fire"] else "normal")
-
-        # time labels along the bottom
+        # ---- time axis under the bottom (CALL) panel
+        # 判定 ○/× used to sit in a row of its own; the state is on the ▲ marks,
+        # the entry highlight and the cursor read-out, so the space is given
+        # back to the panels that carry numbers.
         label_step: int = max(1, math.ceil(n / 14))
-        for i, r in enumerate(rows):
-            if i % label_step and i != n - 1:
-                continue
-            ax_mark.text(i, 0.02, r["dt"].strftime("%H:%M"), ha="center", va="bottom",
-                         color="#9aa3ad", fontsize=8)
+        tick_ix: list[int] = [i for i in range(n) if i % label_step == 0 or i == n - 1]
+        ax_call.set_xticks(tick_ix)
+        ax_call.set_xticklabels(
+            [rows[i]["dt"].strftime("%H:%M") for i in tick_ix],
+            color="#9aa3ad", fontsize=8,
+        )
+        ax_call.tick_params(axis="x", labelbottom=True, colors="#9aa3ad", length=3)
 
         # ---- highlight the ▲ columns across every row
         for i in fire_ix:
-            for ax in (ax_fut, ax_atm, ax_put, ax_call, ax_mark):
+            for ax in (ax_fut, ax_atm, ax_put, ax_call):
                 ax.axvspan(i - 0.5, i + 0.5, color="#00e58a", alpha=0.13, zorder=0)
             ax_fut.annotate(
                 "▲", xy=(i, 0.985), xycoords=("data", "axes fraction"),
@@ -4098,13 +4128,31 @@ class EntrySignalChart(QtWidgets.QWidget):
             for ax in (ax_atm, ax_put, ax_call):
                 ax.axvline(i, color="#ffcc00", linewidth=0.8, linestyle=":", alpha=0.55)
 
-        ax_mark.set_xlim(-0.8, n - 0.2)
+        ax_fut.set_xlim(-0.8, n - 0.2)
 
         # one hair-line per panel, moved by the mouse
-        for ax in (ax_fut, ax_atm, ax_put, ax_call, ax_mark):
+        for ax in (ax_fut, ax_atm, ax_put, ax_call):
             line = ax.axvline(0, color="#dddddd", linewidth=0.8, alpha=0.55,
                               visible=False, zorder=5, animated=True)
             self._cursor_lines.append(line)
+
+        # Horizontal crosshair + value tag, per value panel. 判定 row has no
+        # meaningful y scale, so it is left out.
+        for ax, kind in (
+            (ax_fut, "price"), (ax_atm, "iv"), (ax_put, "iv"), (ax_call, "iv")
+        ):
+            hline = ax.axhline(
+                0, color="#dddddd", linewidth=0.8, alpha=0.55,
+                visible=False, zorder=5, animated=True,
+            )
+            tag = ax.text(
+                0, 0, "", color="#e8e8e8", fontsize=8.5, va="center", ha="left",
+                bbox=dict(boxstyle="round,pad=0.25", fc="#12161b",
+                          ec="#5a6068", alpha=0.94),
+                zorder=6, animated=True, visible=False,
+            )
+            self._cursor_hlines.append((ax, hline, kind))
+            self._cursor_tags.append(tag)
 
         # …and the read-out that travels with it, like 株価チャート's cursor
         # label: pinned to the top of the futures panel at the cursor's bar,
