@@ -91,6 +91,9 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         # curve because the futures moved). The two always sum to 前日比IV.
         self.iv_level_bars: dict[str, pg.BarGraphItem] = {}
         self.iv_slide_bars: dict[str, pg.BarGraphItem] = {}
+        # Δ値 / IV / 価格 / 売買差 for the strike above and below each Δ0.1
+        # strike — the next candidates when the Δ0.1 one is not tradable.
+        self.eris_neighbor_labels: dict[str, list[pg.TextItem]] = {}
         self.iv_diff_pos_text_items: dict[str, list[pg.TextItem]] = {} # Added for IV diff text
         self.iv_diff_neg_text_items: dict[str, list[pg.TextItem]] = {} # Added for IV diff text
         self.total_volume_text_items: dict[str, list[pg.TextItem]] = {} # Added for Volume text
@@ -473,6 +476,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.iv_level_bars[chain_symbol].hide()
         self.iv_slide_bars[chain_symbol].hide()
 
+        self.eris_neighbor_labels[chain_symbol] = []
         self.iv_diff_pos_text_items[chain_symbol] = [] # Initialize list for text items
         self.iv_diff_neg_text_items[chain_symbol] = []
         self.total_volume_text_items[chain_symbol] = []
@@ -857,6 +861,60 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 self.delta002_c_strike_lines[chain.chain_symbol].hide()
 
 
+            # ---- one strike either side of the Δ0.1 put / call ----------
+            for text_item in self.eris_neighbor_labels[chain.chain_symbol]:
+                self.impv_chart.removeItem(text_item)
+            self.eris_neighbor_labels[chain.chain_symbol].clear()
+
+            # Borrow the font straight off the eris strike line's own label so
+            # the two always match, whatever pyqtgraph's default turns out to be.
+            eris_label = self.eris_p_strike_lines[chain.chain_symbol].label
+            eris_text_item = getattr(eris_label, "textItem", None)
+            neighbor_font = (
+                eris_text_item.font() if eris_text_item is not None else QtGui.QFont()
+            )
+            neighbor_color = self.chain_colors[chain.chain_symbol]
+
+            def _neighbor_text(opt: OptionData, tag: str) -> str:
+                delta: float = opt.theo_delta / opt.size if opt.size else 0.0
+                parts: list[str] = [f"{tag}Δ{delta:.3f}", f"IV{opt.mid_impv * 100:.1f}"]
+                tick = opt.tick
+                if tick and tick.bid_price_1 and tick.ask_price_1:
+                    mid: float = (tick.bid_price_1 + tick.ask_price_1) / 2
+                    parts.append(f"¥{mid:.0f}")
+                    parts.append(f"差{tick.ask_price_1 - tick.bid_price_1:.0f}")
+                return " ".join(parts)
+
+            for options, eris_strike, tag in (
+                (chain.puts, chain.eris_p_strike, "P"),
+                (chain.calls, chain.eris_c_strike, "C"),
+            ):
+                if not eris_strike:
+                    continue
+                sorted_opts: list[OptionData] = sorted(
+                    options.values(), key=lambda o: o.strike_price
+                )
+                strikes_all: list[float] = [o.strike_price for o in sorted_opts]
+                if eris_strike not in strikes_all:
+                    continue
+                center: int = strikes_all.index(eris_strike)
+                for j in (center - 1, center + 1):
+                    if j < 0 or j >= len(sorted_opts):
+                        continue
+                    opt = sorted_opts[j]
+                    if not opt.mid_impv:
+                        continue
+                    label_item = pg.TextItem(
+                        text=_neighbor_text(opt, tag),
+                        color=neighbor_color,
+                        anchor=(0.5, 1),        # sits just above the point
+                    )
+                    label_item.setFont(neighbor_font)
+                    label_item.setPos(opt.strike_price, opt.mid_impv * 100)
+                    label_item.setZValue(5)
+                    self.impv_chart.addItem(label_item)
+                    self.eris_neighbor_labels[chain.chain_symbol].append(label_item)
+
             # Update ATM strike line
             if chain.atm_price:
                 self.atm_strike_lines[chain.chain_symbol].setPos(chain.atm_price)
@@ -1212,6 +1270,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                     iv_diff_neg_bar.show()
                 # The labels are built for whichever mode is active, so they
                 # simply follow the chain checkbox.
+                for text_item in self.eris_neighbor_labels[chain_symbol]:
+                    text_item.setVisible(True)
                 for text_item in self.iv_diff_pos_text_items[chain_symbol]:
                     text_item.setVisible(True)
                 for text_item in self.iv_diff_neg_text_items[chain_symbol]:
@@ -1239,6 +1299,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 total_volume_bar.hide()
                 iv_diff_pos_bar.hide()
                 iv_diff_neg_bar.hide()
+                for text_item in self.eris_neighbor_labels[chain_symbol]:
+                    text_item.hide()
                 for text_item in self.iv_diff_pos_text_items[chain_symbol]:
                     text_item.hide()
                 for text_item in self.iv_diff_neg_text_items[chain_symbol]:
