@@ -79,6 +79,10 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
         self.prev_call_curves: dict[str, pg.PlotCurveItem] = {}
         self.prev_put_curves: dict[str, pg.PlotCurveItem] = {}
+        # 前日IV + 面の上下 only: what today's curve would be if the futures had
+        # not moved at all. Above the 前日 curve = vol was bought this session,
+        # below it = sold — with the strike-sliding effect taken out.
+        self.level_curves: dict[str, pg.PlotCurveItem] = {}
 
         self.iv_diff_pos_bars: dict[str, pg.BarGraphItem] = {}
         self.iv_diff_neg_bars: dict[str, pg.BarGraphItem] = {}
@@ -337,6 +341,12 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             pen=pen_prev_day,
         )
 
+        self.level_curves[chain_symbol] = self.impv_chart.plot(
+            symbolSize=0,
+            name=symbol + " 前日IV+面の上下",
+            pen=pg.mkPen(color=(0, 229, 138), width=2, style=QtCore.Qt.DashDotLine),
+        )
+
         p_line_pen = pg.mkPen(color=color, width=2, style=QtCore.Qt.DotLine)
         c_line_pen = pg.mkPen(color=color, width=2, style=QtCore.Qt.DotLine)
         atm_line_pen = pg.mkPen(color=(255, 174, 201), width=2, style=QtCore.Qt.DotLine)
@@ -479,6 +489,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             (self.put_ask_curves[chain_symbol], symbol + " プット売"),
             (self.prev_call_curves[chain_symbol], symbol + " 前日コール"),
             (self.prev_put_curves[chain_symbol], symbol + " 前日プット"),
+            (self.level_curves[chain_symbol], symbol + " 前日IV+面の上下"),
         ):
             self._register_legend(chain_symbol, self.impv_chart, item, label)
         self._register_legend(
@@ -971,6 +982,12 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             level_h: list[float] = []
             slide_y0: list[float] = []
             slide_h: list[float] = []
+            # 前日IV + 面の上下 = today's IV read at the strike that has the same
+            # moneyness K/F as this strike had yesterday, i.e. the curve with
+            # the futures move undone. Named apart from the interpolation's own
+            # curve_x, which holds today's quoted strikes.
+            level_curve_x: list[float] = []
+            level_curve_y: list[float] = []
             if self.decomp_check.isChecked() and prev_price and underlying_price:
                 curve_x: list[float] = sorted(today_iv_map.keys())
 
@@ -999,9 +1016,18 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                     level_h.append(level)
                     slide_y0.append(level)
                     slide_h.append(slide)
+                    level_curve_x.append(strike)
+                    level_curve_y.append(iv_same)
 
             # Stacked: 面の上下 from zero, then 滑り on top of it, so the bar
             # as a whole still reads as 前日比IV.
+            if level_curve_x:
+                self.level_curves[chain.chain_symbol].setData(
+                    x=level_curve_x, y=level_curve_y
+                )
+            else:
+                self.level_curves[chain.chain_symbol].setData(x=[], y=[])
+
             self.iv_level_bars[chain.chain_symbol].setOpts(
                 x=level_x, height=level_h, y0=[0.0] * len(level_x),
                 width=bar_width_diff * 0.9,
@@ -1155,14 +1181,17 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             iv_diff_neg_bar = self.iv_diff_neg_bars[chain_symbol]
             level_bar = self.iv_level_bars[chain_symbol]
             slide_bar = self.iv_slide_bars[chain_symbol]
+            level_curve = self.level_curves[chain_symbol]
             decomp: bool = self.decomp_check.isChecked()
 
             if checkbox.isChecked() and decomp:
                 level_bar.show()
                 slide_bar.show()
+                level_curve.show()
             else:
                 level_bar.hide()
                 slide_bar.hide()
+                level_curve.hide()
 
             if checkbox.isChecked():
                 call_mid_curve.show()
