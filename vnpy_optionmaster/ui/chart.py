@@ -29,6 +29,7 @@ from matplotlib.figure import Figure        # noqa
 from matplotlib.patches import Patch, Rectangle        # noqa
 from matplotlib.lines import Line2D                   # noqa
 from matplotlib.collections import LineCollection, PolyCollection   # noqa
+from matplotlib.colors import to_rgba                 # noqa
 from matplotlib.transforms import blended_transform_factory  # noqa
 from mpl_toolkits.mplot3d import Axes3D     # noqa
 from pylab import mpl                       # noqa
@@ -3302,25 +3303,28 @@ class EntrySignalChart(QtWidgets.QWidget):
             "表示する最大本数。超えた分は古い側から切り捨てます。\n"
             "1m足でセッション全体を見るときは 400〜600 程度にしてください。"
         )
-        self.max_bars_spin.valueChanged.connect(self.run_analysis)
+        self.max_bars_spin.valueChanged.connect(self._redraw_only)
 
-        self.atm_spin: QtWidgets.QDoubleSpinBox = QtWidgets.QDoubleSpinBox()
-        self.atm_spin.setRange(0.0, 5.0)
-        self.atm_spin.setSingleStep(0.05)
-        self.atm_spin.setDecimals(2)
-        self.atm_spin.setValue(0.30)
-        self.atm_spin.setFixedWidth(65)
-        self.atm_spin.setToolTip("ATM IV 前日比の色分けしきい値")
-        self.atm_spin.valueChanged.connect(self.run_analysis)
+        # Which of the three series are drawn, and how solid their fills are.
+        self.atm_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("ATM")
+        self.put_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("PUT")
+        self.call_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("CALL")
+        for box in (self.atm_check, self.put_check, self.call_check):
+            box.setChecked(True)
+            box.setToolTip("この系列の表示/非表示")
+            box.toggled.connect(self._redraw_only)
 
-        self.wing_spin: QtWidgets.QDoubleSpinBox = QtWidgets.QDoubleSpinBox()
-        self.wing_spin.setRange(0.0, 5.0)
-        self.wing_spin.setSingleStep(0.05)
-        self.wing_spin.setDecimals(2)
-        self.wing_spin.setValue(0.20)
-        self.wing_spin.setFixedWidth(65)
-        self.wing_spin.setToolTip("Put/Call ウィング 前日比の色分けしきい値")
-        self.wing_spin.valueChanged.connect(self.run_analysis)
+        self.alpha_spin: QtWidgets.QDoubleSpinBox = QtWidgets.QDoubleSpinBox()
+        self.alpha_spin.setRange(0.05, 1.00)
+        self.alpha_spin.setSingleStep(0.05)
+        self.alpha_spin.setDecimals(2)
+        self.alpha_spin.setValue(0.45)
+        self.alpha_spin.setFixedWidth(65)
+        self.alpha_spin.setToolTip(
+            "棒の塗りの不透明度。小さいほど透けて、重なった系列が見えます。\n"
+            "1.00 にすると手前の系列で完全に隠れます。"
+        )
+        self.alpha_spin.valueChanged.connect(self._redraw_only)
 
         # Tick更新 is the only automatic refresh: the chart follows the tick
         # stream, so there is no periodic DB reload to configure. 更新 reloads
@@ -3360,10 +3364,12 @@ class EntrySignalChart(QtWidgets.QWidget):
         hbox.addWidget(self.interval_combo)
         hbox.addWidget(QtWidgets.QLabel("最大"))
         hbox.addWidget(self.max_bars_spin)
-        hbox.addWidget(QtWidgets.QLabel("ATM≧"))
-        hbox.addWidget(self.atm_spin)
-        hbox.addWidget(QtWidgets.QLabel("ウィング≧"))
-        hbox.addWidget(self.wing_spin)
+        hbox.addWidget(QtWidgets.QLabel("表示"))
+        hbox.addWidget(self.atm_check)
+        hbox.addWidget(self.put_check)
+        hbox.addWidget(self.call_check)
+        hbox.addWidget(QtWidgets.QLabel("透明度"))
+        hbox.addWidget(self.alpha_spin)
         hbox.addStretch()
         hbox.addWidget(self.tick_check)
         hbox.addWidget(button)
@@ -3398,8 +3404,10 @@ class EntrySignalChart(QtWidgets.QWidget):
             "month": self.month_combo.currentText(),
             "interval": self.interval_combo.currentText(),
             "max_bars": self.max_bars_spin.value(),
-            "atm_threshold": self.atm_spin.value(),
-            "wing_threshold": self.wing_spin.value(),
+            "fill_alpha": self.alpha_spin.value(),
+            "show_atm": self.atm_check.isChecked(),
+            "show_put": self.put_check.isChecked(),
+            "show_call": self.call_check.isChecked(),
             "auto_start": self.auto_start_check.isChecked(),
             "now_end": self.now_end_check.isChecked(),
             "tick_update": self.tick_check.isChecked(),
@@ -3419,8 +3427,10 @@ class EntrySignalChart(QtWidgets.QWidget):
             self.month_combo.setCurrentText(month)
         self.interval_combo.setCurrentText(data.get("interval", "10m"))
         self.max_bars_spin.setValue(data.get("max_bars", self.MAX_COLUMNS))
-        self.atm_spin.setValue(data.get("atm_threshold", 0.30))
-        self.wing_spin.setValue(data.get("wing_threshold", 0.20))
+        self.alpha_spin.setValue(data.get("fill_alpha", 0.45))
+        self.atm_check.setChecked(data.get("show_atm", True))
+        self.put_check.setChecked(data.get("show_put", True))
+        self.call_check.setChecked(data.get("show_call", True))
         self.auto_start_check.setChecked(data.get("auto_start", True))
         self.now_end_check.setChecked(data.get("now_end", True))
         self.tick_check.setChecked(data.get("tick_update", True))
@@ -3726,10 +3736,13 @@ class EntrySignalChart(QtWidgets.QWidget):
         parts: list[str] = [
             r["dt"].strftime("%m/%d %H:%M"),
             f"先物 {r['close']:,.0f} (O {r['open']:,.0f} H {r['high']:,.0f} L {r['low']:,.0f})",
-            f"ATM {r['atm']:5.2f} (前日比 {d('d_atm')})",
-            f"PUT {r['put']:5.2f} (前日比 {d('d_put')})",
-            f"CALL {r['call']:5.2f} (前日比 {d('d_call')})",
         ]
+        if self.atm_check.isChecked():
+            parts.append(f"ATM {r['atm']:5.2f} (前日比 {d('d_atm')})")
+        if self.put_check.isChecked():
+            parts.append(f"PUT {r['put']:5.2f} (前日比 {d('d_put')})")
+        if self.call_check.isChecked():
+            parts.append(f"CALL {r['call']:5.2f} (前日比 {d('d_call')})")
         if r.get("roll"):
             parts.append(f"行使価格変更 P{r['ps']}/C{r['cs']}")
         self.cursor_label.setText("　|　".join(parts))
@@ -3743,11 +3756,14 @@ class EntrySignalChart(QtWidgets.QWidget):
                 r["dt"].strftime("%m/%d %H:%M"),
                 f"先物 {r['close']:,.0f}",
                 f"  H {r['high']:,.0f}  L {r['low']:,.0f}",
-                f"ATM  {r['atm']:6.2f} ({d('d_atm')})",
-                f"PUT  {r['put']:6.2f} ({d('d_put')})",
-                f"CALL {r['call']:6.2f} ({d('d_call')})",
-                "   前日比",
             ]
+            if self.atm_check.isChecked():
+                lines.append(f"ATM  {r['atm']:6.2f} ({d('d_atm')})")
+            if self.put_check.isChecked():
+                lines.append(f"PUT  {r['put']:6.2f} ({d('d_put')})")
+            if self.call_check.isChecked():
+                lines.append(f"CALL {r['call']:6.2f} ({d('d_call')})")
+            lines.append("   前日比")
             if r.get("roll"):
                 lines.append("行使価格変更")
             self._cursor_box.set_ha("left" if box_on_right else "right")
@@ -3868,6 +3884,17 @@ class EntrySignalChart(QtWidgets.QWidget):
             shown = shown[-max_bars:]
         self.update_chart(shown)
 
+    def _redraw_only(self, *_args) -> None:
+        """Re-draw from the rows already loaded.
+
+        Colours, transparency, visibility and 最大本数 only change how the data
+        is shown, so there is no reason to go back to the database for them.
+        """
+        if self._all_rows:
+            self._show(self._all_rows)
+        else:
+            self.run_analysis()
+
     def run_analysis(self, *_args) -> None:
         self.status_label.setText(
             "最終更新: " + datetime.now().strftime("%H:%M:%S")
@@ -3899,8 +3926,6 @@ class EntrySignalChart(QtWidgets.QWidget):
             self.cursor_label.setText("データなし")
             return
 
-        atm_th: float = self.atm_spin.value()
-        wing_th: float = self.wing_spin.value()
         n: int = len(rows)
         x = np.arange(n)
 
@@ -3910,16 +3935,14 @@ class EntrySignalChart(QtWidgets.QWidget):
         w_px: float = max(1.0, self.fig.get_size_inches()[0] * self.fig.dpi)
         h_px: float = max(1.0, self.fig.get_size_inches()[1] * self.fig.dpi)
         gs = self.fig.add_gridspec(
-            4, 1, height_ratios=[3.2, 1.5, 1.5, 1.5], hspace=0.10,
+            2, 1, height_ratios=[3.0, 2.6], hspace=0.10,
             left=min(0.12, 58.0 / w_px),
             right=1.0 - min(0.05, 10.0 / w_px),
             top=1.0 - min(0.12, 26.0 / h_px),
             bottom=min(0.12, 28.0 / h_px),
         )
         ax_fut = self.fig.add_subplot(gs[0, 0])
-        ax_atm = self.fig.add_subplot(gs[1, 0], sharex=ax_fut)
-        ax_put = self.fig.add_subplot(gs[2, 0], sharex=ax_fut)
-        ax_call = self.fig.add_subplot(gs[3, 0], sharex=ax_fut)
+        ax_iv = self.fig.add_subplot(gs[1, 0], sharex=ax_fut)
 
         # ---- futures OHLC bars
         # Batched into three collections instead of ~3 artists per bar: at 600
@@ -3984,89 +4007,179 @@ class EntrySignalChart(QtWidgets.QWidget):
             color="#dddddd", fontsize=11, loc="left", pad=4
         )
 
-        # ---- the three condition rows
+        # ---- ATM / PUT / CALL overlaid in one row
+        # All three are 前日比 in IV points, so they share one scale honestly.
+        #
+        # Colours are the ones 株価チャート's iv_item uses for the same three
+        # series, so a glance between the two windows needs no translation:
+        # ATM = WHITE_COLOR, Δ0.1 Put = DOWN_COLOR (cyan), Δ0.1 Call =
+        # RED_COLOR. Overlaps are handled by drawing the shortest bar in front
+        # and every outline above every fill, not by hue.
         specs = [
-            (ax_atm, "d_atm", atm_th, "#00e58a", "ATM"),
-            (ax_put, "d_put", wing_th, "#3987e5", "PUT"),
-            (ax_call, "d_call", wing_th, "#eb6834", "CALL"),
+            (key, color, label)
+            for key, color, label, shown in (
+                ("d_atm", "#ffffff", "ATM", self.atm_check.isChecked()),
+                ("d_put", "#4bffff", "PUT Δ0.1", self.put_check.isChecked()),
+                ("d_call", "#ff0000", "CALL Δ0.1", self.call_check.isChecked()),
+            )
+            if shown
         ]
-        for ax, key, th, color, label in specs:
-            values: list[float] = [
-                r[key] if r.get(key) is not None else 0.0 for r in rows
-            ]
-            colors: list[str] = [
-                color if (r.get(key) is not None and r[key] >= th) else "#4a5058"
-                for r in rows
-            ]
-            ax.add_collection(PolyCollection(
-                [
-                    [(i - body_w / 2, 0.0), (i + body_w / 2, 0.0),
-                     (i + body_w / 2, v), (i - body_w / 2, v)]
-                    for i, v in enumerate(values)
-                ],
-                facecolors=colors, edgecolors="none",
-            ))
-            ax.axhline(0, color="#888888", linewidth=0.8)
-            ax.axhline(th, color=color, linewidth=1.0, linestyle="--", alpha=0.8)
-            ax.set_ylabel(f"{label}\n前日比", color=color, fontsize=9)
-            ax.tick_params(labelbottom=False, labelleft=False, labelsize=8)
-            ax.set_xticks([])
-            ax.grid(False)
-            for spine in ("top", "right", "left"):
-                ax.spines[spine].set_visible(False)
+        fill_alpha: float = self.alpha_spin.value()
+        all_values: list[float] = []
 
-            # value labels: at most ~40 of them, and none at all once the
-            # columns are too narrow to read a number on.
-            step: int = max(1, math.ceil(n / 40))
-            span: float = max(abs(v) for v in values) or 1.0
+        # Every bar of every series goes into one list, sorted by magnitude:
+        # the tallest is drawn first and the SHORTEST last, so the bar that is
+        # most buried by the others ends up with its fill and its outline on
+        # top. Fill and outline are still two passes (zorder 1.5 / 2.5), so no
+        # fill can ever wash out an outline.
+        bars: list[tuple] = []
+        for key, color, label in specs:
             for i, r in enumerate(rows):
                 v = r.get(key)
-                if n > 240 or v is None or (i % step and i != n - 1):
+                if v is None:
                     continue
-                passed: bool = v >= th
-                ax.text(
-                    i, v + (span * 0.12 if v >= 0 else -span * 0.12),
-                    f"{v:+.2f}", ha="center",
-                    va="bottom" if v >= 0 else "top",
-                    color=color if passed else "#6b7280", fontsize=7.5,
-                    fontweight="bold" if passed else "normal"
-                )
-            ax.set_ylim(min(0.0, min(values)) - span * 0.42,
-                        max(th, max(values)) + span * 0.42)
+                all_values.append(v)
+                bars.append((
+                    abs(v),
+                    [(i - body_w / 2, 0.0), (i + body_w / 2, 0.0),
+                     (i + body_w / 2, v), (i - body_w / 2, v)],
+                    to_rgba(color, fill_alpha),
+                    to_rgba(color, 1.0),
+                ))
 
-        # ---- time axis under the bottom (CALL) panel
-        # 判定 ○/× used to sit in a row of its own; the state is on the ▲ marks,
-        # the entry highlight and the cursor read-out, so the space is given
-        # back to the panels that carry numbers.
+        if bars:
+            bars.sort(key=lambda b: b[0], reverse=True)   # 短い棒ほど手前
+            verts = [b[1] for b in bars]
+            ax_iv.add_collection(PolyCollection(
+                verts, facecolors=[b[2] for b in bars],
+                edgecolors="none", zorder=1.5,
+            ))
+            ax_iv.add_collection(PolyCollection(
+                verts, facecolors="none", edgecolors=[b[3] for b in bars],
+                linewidths=1.2, zorder=2.5,
+            ))
+
+        # ---- ATM ±0.5σ, the same band 株価チャート's iv_item draws
+        # atm_iv_daily = ATM IV(年率%) / √252 — one day's implied move — and the
+        # band is half of it, so it moves with ATM IV instead of being a fixed
+        # level. Drawn as a step line per bar, like iv_item's per-bar segments.
+        sigma_x: list[float] = []
+        sigma_up: list[float] = []
+        sigma_dn: list[float] = []
+        for i, r in enumerate(rows):
+            if not r.get("atm"):
+                continue
+            half: float = r["atm"] / (252 ** 0.5) * 0.5
+            sigma_x.append(i)
+            sigma_up.append(half)
+            sigma_dn.append(-half)
+        if sigma_x:
+            for ys in (sigma_up, sigma_dn):
+                ax_iv.plot(
+                    sigma_x, ys, color="#ffffff", linewidth=1.0,
+                    linestyle="--", alpha=0.75, zorder=3, drawstyle="steps-mid",
+                )
+            all_values.extend(sigma_up)
+            all_values.extend(sigma_dn)
+            # Labelled at the LEFT end: at the right edge they fell outside
+            # the axes and were clipped by the window.
+            ax_iv.annotate(
+                "+0.5σ", xy=(sigma_x[0], sigma_up[0]), xytext=(6, 0),
+                textcoords="offset points", color="#dddddd", fontsize=8,
+                va="center", ha="left", zorder=4,
+            )
+            ax_iv.annotate(
+                "-0.5σ", xy=(sigma_x[0], sigma_dn[0]), xytext=(6, 0),
+                textcoords="offset points", color="#dddddd", fontsize=8,
+                va="center", ha="left", zorder=4,
+            )
+
+        ax_iv.axhline(0, color="#888888", linewidth=0.8, zorder=3)
+        ax_iv.set_axisbelow(True)       # grid stays under the bars
+        ax_iv.set_ylabel("前日比IV", color="#cccccc", fontsize=10)
+        ax_iv.tick_params(labelbottom=False, labelleft=True, labelsize=8)
+        ax_iv.grid(True, axis="y", alpha=0.12)
+        for spine in ("top", "right"):
+            ax_iv.spines[spine].set_visible(False)
+        ax_iv.legend(
+            handles=[
+                Patch(facecolor=to_rgba(c, fill_alpha), edgecolor=c, label=lab)
+                for _k, c, lab in specs
+            ],
+            loc="upper left", fontsize=8, framealpha=0.6, ncol=3,
+            handlelength=1.2, columnspacing=1.0,
+        )
+
+        span: float = max((abs(v) for v in all_values), default=1.0) or 1.0
+        lo_v: float = min(all_values, default=0.0)
+        hi_v: float = max(all_values, default=0.0)
+        ax_iv.set_ylim(min(0.0, lo_v) - span * 0.12, hi_v + span * 0.18)
+
+        # ---- value labels: only the outermost of the three per column
+        # Three numbers stacked on overlapping bars is unreadable, but the
+        # extreme one is the one being read anyway — so each column gets at
+        # most two: the highest positive and the lowest negative, each in its
+        # own series colour. Thinned to ~40 labels, dropped entirely once the
+        # columns are too narrow for a number.
+        y0, y1 = ax_iv.get_ylim()
+        pad: float = (y1 - y0) * 0.012
+        label_every: int = max(1, math.ceil(n / 40))
+        if n <= 240:
+            for i, r in enumerate(rows):
+                if i % label_every and i != n - 1:
+                    continue
+                vals = [
+                    (r[key], color) for key, color, _lab in specs
+                    if r.get(key) is not None
+                ]
+                if not vals:
+                    continue
+                extremes = []
+                pos = [t for t in vals if t[0] > 0]
+                neg = [t for t in vals if t[0] < 0]
+                if pos:
+                    extremes.append(max(pos, key=lambda t: t[0]))
+                if neg:
+                    extremes.append(min(neg, key=lambda t: t[0]))
+                for v, color in extremes:
+                    ax_iv.text(
+                        i, v + (pad if v > 0 else -pad), f"{v:+.2f}",
+                        ha="center", va="bottom" if v > 0 else "top",
+                        color=color, fontsize=7.5, zorder=4,
+                    )
+        if not specs:
+            ax_iv.text(0.5, 0.5, "系列がすべて非表示です",
+                       transform=ax_iv.transAxes, ha="center", va="center",
+                       color="#6b7280", fontsize=11)
+
+        # ---- time axis under the bottom panel
         label_step: int = max(1, math.ceil(n / 14))
         tick_ix: list[int] = [i for i in range(n) if i % label_step == 0 or i == n - 1]
-        ax_call.set_xticks(tick_ix)
-        ax_call.set_xticklabels(
+        ax_iv.set_xticks(tick_ix)
+        ax_iv.set_xticklabels(
             [rows[i]["dt"].strftime("%H:%M") for i in tick_ix],
             color="#9aa3ad", fontsize=8,
         )
-        ax_call.tick_params(axis="x", labelbottom=True, colors="#9aa3ad", length=3)
+        ax_iv.tick_params(axis="x", labelbottom=True, colors="#9aa3ad", length=3)
 
         # 行使価格変更 markers (the signal is suppressed on those bars)
         for i, r in enumerate(rows):
             if not r.get("roll"):
                 continue
-            for ax in (ax_atm, ax_put, ax_call):
-                ax.axvline(i, color="#ffcc00", linewidth=0.8, linestyle=":", alpha=0.55)
+            # muted violet: yellow now belongs to the ATM series
+            ax_iv.axvline(i, color="#b48ead", linewidth=0.8, linestyle=":", alpha=0.6)
 
         ax_fut.set_xlim(-0.8, n - 0.2)
 
         # one hair-line per panel, moved by the mouse
-        for ax in (ax_fut, ax_atm, ax_put, ax_call):
+        for ax in (ax_fut, ax_iv):
             line = ax.axvline(0, color="#dddddd", linewidth=0.8, alpha=0.55,
                               visible=False, zorder=5, animated=True)
             self._cursor_lines.append(line)
 
         # Horizontal crosshair + value tag, per value panel. 判定 row has no
         # meaningful y scale, so it is left out.
-        for ax, kind in (
-            (ax_fut, "price"), (ax_atm, "iv"), (ax_put, "iv"), (ax_call, "iv")
-        ):
+        for ax, kind in ((ax_fut, "price"), (ax_iv, "iv")):
             hline = ax.axhline(
                 0, color="#dddddd", linewidth=0.8, alpha=0.55,
                 visible=False, zorder=5, animated=True,
