@@ -91,6 +91,9 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.iv_diff_neg_text_items: dict[str, list[pg.TextItem]] = {} # Added for IV diff text
         self.total_volume_text_items: dict[str, list[pg.TextItem]] = {} # Added for Volume text
         self.chain_colors: dict[str, tuple] = {} # Added to store color for each chain
+        # (plot, item, label) per chain, so the legends can be rebuilt with
+        # only the checked 限月 in them.
+        self._legend_entries: dict[str, list[tuple]] = {}
 
         self.underlying_line_positions: list[float] = [0.4, 0.3, 0.6, 0.2, 0.7, 0.1, 0.8, 0.9, 0.15]
 
@@ -209,9 +212,12 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.iv_diff_chart.setLabel("left", "IV前日比")
         self.iv_diff_chart.setLabel("bottom", "権利行使価格")
         self.iv_diff_chart.setXLink(self.impv_chart)
-        iv_diff_legend = self.iv_diff_chart.addLegend(colCount=4) # Changed colCount from 4 to 2 for consistency
-        iv_diff_legend.anchor((0, 1), (0, 1)) # Anchor top-left of legend to top-left of plot
-        iv_diff_legend.setOffset((1, 1)) # Add padding (10 right, 10 down)
+        # Legend on the title row rather than inside the plot: parented to the
+        # PlotItem (not its ViewBox) so it can sit in the band above the axes,
+        # and laid out in one wide row.
+        iv_diff_legend = self.iv_diff_chart.addLegend(colCount=8, horSpacing=14)
+        iv_diff_legend.setParentItem(self.iv_diff_chart)
+        iv_diff_legend.anchor((0, 0), (0, 0), offset=(70, 0))
         self.iv_diff_chart.setMenuEnabled(False)
         self.iv_diff_chart.setMouseEnabled(False, False)
         self.iv_diff_chart.setMaximumHeight(400)
@@ -460,6 +466,62 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.iv_diff_pos_text_items[chain_symbol] = [] # Initialize list for text items
         self.iv_diff_neg_text_items[chain_symbol] = []
         self.total_volume_text_items[chain_symbol] = []
+
+        # Register every named item so the legends can be rebuilt with only
+        # the checked 限月 (see _rebuild_legends).
+        self._legend_entries[chain_symbol] = []
+        for item, label in (
+            (self.call_mid_curves[chain_symbol], symbol + " コール"),
+            (self.put_mid_curves[chain_symbol], symbol + " プット"),
+            (self.call_bid_curves[chain_symbol], symbol + " コール買"),
+            (self.call_ask_curves[chain_symbol], symbol + " コール売"),
+            (self.put_bid_curves[chain_symbol], symbol + " プット買"),
+            (self.put_ask_curves[chain_symbol], symbol + " プット売"),
+            (self.prev_call_curves[chain_symbol], symbol + " 前日コール"),
+            (self.prev_put_curves[chain_symbol], symbol + " 前日プット"),
+        ):
+            self._register_legend(chain_symbol, self.impv_chart, item, label)
+        self._register_legend(
+            chain_symbol, self.volume_chart,
+            self.total_volume_bars[chain_symbol], symbol,
+        )
+        self._register_legend(
+            chain_symbol, self.iv_diff_chart,
+            self.iv_diff_pos_bars[chain_symbol], symbol,
+        )
+        self._register_legend(
+            chain_symbol, self.iv_diff_chart,
+            self.iv_level_bars[chain_symbol], f"{symbol} 面の上下",
+        )
+        self._register_legend(
+            chain_symbol, self.iv_diff_chart,
+            self.iv_slide_bars[chain_symbol], f"{symbol} 滑り",
+        )
+
+    def _register_legend(self, chain_symbol: str, plot, item, label: str) -> None:
+        """Remember one legend entry so it can be re-added on demand."""
+        self._legend_entries.setdefault(chain_symbol, []).append((plot, item, label))
+
+    def _rebuild_legends(self) -> None:
+        """Rebuild every legend with only the checked 限月 in it.
+
+        pyqtgraph keeps a legend row even when its curve is hidden, so the
+        unchecked 限月 left a column of ⊘ icons behind; clearing and re-adding
+        is the way to make a row actually disappear.
+        """
+        for plot in (self.impv_chart, self.volume_chart, self.iv_diff_chart):
+            legend = getattr(plot, "legend", None)
+            if legend is not None:
+                legend.clear()
+
+        for chain_symbol in sorted(self._legend_entries):
+            checkbox = self.chain_checks.get(chain_symbol)
+            if checkbox is not None and not checkbox.isChecked():
+                continue
+            for plot, item, label in self._legend_entries[chain_symbol]:
+                legend = getattr(plot, "legend", None)
+                if legend is not None:
+                    legend.addItem(item, label)
 
     def update_curve_data(self) -> None:
         """"""
@@ -793,10 +855,18 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
             # Load previous day futures close first (needed for the 先物 line's
             # 前日差 label below and for the 前日先物 line).
-            today_key: str = datetime.now(DB_TZ).strftime("%Y-%m-%d")
-            if self._prev_underlying_loaded_date != today_key:
+            # Key the cache by SESSION, not by calendar date. The night
+            # session that opens at 17:00 belongs to the NEXT trading day, so
+            # the previous-day close changes there — a date key only flipped at
+            # midnight and left this line showing yesterday's value all evening.
+            now_dt: datetime = datetime.now(DB_TZ)
+            session_dt: datetime = (
+                now_dt + timedelta(days=1) if now_dt.hour >= 17 else now_dt
+            )
+            session_key: str = session_dt.strftime("%Y-%m-%d")
+            if self._prev_underlying_loaded_date != session_key:
                 self.prev_underlying_prices.clear()
-                self._prev_underlying_loaded_date = today_key
+                self._prev_underlying_loaded_date = session_key
 
             if chain.chain_symbol not in self.prev_underlying_prices:
                 prev_price = self._load_prev_day_futures_close(chain.chain_symbol)
@@ -930,6 +1000,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                     slide_y0.append(level)
                     slide_h.append(slide)
 
+            # Stacked: 面の上下 from zero, then 滑り on top of it, so the bar
+            # as a whole still reads as 前日比IV.
             self.iv_level_bars[chain.chain_symbol].setOpts(
                 x=level_x, height=level_h, y0=[0.0] * len(level_x),
                 width=bar_width_diff * 0.9,
@@ -939,17 +1011,80 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 width=bar_width_diff * 0.9,
             )
 
+            # Draw the SMALLER of the two last, so a thin segment is never
+            # covered by the other one's edge.
+            def _mag(values: list[float]) -> float:
+                return sum(abs(v) for v in values) / len(values) if values else 0.0
+
+            if _mag(level_h) <= _mag(slide_h):
+                self.iv_slide_bars[chain.chain_symbol].setZValue(1)
+                self.iv_level_bars[chain.chain_symbol].setZValue(2)
+            else:
+                self.iv_level_bars[chain.chain_symbol].setZValue(1)
+                self.iv_slide_bars[chain.chain_symbol].setZValue(2)
+
             # Add text labels for IV diff bars
             chain_color = self.chain_colors[chain.chain_symbol]
             font = QtGui.QFont()
             font.setPointSize(8) # Smaller font size for better fit
+
+            if self.decomp_check.isChecked():
+                # IV分解中は前日比の棒を隠しているので、その数値もここで出す。
+                # 棒の外側に合計（＝前日比IV）、緑と橙の境目に 面の上下。
+                # One row height, in data units. Two rows in a single HTML item
+                # cannot be centred (Qt ignores the alignment there), so the
+                # two numbers are separate items, each centred on the bar.
+                row_h: float = (
+                    (max_iv_diff_pos - min_iv_diff_neg) * 0.09
+                ) or 0.15
+                for strike, level, slide in zip(level_x, level_h, slide_h):
+                    total: float = level + slide
+                    up: bool = total >= 0
+                    out_offset: float = (
+                        max_iv_diff_pos if up else abs(min_iv_diff_neg)
+                    ) * text_offset_scale or 0.3
+                    base_y: float = total + (out_offset if up else -out_offset)
+
+                    # 合成後 always sits on the row FURTHER from the bar, with
+                    # 面の上下 right under it. A bar pointing down used to reach
+                    # the 合成後 row and cover it.
+                    if up:
+                        total_y: float = base_y + row_h
+                        level_y: float = base_y
+                    else:
+                        total_y = base_y - row_h
+                        level_y = base_y - row_h * 2
+
+                    total_item = pg.TextItem(
+                        text=f"{total:.2f}%",
+                        color=chain_color,
+                        anchor=(0.5, 0 if up else 1),
+                    )
+                    total_item.setFont(font)
+                    total_item.setPos(strike, total_y)
+                    total_item.setZValue(5)
+                    self.iv_diff_chart.addItem(total_item)
+                    self.iv_diff_pos_text_items[chain.chain_symbol].append(total_item)
+
+                    level_item = pg.TextItem(
+                        text=f"（{level:+.2f}）",
+                        color=(0, 229, 138),
+                        anchor=(0.5, 0 if up else 1),
+                    )
+                    level_item.setFont(font)
+                    level_item.setPos(strike, level_y)
+                    level_item.setZValue(5)
+                    self.iv_diff_chart.addItem(level_item)
+                    self.iv_diff_pos_text_items[chain.chain_symbol].append(level_item)
 
             if max_iv_diff_pos > 0:
                 iv_text_offset_pos = max_iv_diff_pos * text_offset_scale
             else:
                 iv_text_offset_pos = 0.5
 
-            for strike, height in zip(pos_strikes, pos_heights):
+            for strike, height in (
+                [] if self.decomp_check.isChecked() else zip(pos_strikes, pos_heights)
+            ):
                 text_item = pg.TextItem(
                     text=f"{height:.2f}%",
                     color=chain_color,
@@ -965,7 +1100,9 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             else:
                 iv_text_offset_neg = 0.5
 
-            for strike, height in zip(neg_strikes, neg_heights):
+            for strike, height in (
+                [] if self.decomp_check.isChecked() else zip(neg_strikes, neg_heights)
+            ):
                 text_item = pg.TextItem(
                     text=f"{height:.2f}%",
                     color=chain_color,
@@ -995,6 +1132,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
     def update_curve_visible(self) -> None:
         """"""
+        self._rebuild_legends()
         for chain_symbol, checkbox in self.chain_checks.items():
             call_mid_curve: pg.PlotCurveItem = self.call_mid_curves[chain_symbol]
             call_bid_curve: pg.PlotCurveItem = self.call_bid_curves[chain_symbol]
@@ -1043,10 +1181,12 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 else:
                     iv_diff_pos_bar.show()
                     iv_diff_neg_bar.show()
+                # The labels are built for whichever mode is active, so they
+                # simply follow the chain checkbox.
                 for text_item in self.iv_diff_pos_text_items[chain_symbol]:
-                    text_item.setVisible(not decomp)
+                    text_item.setVisible(True)
                 for text_item in self.iv_diff_neg_text_items[chain_symbol]:
-                    text_item.setVisible(not decomp)
+                    text_item.setVisible(True)
                 for text_item in self.total_volume_text_items[chain_symbol]:
                     text_item.show()
             else:
@@ -1085,16 +1225,21 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         """
         symbol: str = chain_symbol.split(".")[0]
         now: datetime = datetime.now(DB_TZ)
-        start: datetime = now - timedelta(days=2)
-
         database: BaseDatabase = get_database()
-        bars: list[BarData] = database.load_bar_data(
-            symbol=symbol,
-            exchange=Exchange.JPX,
-            interval=Interval.MINUTE,
-            start=start,
-            end=now,
-        )
+
+        # Only the newest bar is used, so ask for a short window first; the
+        # wider one is the fallback for a market that has been closed a while.
+        bars: list[BarData] = []
+        for lookback in (timedelta(hours=2), timedelta(days=4)):
+            bars = database.load_bar_data(
+                symbol=symbol,
+                exchange=Exchange.JPX,
+                interval=Interval.MINUTE,
+                start=now - lookback,
+                end=now,
+            )
+            if bars:
+                break
         if not bars:
             return None
 
