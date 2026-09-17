@@ -41,6 +41,12 @@ mpl.rcParams['font.sans-serif'] = ['Microsoft YaHei']   # set font for Chinese
 mpl.rcParams['axes.unicode_minus'] = False
 
 
+# IV分解の積み上げ 2 段の色。前面になる段は重なりを透かすため半透明。
+LEVEL_RGB: tuple = (0, 229, 138)      # 面の上下
+SLIDE_RGB: tuple = (255, 170, 51)     # 滑り
+DECOMP_FRONT_ALPHA: int = 130
+
+
 class OptionVolatilityChart(QtWidgets.QWidget):
 
     signal_timer: QtCore.Signal = QtCore.Signal(Event)
@@ -367,14 +373,14 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             angle=90,
             movable=False,
             pen=p_line_pen,
-            label=symbol + " プットΔ0.1",
+            label="プットΔ0.1",
             labelOpts={'position': max(0.05, 0.95 - label_shift), 'color': color, 'fill': (200,200,200,50), 'movable': False}
         )
         self.eris_c_strike_lines[chain_symbol] = pg.InfiniteLine(
             angle=90,
             movable=False,
             pen=c_line_pen,
-            label=symbol + " コールΔ0.1",
+            label="コールΔ0.1",
             labelOpts={'position': min(0.95, 0.01 + label_shift), 'color': color, 'fill': (200,200,200,50), 'movable': False}
         )
 
@@ -382,14 +388,14 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             angle=90,
             movable=False,
             pen=p_line_pen,
-            label=symbol + " プットΔ0.02",
+            label="プットΔ0.02",
             labelOpts={'position': max(0.05, 0.92 - label_shift), 'color': color, 'fill': (200,200,200,50), 'movable': False}
         )
         self.delta002_c_strike_lines[chain_symbol] = pg.InfiniteLine(
             angle=90,
             movable=False,
             pen=c_line_pen,
-            label=symbol + " コールΔ0.02",
+            label="コールΔ0.02",
             labelOpts={'position': min(0.95, 0.04 + label_shift), 'color': color, 'fill': (200,200,200,50), 'movable': False}
         )
 
@@ -461,14 +467,14 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         # IV分解の積み上げ2本（既定では非表示）
         self.iv_level_bars[chain_symbol] = pg.BarGraphItem(
             x=[], height=[], y0=[], width=1.0,
-            brush=pg.mkBrush(color=(0, 229, 138)),
-            pen=pg.mkPen(color=(0, 229, 138)),
+            brush=pg.mkBrush(color=LEVEL_RGB),
+            pen=pg.mkPen(color=LEVEL_RGB),
             name=f"{symbol} 面の上下",
         )
         self.iv_slide_bars[chain_symbol] = pg.BarGraphItem(
             x=[], height=[], y0=[], width=1.0,
-            brush=pg.mkBrush(color=(255, 170, 51)),
-            pen=pg.mkPen(color=(255, 170, 51)),
+            brush=pg.mkBrush(color=SLIDE_RGB),
+            pen=pg.mkPen(color=SLIDE_RGB),
             name=f"{symbol} 滑り",
         )
         self.iv_diff_chart.addItem(self.iv_level_bars[chain_symbol])
@@ -819,7 +825,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 iv_text = f"{chain.eris_p_iv:.3f}" if chain.eris_p_iv is not None else "N/A"
                 price_text = f"{chain.eris_p_price:.0f}" if chain.eris_p_price is not None else "N/A"
                 spread_text = f" 差{chain.eris_p_spread:.0f}" if chain.eris_p_spread is not None else ""
-                line.label.setText(f"{symbol} PΔ{delta_text} IV{iv_text} ¥{price_text}{spread_text}")
+                line.label.setText(f"PΔ{delta_text} IV{iv_text} ¥{price_text}{spread_text}")
                 line.show()
             else:
                 self.eris_p_strike_lines[chain.chain_symbol].hide()
@@ -831,7 +837,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 iv_text = f"{chain.eris_c_iv:.3f}" if chain.eris_c_iv is not None else "N/A"
                 price_text = f"{chain.eris_c_price:.0f}" if chain.eris_c_price is not None else "N/A"
                 spread_text = f" 差{chain.eris_c_spread:.0f}" if chain.eris_c_spread is not None else ""
-                line.label.setText(f"{symbol} CΔ{delta_text} IV{iv_text} ¥{price_text}{spread_text}")
+                line.label.setText(f"CΔ{delta_text} IV{iv_text} ¥{price_text}{spread_text}")
                 line.show()
             else:
                 self.eris_c_strike_lines[chain.chain_symbol].hide()
@@ -843,7 +849,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 iv_text = f"{chain.delta002_p_iv:.3f}" if chain.delta002_p_iv is not None else "N/A"
                 price_text = f"{chain.delta002_p_price:.0f}" if chain.delta002_p_price is not None else "N/A"
                 spread_text = f" 差{chain.delta002_p_spread:.0f}" if chain.delta002_p_spread is not None else ""
-                line.label.setText(f"{symbol} PΔ{delta_text} IV{iv_text} ¥{price_text}{spread_text}")
+                line.label.setText(f"PΔ{delta_text} IV{iv_text} ¥{price_text}{spread_text}")
                 line.show()
             else:
                 self.delta002_p_strike_lines[chain.chain_symbol].hide()
@@ -855,7 +861,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 iv_text = f"{chain.delta002_c_iv:.3f}" if chain.delta002_c_iv is not None else "N/A"
                 price_text = f"{chain.delta002_c_price:.0f}" if chain.delta002_c_price is not None else "N/A"
                 spread_text = f" 差{chain.delta002_c_spread:.0f}" if chain.delta002_c_spread is not None else ""
-                line.label.setText(f"{symbol} CΔ{delta_text} IV{iv_text} ¥{price_text}{spread_text}")
+                line.label.setText(f"CΔ{delta_text} IV{iv_text} ¥{price_text}{spread_text}")
                 line.show()
             else:
                 self.delta002_c_strike_lines[chain.chain_symbol].hide()
@@ -1097,15 +1103,27 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
             # Draw the SMALLER of the two last, so a thin segment is never
             # covered by the other one's edge.
+            #
+            # 面の上下と滑りは符号が逆になることが多い（先物が上げればスキューを
+            # 滑り降りる）。その場合 0→level と level→level+slide は重なるので、
+            # 上になる方を不透明のままにすると、下の段（例えば -1.05 まで伸びている
+            # 緑）がほとんど見えなくなる。前面の段だけ半透明にして、重なった
+            # 区間を透かせる（枠線は両方とも不透明のままなので各段の範囲は読める）。
             def _mag(values: list[float]) -> float:
                 return sum(abs(v) for v in values) / len(values) if values else 0.0
 
+            level_bar_item = self.iv_level_bars[chain.chain_symbol]
+            slide_bar_item = self.iv_slide_bars[chain.chain_symbol]
             if _mag(level_h) <= _mag(slide_h):
-                self.iv_slide_bars[chain.chain_symbol].setZValue(1)
-                self.iv_level_bars[chain.chain_symbol].setZValue(2)
+                front, front_rgb = level_bar_item, LEVEL_RGB
+                back, back_rgb = slide_bar_item, SLIDE_RGB
             else:
-                self.iv_level_bars[chain.chain_symbol].setZValue(1)
-                self.iv_slide_bars[chain.chain_symbol].setZValue(2)
+                front, front_rgb = slide_bar_item, SLIDE_RGB
+                back, back_rgb = level_bar_item, LEVEL_RGB
+            back.setZValue(1)
+            front.setZValue(2)
+            back.setOpts(brush=pg.mkBrush(color=back_rgb + (255,)))
+            front.setOpts(brush=pg.mkBrush(color=front_rgb + (DECOMP_FRONT_ALPHA,)))
 
             # Add text labels for IV diff bars
             chain_color = self.chain_colors[chain.chain_symbol]
@@ -2132,6 +2150,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             "show_decay": self.decay_check.isChecked(),
             "show_envelope": self.envelope_check.isChecked(),
             "show_skew": self.skew_check.isChecked(),
+            "show_level": self.level_check.isChecked(),
             "show_pinned": self.pinned_check.isChecked(),
             "show_current_price": self.current_price_check.isChecked(),
             "interval": self.interval_combo.currentText(),
@@ -2151,6 +2170,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self.decay_check.setChecked(data.get("show_decay", False))
         self.envelope_check.setChecked(data.get("show_envelope", False))
         self.skew_check.setChecked(data.get("show_skew", False))
+        self.level_check.setChecked(data.get("show_level", True))
         self.pinned_check.setChecked(data.get("show_pinned", False))
         self.current_price_check.setChecked(data.get("show_current_price", True))
         self.interval_combo.setCurrentText(data.get("interval", "4H"))
@@ -2236,6 +2256,17 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self.skew_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("スキュー")
         self.pinned_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("ピン留め(固定行使価格)")
 
+        # ATM の面の上下だけのIV: 今日のIVを前日と同じモネネスで測り直した水準。
+        # 通常のATM線との差が「滑り」なので、2本並べるとボラそのものが買われて
+        # いるのか、先物が動いてスマイル上を滑っただけなのかが分かる。
+        self.level_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("面の上下")
+        self.level_check.setChecked(True)
+        self.level_check.setToolTip(
+            "ATMの面の上下だけのIV（前日と同じモネネスで測り直した今日のIV）。\n"
+            "ATM線より上なら、先物の動きを除いてもボラが買われています。"
+        )
+        self.level_check.toggled.connect(self.run_analysis)
+
         # Futures current-value line + right-edge price tag (like 株価チャット).
         self.current_price_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("現在値")
         self.current_price_check.setChecked(True)
@@ -2277,6 +2308,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         hbox.addWidget(self.envelope_check)
         hbox.addWidget(self.skew_check)
         hbox.addWidget(self.pinned_check)
+        hbox.addWidget(self.level_check)
         hbox.addWidget(self.current_price_check)
         hbox.addWidget(self.refresh_interval_spin)
         hbox.addWidget(self.auto_refresh_check)
@@ -2518,6 +2550,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     "o": bar.open_price, "h": bar.high_price,
                     "l": bar.low_price, "c": bar.close_price,
                     "atm": bar.atm_iv, "ep": bar.eris_p_iv, "ec": bar.eris_c_iv,
+                    "lvl": getattr(bar, "atm_level_iv", None),
                 }
             else:
                 b["h"] = max(b["h"], bar.high_price)
@@ -2526,6 +2559,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 # last non-zero IV snapshot in the bucket
                 if bar.atm_iv:
                     b["atm"] = bar.atm_iv
+                if getattr(bar, "atm_level_iv", None):
+                    b["lvl"] = bar.atm_level_iv
                 if bar.eris_p_iv:
                     b["ep"] = bar.eris_p_iv
                 if bar.eris_c_iv:
@@ -2548,6 +2583,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             "ATM (Δ0.50)": _iv_list("atm"),
             "Put Δ0.10": _iv_list("ep"),
             "Call Δ0.10": _iv_list("ec"),
+            "ATM 面の上下": _iv_list("lvl"),
         }
         futures_ohlc: dict[str, tuple[float, float, float, float]] = {
             k: (buckets[k]["o"], buckets[k]["h"], buckets[k]["l"], buckets[k]["c"])
@@ -2975,6 +3011,21 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     bbox=dict(facecolor="black", alpha=0.7, edgecolor="none", pad=1),
                 )
 
+        # --- ATM の面の上下だけのIV -----------------------------------------
+        # 前日と同じモネネス（K / F）で測り直した今日のIV水準。ATM線との差が
+        # 「滑り」なので、2本の開き方がそのまま「本物の買われ方」になる。
+        level_values = series.get("ATM 面の上下")
+        if self.level_check.isChecked() and level_values:
+            level_arr = np.array(level_values, dtype=float)
+            if np.any(~np.isnan(level_arr)):
+                ax.plot(
+                    x, level_values,
+                    color="#00e58a", linewidth=1.6,
+                    linestyle=(0, (6, 2, 1, 2)), alpha=0.95,
+                    label="ATM 面の上下（滑り除く）",
+                    marker=".", markersize=3,
+                )
+
         # --- Strike-anchored (pinned) IV — dotted line on the main IV chart ---
         # Tracks one specific contract per Δ-target so its IV move is not
         # contaminated by the chain rolling along the smile when futures move.
@@ -3297,6 +3348,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self._cursor_ax_skew = ax_skew
         self._cursor_date_labels = date_labels
         self._cursor_series = {label: series[label] for label, _, _ in plot_targets}
+        if level_values:
+            self._cursor_series["ATM 面の上下"] = level_values
         self._cursor_skew_series = {
             label: skew_series[label]
             for label, _, _ in skew_targets
@@ -3376,6 +3429,14 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             if ix < len(values) and not np.isnan(values[ix]):
                 short_label = label.split(" ")[0]
                 lines.append(f"{short_label}: {values[ix]:.1f}%")
+
+        level_vals = self._cursor_series.get("ATM 面の上下", [])
+        if (
+            self.level_check.isChecked()
+            and ix < len(level_vals)
+            and not np.isnan(level_vals[ix])
+        ):
+            lines.append(f"面の上下: {level_vals[ix]:.1f}%")
 
         # Pinned (strike-anchored) IV values
         if getattr(self, "_cursor_pinned_series", None):
@@ -3545,7 +3606,14 @@ class EntrySignalChart(QtWidgets.QWidget):
         self.atm_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("ATM")
         self.put_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("PUT")
         self.call_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("CALL")
-        for box in (self.atm_check, self.put_check, self.call_check):
+        # 面の上下だけ: 前日比IVから「滑り」を取り除いた、ボラ水準そのものの動き
+        self.level_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("面")
+        self.level_check.setToolTip(
+            "ATMの面の上下（前日比IV − 滑り）。\n"
+            "先物が動いてスマイル上を滑っただけの見かけの変化を除いた分で、\n"
+            "プラスが続くなら今日そのものボラが買われています。"
+        )
+        for box in (self.atm_check, self.put_check, self.call_check, self.level_check):
             box.setChecked(True)
             box.setToolTip("この系列の表示/非表示")
             box.toggled.connect(self._redraw_only)
@@ -3604,6 +3672,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         hbox.addWidget(self.atm_check)
         hbox.addWidget(self.put_check)
         hbox.addWidget(self.call_check)
+        hbox.addWidget(self.level_check)
         hbox.addWidget(QtWidgets.QLabel("透明度"))
         hbox.addWidget(self.alpha_spin)
         hbox.addStretch()
@@ -3644,6 +3713,7 @@ class EntrySignalChart(QtWidgets.QWidget):
             "show_atm": self.atm_check.isChecked(),
             "show_put": self.put_check.isChecked(),
             "show_call": self.call_check.isChecked(),
+            "show_level": self.level_check.isChecked(),
             "auto_start": self.auto_start_check.isChecked(),
             "now_end": self.now_end_check.isChecked(),
             "tick_update": self.tick_check.isChecked(),
@@ -3667,6 +3737,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         self.atm_check.setChecked(data.get("show_atm", True))
         self.put_check.setChecked(data.get("show_put", True))
         self.call_check.setChecked(data.get("show_call", True))
+        self.level_check.setChecked(data.get("show_level", True))
         self.auto_start_check.setChecked(data.get("auto_start", True))
         self.now_end_check.setChecked(data.get("now_end", True))
         self.tick_check.setChecked(data.get("tick_update", True))
@@ -3825,16 +3896,20 @@ class EntrySignalChart(QtWidgets.QWidget):
                     "dt": floor,
                     "open": bar.open_price, "high": bar.high_price,
                     "low": bar.low_price, "close": bar.close_price,
-                    "atm": 0.0, "put": 0.0, "call": 0.0,
-                    "ps": 0, "cs": 0,
+                    "atm": 0.0, "put": 0.0, "call": 0.0, "lvl": 0.0,
+                    "pc": bar.pre_close, "ps": 0, "cs": 0,
                 }
             else:
                 b["high"] = max(b["high"], bar.high_price)
                 b["low"] = min(b["low"], bar.low_price)
                 b["close"] = bar.close_price
             # last non-zero snapshot inside the bucket
+            if bar.pre_close:
+                b["pc"] = bar.pre_close
             if bar.atm_iv:
                 b["atm"] = bar.atm_iv * 100
+            if getattr(bar, "atm_level_iv", 0):
+                b["lvl"] = bar.atm_level_iv * 100
             if bar.eris_p_iv:
                 b["put"] = bar.eris_p_iv * 100
             if bar.eris_c_iv:
@@ -3869,7 +3944,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         price as its strike, exactly as iv_item does.
         """
         month: str = self.month_combo.currentText()
-        r["d_atm"] = r["d_put"] = r["d_call"] = None
+        r["d_atm"] = r["d_put"] = r["d_call"] = r["d_level"] = None
         if not month:
             return
 
@@ -3884,6 +3959,10 @@ class EntrySignalChart(QtWidgets.QWidget):
 
         if r["atm"] and a_prev:
             r["d_atm"] = r["atm"] - a_prev * 100
+        # 面の上下: 同じモネネスで測り直した今日のIV − 前日同一行使価格IV。
+        # 引く相手はATMと同じ前日IVなので、d_atm との差がそのまま「滑り」。
+        if r.get("lvl") and a_prev:
+            r["d_level"] = r["lvl"] - a_prev * 100
         if r["put"] and p_prev:
             r["d_put"] = r["put"] - p_prev * 100
         if r["call"] and c_prev:
@@ -4079,6 +4158,7 @@ class EntrySignalChart(QtWidgets.QWidget):
             last = dict(
                 dt=floor, open=price, high=price, low=price, close=price,
                 atm=last["atm"], put=last["put"], call=last["call"],
+                lvl=last.get("lvl", 0.0), pc=last.get("pc", 0.0),
                 ps=last["ps"], cs=last["cs"],
             )
             rows.append(last)
@@ -4090,6 +4170,12 @@ class EntrySignalChart(QtWidgets.QWidget):
         if chain is not None:
             if chain.atm_impv:
                 last["atm"] = chain.atm_impv * 100
+            if chain.atm_level_iv:
+                last["lvl"] = chain.atm_level_iv * 100
+            # 前日終値はティックが持っている（夜間に入れば翌日の値に切り替わる）
+            underlying = getattr(chain, "underlying", None)
+            if underlying is not None and underlying.tick and underlying.tick.pre_close:
+                last["pc"] = underlying.tick.pre_close
             if chain.eris_p_iv:
                 last["put"] = chain.eris_p_iv * 100
             if chain.eris_c_iv:
@@ -4224,11 +4310,61 @@ class EntrySignalChart(QtWidgets.QWidget):
                 hollow_bodies, facecolors="none", edgecolors=down_color, linewidths=1.0
             ))
 
+        # ---- 前日先物（0σ）と ±0.5σ
+        # 株価チャートの基準線と同じで、0σ＝前日終値、±0.5σ＝前日終値 ×
+        # (1 ± ATM日率IV × 0.5)。ATM日率IV = ATM IV(年率) / √252。
+        # セッションをまたぐと前日終値が変わるので、バーごとの階段線で引く。
+        base_x: list[float] = []
+        base_y: list[float] = []
+        sigma_up_y: list[float] = []
+        sigma_dn_y: list[float] = []
+        for i, r in enumerate(rows):
+            prev_close: float = r.get("pc") or 0.0
+            if not prev_close:
+                continue
+            base_x.append(i)
+            base_y.append(prev_close)
+            daily_iv: float = (r.get("atm") or 0.0) / 100.0 / (252 ** 0.5)
+            sigma_up_y.append(prev_close * (1 + daily_iv * 0.5))
+            sigma_dn_y.append(prev_close * (1 - daily_iv * 0.5))
+
         # Collections do not autoscale the view, so set the price range here.
+        # 0σ は基準線なので範囲に含める。±0.5σ は「入れば描く」だけで、
+        # そのために軸を広げることはしない（ローソクが潰れてしまうため）。
         lo_px: float = min(r["low"] for r in rows)
         hi_px: float = max(r["high"] for r in rows)
+        if base_y:
+            lo_px = min(lo_px, min(base_y))
+            hi_px = max(hi_px, max(base_y))
         pad_px: float = (hi_px - lo_px) * 0.06 or 1.0
         ax_fut.set_ylim(lo_px - pad_px, hi_px + pad_px)
+
+        if base_x:
+            ax_fut.plot(
+                base_x, base_y, color="#ffff00", linewidth=0.9, linestyle=":",
+                alpha=0.9, zorder=0.8, drawstyle="steps-mid",
+            )
+            ax_fut.annotate(
+                f"0σ {base_y[0]:.0f}", xy=(base_x[0], base_y[0]), xytext=(6, 0),
+                textcoords="offset points", color="#ffff00", fontsize=8,
+                va="center", ha="left", zorder=4,
+            )
+            y_lo, y_hi = ax_fut.get_ylim()
+            for ys, color, tag in (
+                (sigma_up_y, "#ff4b4b", "+0.5σ"),
+                (sigma_dn_y, "#4bffff", "-0.5σ"),
+            ):
+                if not ys or min(ys) < y_lo or max(ys) > y_hi:
+                    continue        # 現在のY軸に収まらない → 描かない
+                ax_fut.plot(
+                    base_x, ys, color=color, linewidth=0.9, linestyle="--",
+                    alpha=0.8, zorder=0.8, drawstyle="steps-mid",
+                )
+                ax_fut.annotate(
+                    f"{tag} {ys[0]:.0f}", xy=(base_x[0], ys[0]), xytext=(6, 0),
+                    textcoords="offset points", color=color, fontsize=8,
+                    va="center", ha="left", zorder=4,
+                )
         ax_fut.set_ylabel("先物", color="#cccccc", fontsize=10)
         ax_fut.tick_params(labelbottom=False, labelsize=9)
         ax_fut.grid(True, axis="y", alpha=0.15)
@@ -4257,6 +4393,7 @@ class EntrySignalChart(QtWidgets.QWidget):
                 ("d_atm", "#ffffff", "ATM", self.atm_check.isChecked()),
                 ("d_put", "#4bffff", "PUT Δ0.1", self.put_check.isChecked()),
                 ("d_call", "#ff0000", "CALL Δ0.1", self.call_check.isChecked()),
+                ("d_level", "#00ff80", "ATM 面の上下", self.level_check.isChecked()),
             )
             if shown
         ]
@@ -4342,7 +4479,7 @@ class EntrySignalChart(QtWidgets.QWidget):
                 Patch(facecolor=to_rgba(c, fill_alpha), edgecolor=c, label=lab)
                 for _k, c, lab in specs
             ],
-            loc="upper left", fontsize=8, framealpha=0.6, ncol=3,
+            loc="upper left", fontsize=8, framealpha=0.6, ncol=4,
             handlelength=1.2, columnspacing=1.0,
         )
 
@@ -4397,6 +4534,21 @@ class EntrySignalChart(QtWidgets.QWidget):
             color="#9aa3ad", fontsize=8,
         )
         ax_iv.tick_params(axis="x", labelbottom=True, colors="#9aa3ad", length=3)
+
+        # ---- セッション開始（日中 08:45 / 夜間 17:00）の縦線
+        # 株価チャートの市場時間線と同じグレーの破線。開始時刻ちょうどの
+        # バーが無い場合（時間足が荷い、引けていない等）も、セッションが切り替わった
+        # 最初のバーに引く。棒より後ろ（zorder）なので読みの邪魔にならない。
+        prev_session: datetime | None = None
+        for i, r in enumerate(rows):
+            session: datetime = self._session_start(r["dt"])
+            if prev_session is not None and session != prev_session:
+                for ax in (ax_fut, ax_iv):
+                    ax.axvline(
+                        i, color="#646464", linewidth=0.9,
+                        linestyle="--", alpha=0.9, zorder=0.6,
+                    )
+            prev_session = session
 
         # 行使価格変更 markers (the signal is suppressed on those bars)
         for i, r in enumerate(rows):

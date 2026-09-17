@@ -345,6 +345,8 @@ class ChainData:
         self.use_synthetic: bool = False
         self.atm_impv: float | None = None
         self.atm_strike: int | None = None
+        # 面の上下だけのIV（ATM）。calculate_atm_level_iv() 参照。
+        self.atm_level_iv: float | None = None
 
         self.eris_p_iv: float | None = None
         self.eris_p_strike: int | None = None
@@ -460,6 +462,7 @@ class ChainData:
 
         self.calculate_pos_greeks()
         self.calculate_eris_data()
+        self.calculate_atm_level_iv()
 
     def update_trade(self, trade: TradeData) -> None:
         """"""
@@ -578,6 +581,66 @@ class ChainData:
             self.atm_impv = atm_put.mid_impv
         else:
             self.atm_impv = 0
+
+    def calculate_atm_level_iv(self) -> None:
+        """ATMの「面の上下だけのIV」を求める。
+
+        前日比IVは２つの力の合成になる:
+
+            前日比IV(K) ＝ 面の上下 ＋ 滑り
+
+        滑りは先物が動いてスマイルの上を滑っただけの見かけの変化なので、
+        ボラそのものが買われたのか売られたのかを見るには面の上下だけが要る。
+
+        ATM行使価格 K が前日に持っていたモネネス m = K / F_prev を今日の先物
+        F_now で測り直した行使価格
+
+            K_same = m * F_now = K / F_prev * F_now
+
+        における「今日のIV」を返す。前日同一行使価格のIVを引けば、それがその
+        まま面の上下になる。インプライドボラティリティカーブの IV分解 と同じ
+        定義で、そこで使う前日先物終値はティックの pre_close から取る。
+        """
+        self.atm_level_iv = None
+
+        strike: float = self.atm_price
+        underlying: UnderlyingData | None = getattr(self, "underlying", None)
+        if not strike or underlying is None:
+            return
+
+        f_now: float = underlying.mid_price
+        f_prev: float = underlying.tick.pre_close if underlying.tick else 0.0
+        if not f_now or not f_prev:
+            return
+
+        # 今日のスマイル。コールとプットの両方に値があれば平均する
+        # （カーブ画面の前日比IVと同じ作り方）。
+        smile: dict[float, float] = {}
+        for options in (self.calls, self.puts):
+            for option in options.values():
+                iv: float = option.mid_impv
+                if not iv:
+                    continue
+                k: float = option.strike_price
+                quoted: float | None = smile.get(k)
+                smile[k] = (quoted + iv) / 2 if quoted else iv
+
+        if len(smile) < 2:
+            return
+
+        k_same: float = strike / f_prev * f_now
+        strikes: list[float] = sorted(smile)
+        if k_same < strikes[0] or k_same > strikes[-1]:
+            return          # 外挿はしない（スマイルの外は当てにならない）
+
+        for a, b in zip(strikes, strikes[1:]):
+            if a <= k_same <= b:
+                if b == a:
+                    self.atm_level_iv = smile[a]
+                else:
+                    va, vb = smile[a], smile[b]
+                    self.atm_level_iv = va + (vb - va) * (k_same - a) / (b - a)
+                return
 
     def calculate_eris_data(self) -> None:
         """

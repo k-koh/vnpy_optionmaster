@@ -109,7 +109,10 @@ class OptionEngine(BaseEngine):
         session_end: datetime = now.replace(hour=15, minute=45, second=0, microsecond=0)
         if now.hour >= 17:
             session_end = session_end + timedelta(days=1)
-        prev_days_start = session_end - timedelta(days=5) # Load 3 days to ensure data availability
+        # 株価チャートは1本ずつ自分の前日と比べるので、表示期間（最大20日）の
+        # 古いバーにも前日終値が要る。日足スナップショットは1日25本程度なので
+        # 30日ぶん読んでも安い。
+        prev_days_start = session_end - timedelta(days=30)
 
         # Assuming MySQL database is configured and available
         database: BaseDatabase = get_database()
