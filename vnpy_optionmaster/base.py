@@ -91,6 +91,12 @@ class OptionData(InstrumentData):
         """"""
         super().__init__(contract)
 
+        # 出来高の売買振り分け用（classify_volume 参照）
+        self._last_volume: float = 0.0
+        self._last_bid: float = 0.0
+        self._last_ask: float = 0.0
+        self._last_trade_price: float = 0.0
+
         # Option contract features
         self.strike_price: float = contract.option_strike
         self.chain_index: str = contract.option_index
@@ -236,9 +242,64 @@ class OptionData(InstrumentData):
 
         return ref_price
 
+    def classify_volume(self, tick: TickData) -> tuple[float, float]:
+        """増えた出来高を「買い手が攻めた分／売り手が攻めた分」に振り分ける。
+
+        kabus が配信するのはセッション累計の TradingVolume なので、前回配信から
+        の増分がその間に約定した枚数になる。どちらが攻めたかは、約定直前に立って
+        いた板に対してどこで約定したかで決める（Lee-Ready）:
+
+            約定値 ≧ Ask  → 買い手が攻めた
+            約定値 ≦ Bid  → 売り手が攻めた
+            スプレッドの中 → 中値より上なら買い、下なら売り、
+                             中値ちょうどなら直前の約定値との比較、
+                             それも付かなければ半分ずつ
+
+        配信間隔の中で複数の約定がまとまることがあり、その塊は1つの区分に入る。
+        枚数の内訳としては十分だが、1約定ごとの精度は無い。
+        """
+        volume: float = tick.volume or 0.0
+        prev_volume: float = self._last_volume
+        self._last_volume = volume
+
+        price: float = tick.trade_price or 0.0
+        bid: float = self._last_bid
+        ask: float = self._last_ask
+        self._last_bid = tick.bid_price_1 or 0.0
+        self._last_ask = tick.ask_price_1 or 0.0
+        prev_trade: float = self._last_trade_price
+        if price:
+            self._last_trade_price = price
+
+        traded: float = volume - prev_volume
+        # 基準が無い1本目と、セッション跨ぎで累計が戻った時は見送る
+        if not prev_volume or traded <= 0 or not price or not bid or not ask:
+            return 0.0, 0.0
+
+        if price >= ask:
+            return traded, 0.0
+        if price <= bid:
+            return 0.0, traded
+
+        mid: float = (bid + ask) / 2
+        if price > mid:
+            return traded, 0.0
+        if price < mid:
+            return 0.0, traded
+        if prev_trade and price != prev_trade:
+            return (traded, 0.0) if price > prev_trade else (0.0, traded)
+        return traded / 2, traded / 2
+
     def update_tick(self, tick: TickData) -> None:
         """"""
+        buy_volume, sell_volume = self.classify_volume(tick)
+
         super().update_tick(tick)
+
+        if buy_volume or sell_volume:
+            chain = getattr(self, "chain", None)
+            if chain is not None:
+                chain.add_traded_volume(self, buy_volume, sell_volume)
 
         self.calculate_option_impv()
 
@@ -347,6 +408,16 @@ class ChainData:
         self.atm_strike: int | None = None
         # 面の上下だけのIV（ATM）。calculate_atm_level_iv() 参照。
         self.atm_level_iv: float | None = None
+
+        # 約定枚数の売買内訳（セッション累計）。銘柄ごとではなく「その時の
+        # ATM / Δ0.1 Put / Δ0.1 Call」に積むので、行使価格が入れ替わっても
+        # 系列として連続する（eris_p_iv などと同じ扱い）。
+        self.atm_buy_volume: float = 0.0
+        self.atm_sell_volume: float = 0.0
+        self.eris_p_buy_volume: float = 0.0
+        self.eris_p_sell_volume: float = 0.0
+        self.eris_c_buy_volume: float = 0.0
+        self.eris_c_sell_volume: float = 0.0
 
         self.eris_p_iv: float | None = None
         self.eris_p_strike: int | None = None
@@ -581,6 +652,27 @@ class ChainData:
             self.atm_impv = atm_put.mid_impv
         else:
             self.atm_impv = 0
+
+    def add_traded_volume(
+        self, option: "OptionData", buy_volume: float, sell_volume: float
+    ) -> None:
+        """約定枚数を、その銘柄が今どの系列かを見て積み上げる。
+
+        ATMは同じ行使価格のコールとプットを合わせて1系列にする。
+        """
+        if option.chain_index and option.chain_index == self.atm_index:
+            self.atm_buy_volume += buy_volume
+            self.atm_sell_volume += sell_volume
+
+        strike: float = option.strike_price
+        if option.option_type > 0:
+            if self.eris_c_strike and strike == self.eris_c_strike:
+                self.eris_c_buy_volume += buy_volume
+                self.eris_c_sell_volume += sell_volume
+        else:
+            if self.eris_p_strike and strike == self.eris_p_strike:
+                self.eris_p_buy_volume += buy_volume
+                self.eris_p_sell_volume += sell_volume
 
     def calculate_atm_level_iv(self) -> None:
         """ATMの「面の上下だけのIV」を求める。
@@ -1013,15 +1105,34 @@ class PreviousDayOptionData:
         self.datetime: dict[int, datetime | None] = {}
         self.sorted_dates: list[datetime] = []
         self.op_months: set[str] = set()
+        # 日中立会があった日付（engine が先物1分足から作って入れる）。空なら
+        # 土日判定だけで代用する。
+        self.trading_dates: set = set()
 
     def sort_bar_datetime(self) -> None:
         """"""
         self.sorted_dates = sorted(self.bars.keys(), reverse=True)
 
-    def get_prev_day_datetime(self, dt: datetime) -> datetime | None:
-        """"""
-        for i, date in enumerate(self.sorted_dates):
-            if date < dt:
+    def get_prev_day_datetime(self, dt: datetime, back: int = 1) -> datetime | None:
+        """dt より前で back 番目に新しい日足スナップショットの時刻。
+
+        back=1 が前日（直近の引け）。株価チャートの「基準 N日前」は、ここで
+        何本さかのぼるかを指定してくる。読み込んでいる日数（engine 側で30日）
+        より深く遡ることはできず、その場合は None を返す。
+        """
+        found: int = 0
+        for date in self.sorted_dates:
+            if date >= dt:
+                continue
+            if date.weekday() >= 5:
+                # 土日ラベルは金曜夜間セッションぶん。次の営業日の一部であって
+                # 「前日」ではないので飛ばす。
+                continue
+            if self.trading_dates and date.date() not in self.trading_dates:
+                # 祝日ラベル（連休前の夜間セッションぶん）も同じ理由で飛ばす。
+                continue
+            found += 1
+            if found >= back:
                 return date
         return None
 
@@ -1193,14 +1304,15 @@ class PreviousDayOptionData:
         put_strike: int,
         call_strike: int,
         atm_strike: int,
-        dt: datetime
+        dt: datetime,
+        back: int = 1
     ) -> tuple[float, float, float]:
         """"""
         put_iv: float = 0.0
         call_iv: float = 0.0
         atm_iv: float = 0.0
 
-        prev_date = self.get_prev_day_datetime(dt)
+        prev_date = self.get_prev_day_datetime(dt, back)
         if not prev_date:
             return put_iv, call_iv, atm_iv
 

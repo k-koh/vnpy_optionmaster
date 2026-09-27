@@ -133,6 +133,7 @@ class OptionEngine(BaseEngine):
         for bar in bars:
             self.prev_day_option.add_bar(bar)
         self.prev_day_option.sort_bar_datetime()
+        self.prev_day_option.trading_dates = self._detect_trading_dates(database)
         self.prev_day_option.calculate_eris_data()
         self.prev_day_option.calculate_atm_iv()
 
@@ -152,6 +153,39 @@ class OptionEngine(BaseEngine):
         count: int = self.load_prev_day_option_data()
         self.event_engine.put(Event(EVENT_OPTION_PREV_DAY_DATA, count))
         return count
+
+    def _detect_trading_dates(self, database: BaseDatabase) -> set:
+        """日足スナップショットの日付のうち、日中立会が実際にあった日。
+
+        スナップショットの日付は書いた時点で想定した翌営業日なので、金曜夜間
+        セッションぶんが土曜、連休前の夜間ぶんが祝日のラベルになる。これを
+        「前日」として拾うと、同じ営業日の夜間と比べることになってしまう。
+
+        立会があったかどうかは、その日の10:00台に先物の1分足があるかで判定
+        する（夜間は06:00で終わるので、10:00にバーがあれば日中立会がある）。
+        日付ごとに15分ぶんの小さな問い合わせを1回するだけで済む。
+        """
+        trading_dates: set = set()
+        symbols: list[str] = sorted(self.prev_day_option.op_months)
+        if not symbols:
+            return trading_dates
+
+        for snapshot_dt in self.prev_day_option.bars:
+            day_start: datetime = snapshot_dt.replace(
+                hour=10, minute=0, second=0, microsecond=0
+            )
+            for symbol in symbols:
+                bars = database.load_bar_data(
+                    symbol=symbol,
+                    exchange=Exchange.JPX,
+                    interval=Interval.MINUTE,
+                    start=day_start,
+                    end=day_start + timedelta(minutes=15),
+                )
+                if bars:
+                    trading_dates.add(snapshot_dt.date())
+                    break
+        return trading_dates
 
     def load_prev_day_n225_iv_data(self):
         print("开始加载上一交易日 日経平均VI指数")
@@ -548,8 +582,10 @@ class OptionEngine(BaseEngine):
         return None
 
     def get_prev_day_option_iv(self, op_month: str, prev_iv_type: OptionPrevIvType, put_strike: int, call_strike: int,
-                               atm_strike: int, dt: datetime) -> tuple[float, float, float]:
-        return self.prev_day_option.get_prev_day_option_iv(op_month, prev_iv_type, put_strike, call_strike, atm_strike, dt)
+                               atm_strike: int, dt: datetime, back: int = 1) -> tuple[float, float, float]:
+        return self.prev_day_option.get_prev_day_option_iv(
+            op_month, prev_iv_type, put_strike, call_strike, atm_strike, dt, back
+        )
 
     def get_prev_day_n225_vi(self, dt: datetime) -> float | None:
         return self.prev_day_vi.get_prev_day_vi(dt)

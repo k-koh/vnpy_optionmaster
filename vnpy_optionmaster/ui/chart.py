@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 from collections import Counter, deque
+from types import SimpleNamespace
 import copy
 import os
 import re
@@ -3472,6 +3473,18 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self.canvas.draw_idle()
 
 
+# σラインの段。0.5σ刻みで、そのときのY軸に収まるものだけ描く（軸は広げない）。
+SIGMA_STEPS: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
+
+# 約定枚数（セッション累計）のバーの項目と、バケツの中でのキー。
+# バケツにはその区間の最後の累計値を入れ、1本前との差でその足の枚数にする。
+_VOLUME_FIELDS: tuple[tuple[str, str], ...] = (
+    ("abv", "atm_buy_volume"), ("asv", "atm_sell_volume"),
+    ("pbv", "eris_p_buy_volume"), ("psv", "eris_p_sell_volume"),
+    ("cbv", "eris_c_buy_volume"), ("csv", "eris_c_sell_volume"),
+)
+
+
 class EntrySignalChart(QtWidgets.QWidget):
     """▲エントリー判定 - realtime grid of the 3-bar hold rule.
 
@@ -3494,7 +3507,8 @@ class EntrySignalChart(QtWidgets.QWidget):
     SETTING_FILENAME: str = "entry_signal_chart_setting.json"
 
     INTERVALS: list[tuple[str, int]] = [
-        ("1m", 1), ("3m", 3), ("5m", 5), ("10m", 10), ("15m", 15), ("30m", 30)
+        ("1m", 1), ("3m", 3), ("5m", 5), ("10m", 10), ("15m", 15), ("20m", 20),
+        ("30m", 30)
     ]
 
     MAX_COLUMNS: int = 120
@@ -3528,6 +3542,11 @@ class EntrySignalChart(QtWidgets.QWidget):
         self._cursor_ix: int = -1
         self._cursor_key: tuple = ()
         self._cursor_box = None
+        # カーソルの最後の位置 (バー番号, y値, パネル番号)。図を作り直すと
+        # カーソルの部品も新品になるので、これが無いとティック更新のたびに
+        # カーソルが消える。描き直したあと同じ場所へ戻すために覚えておく。
+        self._cursor_state: tuple[int, float, int] | None = None
+        self._panels: list = []
         # Blitting: the cursor artists are `animated`, so a normal draw skips
         # them; we cache that clean canvas and repaint only the cursor on top.
         self._background = None
@@ -3564,6 +3583,22 @@ class EntrySignalChart(QtWidgets.QWidget):
             "OFFにすると開始時刻を手動で指定できます。"
         )
         self.auto_start_check.toggled.connect(self._on_auto_start_toggled)
+
+        # 何セッションぶん表示するか。1 = 今のセッションだけ、2 = 1つ前から、…
+        # 日中(08:45)と夜間(17:00)をそれぞれ1セッションと数え、土日・立会の
+        # 無い日は飛ばす。
+        self.session_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.session_spin.setRange(1, 20)
+        self.session_spin.setValue(2)
+        self.session_spin.setSuffix("ｾｯｼｮﾝ")
+        self.session_spin.setFixedWidth(80)
+        self.session_spin.setToolTip(
+            "「セッション開始」から何セッションぶん遡って表示するか。\n"
+            "1 = 今のセッションだけ / 2 = 1つ前のセッションから。\n"
+            "日中(08:45)と夜間(17:00)をそれぞれ1セッションと数えます。\n"
+            "本数が増えるので、必要なら「最大」も合わせて増やしてください。"
+        )
+        self.session_spin.valueChanged.connect(self._on_session_count_changed)
 
         # End of the window. Follows the clock unless pinned, so a past
         # session can be replayed for 検証.
@@ -3613,8 +3648,45 @@ class EntrySignalChart(QtWidgets.QWidget):
             "先物が動いてスマイル上を滑っただけの見かけの変化を除いた分で、\n"
             "プラスが続くなら今日そのものボラが買われています。"
         )
-        for box in (self.atm_check, self.put_check, self.call_check, self.level_check):
-            box.setChecked(True)
+        # 基準日の取り方。株価チャートの iv_item と同じ考え方:
+        #   ON  … 全バー共通で1本の引け（直近の引け）を0にする。セッションを
+        #         またいで見たときに、そのままIV水準のトレンドになる。
+        #   OFF … 各足をそれぞれの前日と比べる（毎セッション0から描き直し）。
+        # 今のセッションだけを見ている間は、どちらも同じ値になる。
+        self.fixed_ref_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("基準固定")
+        self.fixed_ref_check.setChecked(False)
+        self.fixed_ref_check.setToolTip(
+            "ON : 全バーを同じ1本の引け（直近の引け）を0として描く。\n"
+            "     株価チャートの「基準固定」と同じで、セッションをまたいだ\n"
+            "     IV水準のトレンドがそのまま読めます。\n"
+            "OFF: 各足をそれぞれの前日と比べる（セッションごとに0から）。\n"
+            "※今のセッションだけ表示している間は、どちらも同じ値です。"
+        )
+        self.fixed_ref_check.toggled.connect(self._on_fixed_ref_toggled)
+
+        # カーソル（十字線・値ラベル・情報ボックス）の表示切替。
+        self.cursor_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("カーソル")
+        self.cursor_check.setChecked(True)
+        self.cursor_check.setToolTip(
+            "マウス位置の十字線と値ラベルを表示します。\n"
+            "OFFにすると線もラベルも出ません（株価チャートのカーソルと同じ）。"
+        )
+        self.cursor_check.toggled.connect(self._on_cursor_toggled)
+
+        # 約定枚数パネル（買い手が攻めた枚数を上、売り手が攻めた枚数を下）
+        self.volume_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("枚数")
+        self.volume_check.setToolTip(
+            "約定枚数を「買い手が攻めた分／売り手が攻めた分」に分けて表示。\n"
+            "約定値がAskなら買い、Bidなら売りとして数えています（Lee-Ready）。\n"
+            "面の上下と合わせて読むと、本物の買い需要か投げかが分かります。"
+        )
+        for box in (self.atm_check, self.put_check, self.call_check,
+                    self.level_check, self.volume_check):
+            # ATM と 面の上下 は互いにほぼ重なるので、既定では両方とも
+            # 出さず、ウィング（PUT / CALL）と枚数だけを出す。
+            # 初期値は必ず connect の前に入れる（接続後に変えると、
+            # まだ揃っていないウィジェットを使って再描画が走る）。
+            box.setChecked(box not in (self.atm_check, self.level_check))
             box.setToolTip("この系列の表示/非表示")
             box.toggled.connect(self._redraw_only)
 
@@ -3661,6 +3733,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         hbox.addWidget(QtWidgets.QLabel("開始"))
         hbox.addWidget(self.start_edit)
         hbox.addWidget(self.auto_start_check)
+        hbox.addWidget(self.session_spin)
         hbox.addWidget(QtWidgets.QLabel("終了"))
         hbox.addWidget(self.end_edit)
         hbox.addWidget(self.now_end_check)
@@ -3673,6 +3746,9 @@ class EntrySignalChart(QtWidgets.QWidget):
         hbox.addWidget(self.put_check)
         hbox.addWidget(self.call_check)
         hbox.addWidget(self.level_check)
+        hbox.addWidget(self.volume_check)
+        hbox.addWidget(self.fixed_ref_check)
+        hbox.addWidget(self.cursor_check)
         hbox.addWidget(QtWidgets.QLabel("透明度"))
         hbox.addWidget(self.alpha_spin)
         hbox.addStretch()
@@ -3714,7 +3790,11 @@ class EntrySignalChart(QtWidgets.QWidget):
             "show_put": self.put_check.isChecked(),
             "show_call": self.call_check.isChecked(),
             "show_level": self.level_check.isChecked(),
+            "show_volume": self.volume_check.isChecked(),
+            "fixed_reference": self.fixed_ref_check.isChecked(),
+            "show_cursor": self.cursor_check.isChecked(),
             "auto_start": self.auto_start_check.isChecked(),
+            "session_count": self.session_spin.value(),
             "now_end": self.now_end_check.isChecked(),
             "tick_update": self.tick_check.isChecked(),
         }
@@ -3734,11 +3814,15 @@ class EntrySignalChart(QtWidgets.QWidget):
         self.interval_combo.setCurrentText(data.get("interval", "10m"))
         self.max_bars_spin.setValue(data.get("max_bars", self.MAX_COLUMNS))
         self.alpha_spin.setValue(data.get("fill_alpha", 0.45))
-        self.atm_check.setChecked(data.get("show_atm", True))
+        self.atm_check.setChecked(data.get("show_atm", False))
         self.put_check.setChecked(data.get("show_put", True))
         self.call_check.setChecked(data.get("show_call", True))
-        self.level_check.setChecked(data.get("show_level", True))
+        self.level_check.setChecked(data.get("show_level", False))
+        self.volume_check.setChecked(data.get("show_volume", True))
+        self.fixed_ref_check.setChecked(data.get("fixed_reference", False))
+        self.cursor_check.setChecked(data.get("show_cursor", True))
         self.auto_start_check.setChecked(data.get("auto_start", True))
+        self.session_spin.setValue(data.get("session_count", 2))
         self.now_end_check.setChecked(data.get("now_end", True))
         self.tick_check.setChecked(data.get("tick_update", True))
 
@@ -3755,11 +3839,56 @@ class EntrySignalChart(QtWidgets.QWidget):
         # before 08:45 — still in the night session that began yesterday 17:00
         return night_open - timedelta(days=1)
 
+    def _is_trading_day(self, day: datetime) -> bool:
+        """その日に立会があったか。
+
+        土日は常に除外。OptionMaster が先物1分足から作った立会日の集合が
+        あれば、祝日もそれで除ける（集合が届いていない古い日付は、判断
+        材料が無いので立会ありとして扱う）。
+        """
+        if day.weekday() >= 5:
+            return False
+        prev_day_option = getattr(self.option_engine, "prev_day_option", None)
+        dates = getattr(prev_day_option, "trading_dates", None)
+        if dates and day.date() >= min(dates):
+            return day.date() in dates
+        return True
+
+    def _previous_session_start(self, start: datetime) -> datetime:
+        """1つ前のセッションの開始時刻。
+
+        夜間(17:00)の1つ前は同じ日の日中(08:45)、日中(08:45)の1つ前は前営業日
+        の夜間(17:00)。前営業日は土日と立会の無い日を飛ばす。
+        """
+        if start.hour >= 17:
+            return start.replace(hour=8, minute=45)
+
+        day: datetime = start - timedelta(days=1)
+        for _ in range(14):             # 連休でも十分届く範囲で打ち切る
+            if self._is_trading_day(day):
+                break
+            day -= timedelta(days=1)
+        return day.replace(hour=17, minute=0, second=0, microsecond=0)
+
+    def _auto_start_datetime(self) -> datetime:
+        """「セッション開始」が指す時刻（指定セッション数だけ遡ったもの）。"""
+        start: datetime = self._session_start(datetime.now(DB_TZ))
+        for _ in range(self.session_spin.value() - 1):
+            start = self._previous_session_start(start)
+        return start
+
+    def _on_session_count_changed(self, _value: int) -> None:
+        """遡るセッション数が変わったら、開始時刻を引き直して読み込む。"""
+        if not self.auto_start_check.isChecked():
+            return
+        self._sync_start_edit()
+        self.run_analysis()
+
     def _sync_start_edit(self) -> None:
         """Point the start field at the running session (auto mode only)."""
         if not self.auto_start_check.isChecked():
             return
-        start: datetime = self._session_start(datetime.now(DB_TZ))
+        start: datetime = self._auto_start_datetime()
         self.start_edit.blockSignals(True)
         self.start_edit.setDateTime(QtCore.QDateTime(
             QtCore.QDate(start.year, start.month, start.day),
@@ -3898,6 +4027,7 @@ class EntrySignalChart(QtWidgets.QWidget):
                     "low": bar.low_price, "close": bar.close_price,
                     "atm": 0.0, "put": 0.0, "call": 0.0, "lvl": 0.0,
                     "pc": bar.pre_close, "ps": 0, "cs": 0,
+                    **{key: None for key, _field in _VOLUME_FIELDS},
                 }
             else:
                 b["high"] = max(b["high"], bar.high_price)
@@ -3906,6 +4036,10 @@ class EntrySignalChart(QtWidgets.QWidget):
             # last non-zero snapshot inside the bucket
             if bar.pre_close:
                 b["pc"] = bar.pre_close
+            for key, field in _VOLUME_FIELDS:
+                value = getattr(bar, field, None)
+                if value is not None:
+                    b[key] = value
             if bar.atm_iv:
                 b["atm"] = bar.atm_iv * 100
             if getattr(bar, "atm_level_iv", 0):
@@ -3932,8 +4066,25 @@ class EntrySignalChart(QtWidgets.QWidget):
                 )
             )
             self.apply_prev_day_diff(r)
+            self.apply_volume_delta(r, prev)
 
         return rows
+
+    @staticmethod
+    def apply_volume_delta(r: dict, prev: dict | None) -> None:
+        """累計の売買枚数を、その足の中で約定した枚数に直す。
+
+        記録しているのはセッション累計なので、1本前との差がその足の枚数に
+        なる。アプリを起動し直すと累計が0からになるため、差が負になった本は
+        値なし扱いにする（1本だけ抜けるが、嘘の枚数を出すよりよい）。
+        """
+        for key, _field in _VOLUME_FIELDS:
+            current = r.get(key)
+            before = prev.get(key) if prev else None
+            if current is None or before is None or current < before:
+                r["v_" + key] = None
+            else:
+                r["v_" + key] = current - before
 
     def apply_prev_day_diff(self, r: dict) -> None:
         """Attach 前日比 for ATM / Δ0.1 Put / Δ0.1 Call to one bucket.
@@ -3942,6 +4093,9 @@ class EntrySignalChart(QtWidgets.QWidget):
         previous session's IV **of the same strike** (OptionPrevIvType.
         SAME_STRIKE), in IV points. ATM uses the 1,000-yen rounded futures
         price as its strike, exactly as iv_item does.
+
+        基準固定がONなら、どの足も「現時点から見た直近の引け」1本を0にする
+        （株価チャートの基準固定と同じ）。OFFなら各足がそれぞれの前日を見る。
         """
         month: str = self.month_combo.currentText()
         r["d_atm"] = r["d_put"] = r["d_call"] = r["d_level"] = None
@@ -3949,13 +4103,25 @@ class EntrySignalChart(QtWidgets.QWidget):
             return
 
         atm_strike: int = int(round(r["close"] / 1000) * 1000)
+        r["as"] = atm_strike            # カーソル情報で出すので残す
+        reference_dt: datetime = (
+            datetime.now(DB_TZ) if self.fixed_ref_check.isChecked() else r["dt"]
+        )
         try:
             p_prev, c_prev, a_prev = self.option_engine.get_prev_day_option_iv(
                 f"nk-{month}", OptionPrevIvType.SAME_STRIKE,
-                r["ps"], r["cs"], atm_strike, r["dt"],
+                r["ps"], r["cs"], atm_strike, reference_dt,
             )
         except Exception:
             return
+
+        # この足が0の基準にしている日足スナップショットの時刻。基準固定がOFFのときは
+        # これが17:00で入れ替わり、その足で棒が0から描き直される。
+        prev_day_option = getattr(self.option_engine, "prev_day_option", None)
+        r["ref"] = (
+            prev_day_option.get_prev_day_datetime(reference_dt)
+            if prev_day_option is not None else None
+        )
 
         if r["atm"] and a_prev:
             r["d_atm"] = r["atm"] - a_prev * 100
@@ -4000,11 +4166,20 @@ class EntrySignalChart(QtWidgets.QWidget):
     def _on_mouse_move(self, event) -> None:
         """Show the values of the bar under the mouse."""
         rows: list[dict] = getattr(self, "_rows", [])
+        if not self.cursor_check.isChecked():
+            return
         if not rows or event.inaxes is None or event.xdata is None:
             return
 
         ix: int = int(round(event.xdata))
         ix = max(0, min(len(rows) - 1, ix))
+        # 再描画後に同じ場所へ戻せるよう、位置を覚えておく
+        if event.inaxes in self._panels:
+            self._cursor_state = (
+                ix,
+                float(event.ydata) if event.ydata is not None else 0.0,
+                self._panels.index(event.inaxes),
+            )
         # Repaint when the bar changes or the pointer moves a pixel vertically
         # (the horizontal hair has to follow it), but not on identical events.
         key: tuple = (ix, int(event.y or 0), id(event.inaxes))
@@ -4031,7 +4206,9 @@ class EntrySignalChart(QtWidgets.QWidget):
                 near_left: bool = event.xdata < x0 + (x1 - x0) * 0.10
                 tag.set_ha("left" if near_left else "right")
                 tag.set_position((event.xdata + (0.8 if near_left else -0.8), y))
-                tag.set_text(f"{y:,.0f}" if kind == "price" else f"{y:+.2f}")
+                tag.set_text(
+                    f"{y:,.0f}" if kind in ("price", "vol") else f"{y:+.2f}"
+                )
                 tag.set_visible(True)
             else:
                 hline.set_visible(False)
@@ -4052,12 +4229,52 @@ class EntrySignalChart(QtWidgets.QWidget):
             r["dt"].strftime("%m/%d %H:%M"),
             f"先物 {r['close']:,.0f} (O {r['open']:,.0f} H {r['high']:,.0f} L {r['low']:,.0f})",
         ]
+        diff_label: str = (
+            "基準日比" if self.fixed_ref_check.isChecked() else "前日比"
+        )
+        # 行使価格も出す: Δ0.1 の銘柄は日をまたぐと入れ替わるので、どの
+        # 行使価格の数字を見ているのかが分からないと読み違える。
+        def k(key: str) -> str:
+            strike = r.get(key)
+            return f"({int(strike)})" if strike else "(--------)"
+
+        def qty(buy_key: str, sell_key: str) -> str:
+            """「買手が攻めた枚数 / 売手が攻めた枚数」。
+
+            0 枚は 0 と書くより - の方が、数字の並びの中で「約定が
+            無い」と即座に分かる。
+            """
+            bought, sold = r.get(buy_key), r.get(sell_key)
+            if bought is None and sold is None:
+                return "---"
+
+            def one(value) -> str:
+                return f"{value:.0f}" if value else "-"
+
+            return f"{one(bought)}/{one(sold)}"
+
+        def volume_suffix(buy_key: str, sell_key: str) -> str:
+            """枚数を出しているときだけ、系列行の末尾に付ける。"""
+            if not self.volume_check.isChecked():
+                return ""
+            return "  " + qty(buy_key, sell_key)
+
         if self.atm_check.isChecked():
-            parts.append(f"ATM {r['atm']:5.2f} (前日比 {d('d_atm')})")
+            parts.append(f"ATM{k('as')} {r['atm']:5.2f} ({diff_label} {d('d_atm')})")
         if self.put_check.isChecked():
-            parts.append(f"PUT {r['put']:5.2f} (前日比 {d('d_put')})")
+            parts.append(f"PUT{k('ps')} {r['put']:5.2f} ({diff_label} {d('d_put')})")
         if self.call_check.isChecked():
-            parts.append(f"CALL {r['call']:5.2f} (前日比 {d('d_call')})")
+            parts.append(f"CALL{k('cs')} {r['call']:5.2f} ({diff_label} {d('d_call')})")
+        if self.volume_check.isChecked():
+            volume_parts: list[str] = []
+            if self.atm_check.isChecked():
+                volume_parts.append(f"ATM {qty('v_abv', 'v_asv')}")
+            if self.put_check.isChecked():
+                volume_parts.append(f"PUT {qty('v_pbv', 'v_psv')}")
+            if self.call_check.isChecked():
+                volume_parts.append(f"CALL {qty('v_cbv', 'v_csv')}")
+            if volume_parts:
+                parts.append("枚数(買/売) " + " ".join(volume_parts))
         if r.get("roll"):
             parts.append(f"行使価格変更 P{r['ps']}/C{r['cs']}")
         self.cursor_label.setText("　|　".join(parts))
@@ -4073,12 +4290,16 @@ class EntrySignalChart(QtWidgets.QWidget):
                 f"  H {r['high']:,.0f}  L {r['low']:,.0f}",
             ]
             if self.atm_check.isChecked():
-                lines.append(f"ATM  {r['atm']:6.2f} ({d('d_atm')})")
+                lines.append(f"ATM  {k('as')} {r['atm']:6.2f} ({d('d_atm')})"
+                             + volume_suffix('v_abv', 'v_asv'))
             if self.put_check.isChecked():
-                lines.append(f"PUT  {r['put']:6.2f} ({d('d_put')})")
+                lines.append(f"PUT  {k('ps')} {r['put']:6.2f} ({d('d_put')})"
+                             + volume_suffix('v_pbv', 'v_psv'))
             if self.call_check.isChecked():
-                lines.append(f"CALL {r['call']:6.2f} ({d('d_call')})")
-            lines.append("   前日比")
+                lines.append(f"CALL {k('cs')} {r['call']:6.2f} ({d('d_call')})"
+                             + volume_suffix('v_cbv', 'v_csv'))
+            lines.append(f"   {diff_label}"
+                         + ("　枚数 買/売" if self.volume_check.isChecked() else ""))
             if r.get("roll"):
                 lines.append("行使価格変更")
             self._cursor_box.set_ha("left" if box_on_right else "right")
@@ -4087,6 +4308,52 @@ class EntrySignalChart(QtWidgets.QWidget):
             self._cursor_box.set_visible(True)
 
         self._blit_cursor()
+
+    def _hide_cursor(self) -> None:
+        """カーソルの線・ラベル・情報ボックスをすべて隠す。"""
+        self._cursor_ix = -1
+        self._cursor_key = ()
+        for line in getattr(self, "_cursor_lines", []):
+            line.set_visible(False)
+        for _ax, hline, _kind in getattr(self, "_cursor_hlines", []):
+            hline.set_visible(False)
+        for tag in getattr(self, "_cursor_tags", []):
+            tag.set_visible(False)
+        if self._cursor_box is not None:
+            self._cursor_box.set_visible(False)
+
+    def _on_cursor_toggled(self, checked: bool) -> None:
+        """カーソルを出す/出さない。"""
+        if checked:
+            self._restore_cursor()
+            return
+        self._hide_cursor()
+        self.cursor_label.setText("")
+        self._blit_cursor()
+
+    def _restore_cursor(self) -> None:
+        """描き直したあと、カーソルを最後の位置へ戻す。
+
+        図を作り直すとカーソルの部品は全部新品（非表示）になるので、
+        覚えておいた位置でマウス移動と同じ処理を一度流す。
+        """
+        if not self.cursor_check.isChecked() or self._cursor_state is None:
+            return
+        if not self._rows or not self._panels:
+            return
+
+        ix, y, panel = self._cursor_state
+        if panel < 0 or panel >= len(self._panels):
+            return
+        ix = max(0, min(len(self._rows) - 1, ix))
+
+        # マウス移動と同じ経路を通すための、最小限のイベント。
+        event = SimpleNamespace(
+            inaxes=self._panels[panel], xdata=float(ix), ydata=y, x=0.0, y=0.0
+        )
+        self._cursor_key = ()
+        self._cursor_ix = -1
+        self._on_mouse_move(event)
 
     def _on_mouse_leave(self, event) -> None:
         self._cursor_ix = -1
@@ -4160,6 +4427,7 @@ class EntrySignalChart(QtWidgets.QWidget):
                 atm=last["atm"], put=last["put"], call=last["call"],
                 lvl=last.get("lvl", 0.0), pc=last.get("pc", 0.0),
                 ps=last["ps"], cs=last["cs"],
+                **{key: last.get(key) for key, _field in _VOLUME_FIELDS},
             )
             rows.append(last)
         else:
@@ -4176,6 +4444,11 @@ class EntrySignalChart(QtWidgets.QWidget):
             underlying = getattr(chain, "underlying", None)
             if underlying is not None and underlying.tick and underlying.tick.pre_close:
                 last["pc"] = underlying.tick.pre_close
+            # 約定枚数はチェーン側が系列ごとに積んでいる累計値
+            for key, field in _VOLUME_FIELDS:
+                value = getattr(chain, field, None)
+                if value is not None:
+                    last[key] = value
             if chain.eris_p_iv:
                 last["put"] = chain.eris_p_iv * 100
             if chain.eris_c_iv:
@@ -4193,6 +4466,7 @@ class EntrySignalChart(QtWidgets.QWidget):
             )
         )
         self.apply_prev_day_diff(last)
+        self.apply_volume_delta(last, rows[-2] if len(rows) > 1 else None)
         self._show(rows)
 
     # -------------------------------------------------------------- render
@@ -4205,6 +4479,15 @@ class EntrySignalChart(QtWidgets.QWidget):
         if self._truncated:
             shown = shown[-max_bars:]
         self.update_chart(shown)
+
+    def _on_fixed_ref_toggled(self, _checked: bool) -> None:
+        """基準日の取り方を変える。DBは読み直さず前日比だけ計算し直す。"""
+        if not self._all_rows:
+            self.run_analysis()
+            return
+        for r in self._all_rows:
+            self.apply_prev_day_diff(r)
+        self._show(self._all_rows)
 
     def _redraw_only(self, *_args) -> None:
         """Re-draw from the rows already loaded.
@@ -4250,14 +4533,21 @@ class EntrySignalChart(QtWidgets.QWidget):
 
         n: int = len(rows)
         x = np.arange(n)
+        # 何を0にしているかで呼び名が変わる
+        diff_label: str = (
+            "基準日比" if self.fixed_ref_check.isChecked() else "前日比"
+        )
 
         # Margins in pixels rather than fractions: on a tall window a 6% top
         # margin turns into a wide empty band above the 先物 panel, and a 5.5%
         # left margin wastes an inch on a wide one.
         w_px: float = max(1.0, self.fig.get_size_inches()[0] * self.fig.dpi)
         h_px: float = max(1.0, self.fig.get_size_inches()[1] * self.fig.dpi)
+        show_volume: bool = self.volume_check.isChecked()
+        # 枚数は向きと大きさが分かればよいので、IVの半分以下の背丈で足りる。
+        height_ratios: list[float] = [3.0, 2.6] + ([0.6] if show_volume else [])
         gs = self.fig.add_gridspec(
-            2, 1, height_ratios=[3.0, 2.6], hspace=0.10,
+            len(height_ratios), 1, height_ratios=height_ratios, hspace=0.10,
             left=min(0.12, 58.0 / w_px),
             right=1.0 - min(0.05, 10.0 / w_px),
             top=1.0 - min(0.12, 26.0 / h_px),
@@ -4265,6 +4555,10 @@ class EntrySignalChart(QtWidgets.QWidget):
         )
         ax_fut = self.fig.add_subplot(gs[0, 0])
         ax_iv = self.fig.add_subplot(gs[1, 0], sharex=ax_fut)
+        ax_vol = self.fig.add_subplot(gs[2, 0], sharex=ax_fut) if show_volume else None
+        panels: list = [ax_fut, ax_iv] + ([ax_vol] if ax_vol is not None else [])
+        self._panels = panels
+        ax_bottom = panels[-1]
 
         # ---- futures OHLC bars
         # Batched into three collections instead of ~3 artists per bar: at 600
@@ -4316,17 +4610,14 @@ class EntrySignalChart(QtWidgets.QWidget):
         # セッションをまたぐと前日終値が変わるので、バーごとの階段線で引く。
         base_x: list[float] = []
         base_y: list[float] = []
-        sigma_up_y: list[float] = []
-        sigma_dn_y: list[float] = []
+        base_daily: list[float] = []        # その足のATM日率IV
         for i, r in enumerate(rows):
             prev_close: float = r.get("pc") or 0.0
             if not prev_close:
                 continue
             base_x.append(i)
             base_y.append(prev_close)
-            daily_iv: float = (r.get("atm") or 0.0) / 100.0 / (252 ** 0.5)
-            sigma_up_y.append(prev_close * (1 + daily_iv * 0.5))
-            sigma_dn_y.append(prev_close * (1 - daily_iv * 0.5))
+            base_daily.append((r.get("atm") or 0.0) / 100.0 / (252 ** 0.5))
 
         # Collections do not autoscale the view, so set the price range here.
         # 0σ は基準線なので範囲に含める。±0.5σ は「入れば描く」だけで、
@@ -4350,21 +4641,24 @@ class EntrySignalChart(QtWidgets.QWidget):
                 va="center", ha="left", zorder=4,
             )
             y_lo, y_hi = ax_fut.get_ylim()
-            for ys, color, tag in (
-                (sigma_up_y, "#ff4b4b", "+0.5σ"),
-                (sigma_dn_y, "#4bffff", "-0.5σ"),
-            ):
-                if not ys or min(ys) < y_lo or max(ys) > y_hi:
-                    continue        # 現在のY軸に収まらない → 描かない
-                ax_fut.plot(
-                    base_x, ys, color=color, linewidth=0.9, linestyle="--",
-                    alpha=0.8, zorder=0.8, drawstyle="steps-mid",
-                )
-                ax_fut.annotate(
-                    f"{tag} {ys[0]:.0f}", xy=(base_x[0], ys[0]), xytext=(6, 0),
-                    textcoords="offset points", color=color, fontsize=8,
-                    va="center", ha="left", zorder=4,
-                )
+            for mult in SIGMA_STEPS:
+                for sign, color in ((1.0, "#ff4b4b"), (-1.0, "#4bffff")):
+                    ys: list[float] = [
+                        pc * (1 + sign * daily * mult)
+                        for pc, daily in zip(base_y, base_daily)
+                    ]
+                    if min(ys) < y_lo or max(ys) > y_hi:
+                        continue    # 現在のY軸に収まらない → 描かない
+                    ax_fut.plot(
+                        base_x, ys, color=color, linewidth=0.9, linestyle="--",
+                        alpha=0.8, zorder=0.8, drawstyle="steps-mid",
+                    )
+                    ax_fut.annotate(
+                        f"{sign * mult:+.1f}σ {ys[0]:.0f}",
+                        xy=(base_x[0], ys[0]), xytext=(6, 0),
+                        textcoords="offset points", color=color, fontsize=8,
+                        va="center", ha="left", zorder=4,
+                    )
         ax_fut.set_ylabel("先物", color="#cccccc", fontsize=10)
         ax_fut.tick_params(labelbottom=False, labelsize=9)
         ax_fut.grid(True, axis="y", alpha=0.15)
@@ -4373,7 +4667,7 @@ class EntrySignalChart(QtWidgets.QWidget):
             f"nk-{self.month_combo.currentText()}   "
             f"{rows[0]['dt'].strftime('%m/%d %H:%M')} – {last['dt'].strftime('%H:%M')}   "
             f"{self.interval_combo.currentText()}足 {n}本   "
-            f"前日比IV（同一行使価格）"
+            f"{diff_label}IV（同一行使価格）"
             + ("　（最大{}本のため古い側を省略）".format(self.max_bars_spin.value())
                if self._truncated else ""),
             color="#dddddd", fontsize=11, loc="left", pad=4
@@ -4469,7 +4763,7 @@ class EntrySignalChart(QtWidgets.QWidget):
 
         ax_iv.axhline(0, color="#888888", linewidth=0.8, zorder=3)
         ax_iv.set_axisbelow(True)       # grid stays under the bars
-        ax_iv.set_ylabel("前日比IV", color="#cccccc", fontsize=10)
+        ax_iv.set_ylabel(f"{diff_label}IV", color="#cccccc", fontsize=10)
         ax_iv.tick_params(labelbottom=False, labelleft=True, labelsize=8)
         ax_iv.grid(True, axis="y", alpha=0.12)
         for spine in ("top", "right"):
@@ -4487,6 +4781,30 @@ class EntrySignalChart(QtWidgets.QWidget):
         lo_v: float = min(all_values, default=0.0)
         hi_v: float = max(all_values, default=0.0)
         ax_iv.set_ylim(min(0.0, lo_v) - span * 0.12, hi_v + span * 0.18)
+
+        # ±1.0σ 以上の段は、Y軸に収まるときだけ足す（±0.5σ は上で軸に
+        # 入れてあるので常に見える）。軸をこれらに合わせて広げることはしない。
+        if sigma_x:
+            iv_lo, iv_hi = ax_iv.get_ylim()
+            for mult in SIGMA_STEPS[1:]:
+                for sign in (1.0, -1.0):
+                    ys = [
+                        r["atm"] / (252 ** 0.5) * mult * sign
+                        for r in rows if r.get("atm")
+                    ]
+                    if min(ys) < iv_lo or max(ys) > iv_hi:
+                        continue
+                    ax_iv.plot(
+                        sigma_x, ys, color="#ffffff", linewidth=1.0,
+                        linestyle="--", alpha=0.55, zorder=3,
+                        drawstyle="steps-mid",
+                    )
+                    ax_iv.annotate(
+                        f"{sign * mult:+.1f}σ", xy=(sigma_x[0], ys[0]),
+                        xytext=(6, 0), textcoords="offset points",
+                        color="#dddddd", fontsize=8, va="center", ha="left",
+                        zorder=4,
+                    )
 
         # ---- value labels: only the outermost of the three per column
         # Three numbers stacked on overlapping bars is unreadable, but the
@@ -4525,15 +4843,79 @@ class EntrySignalChart(QtWidgets.QWidget):
                        transform=ax_iv.transAxes, ha="center", va="center",
                        color="#6b7280", fontsize=11)
 
+        # ---- 約定枚数: 買い手が攻めた分を上、売り手が攻めた分を下に
+        # 系列と色はIVパネルと同じで、重なりの描き方（塗りは半透明、短い棒を
+        # 手前、枠線は全部の塗りの上）も揃えてある。
+        if ax_vol is not None:
+            vol_specs = [
+                (buy_key, sell_key, color, label)
+                for buy_key, sell_key, color, label, shown in (
+                    ("v_abv", "v_asv", "#ffffff", "ATM", self.atm_check.isChecked()),
+                    ("v_pbv", "v_psv", "#4bffff", "PUT Δ0.1", self.put_check.isChecked()),
+                    ("v_cbv", "v_csv", "#ff0000", "CALL Δ0.1", self.call_check.isChecked()),
+                )
+                if shown
+            ]
+            vol_bars: list[tuple] = []
+            vol_values: list[float] = []
+            for buy_key, sell_key, color, _label in vol_specs:
+                for i, r in enumerate(rows):
+                    for key, sign in ((buy_key, 1.0), (sell_key, -1.0)):
+                        qty = r.get(key)
+                        if not qty:
+                            continue
+                        value: float = qty * sign
+                        vol_values.append(value)
+                        vol_bars.append((
+                            abs(value),
+                            [(i - body_w / 2, 0.0), (i + body_w / 2, 0.0),
+                             (i + body_w / 2, value), (i - body_w / 2, value)],
+                            to_rgba(color, fill_alpha),
+                            to_rgba(color, 1.0),
+                        ))
+
+            if vol_bars:
+                vol_bars.sort(key=lambda b: b[0], reverse=True)
+                vol_verts = [b[1] for b in vol_bars]
+                ax_vol.add_collection(PolyCollection(
+                    vol_verts, facecolors=[b[2] for b in vol_bars],
+                    edgecolors="none", zorder=1.5,
+                ))
+                ax_vol.add_collection(PolyCollection(
+                    vol_verts, facecolors="none",
+                    edgecolors=[b[3] for b in vol_bars],
+                    linewidths=1.2, zorder=2.5,
+                ))
+                vol_span: float = max(abs(v) for v in vol_values) or 1.0
+                ax_vol.set_ylim(
+                    min(vol_values + [0.0]) - vol_span * 0.15,
+                    max(vol_values + [0.0]) + vol_span * 0.15,
+                )
+            else:
+                ax_vol.set_ylim(-1.0, 1.0)
+                ax_vol.text(
+                    0.5, 0.5, "約定枚数の記録なし（記録開始後の足から表示されます）",
+                    transform=ax_vol.transAxes, ha="center", va="center",
+                    color="#6b7280", fontsize=10,
+                )
+
+            ax_vol.axhline(0, color="#888888", linewidth=0.8, zorder=3)
+            ax_vol.set_axisbelow(True)
+            ax_vol.set_ylabel("約定枚数\n買↑/売↓", color="#cccccc", fontsize=9)
+            ax_vol.tick_params(labelbottom=False, labelleft=True, labelsize=8)
+            ax_vol.grid(True, axis="y", alpha=0.12)
+            for spine in ("top", "right"):
+                ax_vol.spines[spine].set_visible(False)
+
         # ---- time axis under the bottom panel
         label_step: int = max(1, math.ceil(n / 14))
         tick_ix: list[int] = [i for i in range(n) if i % label_step == 0 or i == n - 1]
-        ax_iv.set_xticks(tick_ix)
-        ax_iv.set_xticklabels(
+        ax_bottom.set_xticks(tick_ix)
+        ax_bottom.set_xticklabels(
             [rows[i]["dt"].strftime("%H:%M") for i in tick_ix],
             color="#9aa3ad", fontsize=8,
         )
-        ax_iv.tick_params(axis="x", labelbottom=True, colors="#9aa3ad", length=3)
+        ax_bottom.tick_params(axis="x", labelbottom=True, colors="#9aa3ad", length=3)
 
         # ---- セッション開始（日中 08:45 / 夜間 17:00）の縦線
         # 株価チャートの市場時間線と同じグレーの破線。開始時刻ちょうどの
@@ -4543,31 +4925,76 @@ class EntrySignalChart(QtWidgets.QWidget):
         for i, r in enumerate(rows):
             session: datetime = self._session_start(r["dt"])
             if prev_session is not None and session != prev_session:
-                for ax in (ax_fut, ax_iv):
+                # 値のパネル（IV・枚数）には引かない。あちらの縦線は
+                # 「基準が入れ替わって棒が0から描き直される位置」だけに
+                # して、意味を混ぜない。
+                for ax in (ax_fut,):
                     ax.axvline(
                         i, color="#646464", linewidth=0.9,
                         linestyle="--", alpha=0.9, zorder=0.6,
                     )
             prev_session = session
 
-        # 行使価格変更 markers (the signal is suppressed on those bars)
+        # 基準が入れ替わった足の区切り線（株価チャートの iv_item と同じ）。
+        # 基準固定がOFFのときだけ出る（ONなら全足同じ基準なので変わらない）。
+        # 足の開始位置（左端）に引くので、セッション線（足の中心）とは重ならない。
         for i, r in enumerate(rows):
-            if not r.get("roll"):
+            if not i:
                 continue
-            # muted violet: yellow now belongs to the ATM series
-            ax_iv.axvline(i, color="#b48ead", linewidth=0.8, linestyle=":", alpha=0.6)
+            reference = r.get("ref")
+            previous_reference = rows[i - 1].get("ref")
+            if reference and previous_reference and reference != previous_reference:
+                for ax in (panel for panel in (ax_iv, ax_vol) if panel is not None):
+                    ax.axvline(
+                        i - 0.5, color="#646464", linewidth=0.9,
+                        linestyle="--", alpha=0.9, zorder=3.5,
+                    )
+
+        # 行使価格変更: 縦線ではなく「前|今」の行使価格ラベル（株価チャートの
+        # iv_item と同じ）。前日比は同一行使価格どうしの差なので、銘柄が
+        # 入れ替わった足の段差はIVの動きではない。値のラベルと重ならない
+        # よう、その外側に置く。
+        roll_specs = [
+            (value_key, strike_key, color)
+            for value_key, strike_key, color, shown in (
+                ("d_put", "ps", "#4bffff", self.put_check.isChecked()),
+                ("d_call", "cs", "#ff0000", self.call_check.isChecked()),
+                ("d_atm", "as", "#ffffff", self.atm_check.isChecked()),
+            )
+            if shown
+        ]
+        for value_key, strike_key, color in roll_specs:
+            for i, r in enumerate(rows):
+                if not i:
+                    continue
+                now_strike = r.get(strike_key)
+                prev_strike = rows[i - 1].get(strike_key)
+                if not now_strike or not prev_strike or now_strike == prev_strike:
+                    continue
+                value = r.get(value_key)
+                if value is None:
+                    continue
+                ax_iv.text(
+                    i, value + (pad * 2.8 if value >= 0 else -pad * 2.8),
+                    f"{prev_strike / 1000:g}|{now_strike / 1000:g}",
+                    ha="center", va="bottom" if value >= 0 else "top",
+                    color=color, fontsize=7, zorder=4.5,
+                )
 
         ax_fut.set_xlim(-0.8, n - 0.2)
 
         # one hair-line per panel, moved by the mouse
-        for ax in (ax_fut, ax_iv):
+        for ax in panels:
             line = ax.axvline(0, color="#dddddd", linewidth=0.8, alpha=0.55,
                               visible=False, zorder=5, animated=True)
             self._cursor_lines.append(line)
 
         # Horizontal crosshair + value tag, per value panel. 判定 row has no
         # meaningful y scale, so it is left out.
-        for ax, kind in ((ax_fut, "price"), (ax_iv, "iv")):
+        cursor_panels: list[tuple] = [(ax_fut, "price"), (ax_iv, "iv")]
+        if ax_vol is not None:
+            cursor_panels.append((ax_vol, "vol"))
+        for ax, kind in cursor_panels:
             hline = ax.axhline(
                 0, color="#dddddd", linewidth=0.8, alpha=0.55,
                 visible=False, zorder=5, animated=True,
@@ -4601,13 +5028,16 @@ class EntrySignalChart(QtWidgets.QWidget):
             def _s(key: str) -> str:
                 v = latest.get(key)
                 return "---" if v is None else f"{v:+.2f}"
-            state = (f"前日比　ATM {_s('d_atm')} / PUT {_s('d_put')} / "
+            state = (f"{diff_label}　ATM {_s('d_atm')} / PUT {_s('d_put')} / "
                      f"CALL {_s('d_call')}")
         self.status_label.setText(
             "最終更新: " + datetime.now().strftime("%H:%M:%S") + "　" + state
         )
 
         self.canvas.draw()
+        # 図を作り直したのでカーソルも新品（非表示）になっている。ティック
+        # 更新のたびに消えないよう、最後の位置へ戻す。
+        self._restore_cursor()
 
 
 class PayoffDiagramChart(QtWidgets.QWidget):
