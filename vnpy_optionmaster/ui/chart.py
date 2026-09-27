@@ -4631,8 +4631,27 @@ class EntrySignalChart(QtWidgets.QWidget):
         ax_fut.set_ylim(lo_px - pad_px, hi_px + pad_px)
 
         if base_x:
+            # 前日終値が切り替わる足（セッションの切れ目）で線を切る。
+            # つなぐと段差が縦棒になって、価格帯を横切る線に見えてしまう。
+            breaks: set = {
+                k for k in range(1, len(base_y)) if base_y[k] != base_y[k - 1]
+            }
+
+            def split_at_sessions(values: list) -> tuple[list, list]:
+                """切れ目に欠測を挟んで、線をつながらなくする。"""
+                xs: list = []
+                ys: list = []
+                for k, (x, value) in enumerate(zip(base_x, values)):
+                    if k in breaks:
+                        xs.append(x)
+                        ys.append(float("nan"))
+                    xs.append(x)
+                    ys.append(value)
+                return xs, ys
+
             ax_fut.plot(
-                base_x, base_y, color="#ffff00", linewidth=0.9, linestyle=":",
+                *split_at_sessions(base_y),
+                color="#ffff00", linewidth=0.9, linestyle=":",
                 alpha=0.9, zorder=0.8, drawstyle="steps-mid",
             )
             ax_fut.annotate(
@@ -4647,15 +4666,23 @@ class EntrySignalChart(QtWidgets.QWidget):
                         pc * (1 + sign * daily * mult)
                         for pc, daily in zip(base_y, base_daily)
                     ]
-                    if min(ys) < y_lo or max(ys) > y_hi:
-                        continue    # 現在のY軸に収まらない → 描かない
+                    # セッションごとに前日終値が変わるので、同じσでも入る区間と
+                    # 入らない区間がある。全部が収まるときだけ描くと 1本も出ないので、
+                    # どこかが見えるなら描く（Y軸は固定なので、はみ出した分は切られる）。
+                    inside: list[int] = [
+                        k for k, value in enumerate(ys) if y_lo <= value <= y_hi
+                    ]
+                    if not inside:
+                        continue    # 全区間が軸の外 → 描かない
                     ax_fut.plot(
-                        base_x, ys, color=color, linewidth=0.9, linestyle="--",
+                        *split_at_sessions(ys),
+                        color=color, linewidth=0.9, linestyle="--",
                         alpha=0.8, zorder=0.8, drawstyle="steps-mid",
                     )
+                    anchor: int = inside[0]     # ラベルは見えている最初の位置へ
                     ax_fut.annotate(
-                        f"{sign * mult:+.1f}σ {ys[0]:.0f}",
-                        xy=(base_x[0], ys[0]), xytext=(6, 0),
+                        f"{sign * mult:+.1f}σ {ys[anchor]:.0f}",
+                        xy=(base_x[anchor], ys[anchor]), xytext=(6, 0),
                         textcoords="offset points", color=color, fontsize=8,
                         va="center", ha="left", zorder=4,
                     )
