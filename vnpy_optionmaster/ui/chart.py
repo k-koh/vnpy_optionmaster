@@ -944,7 +944,18 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 self.prev_underlying_prices.clear()
                 self._prev_underlying_loaded_date = session_key
 
-            if chain.chain_symbol not in self.prev_underlying_prices:
+            # 前日終値はティックが持っている（kabus の PreviousClose）。夜間に入れば
+            # 17:00 でその場で切り替わるので、まずこちらを見る。DBの分足は
+            # 記録が止まっている（休場モード・行情切れ等）と古い値のままになるので、
+            # ティックが無いときだけの控えにする。
+            underlying_data = getattr(chain, "underlying", None)
+            tick_prev_close: float = 0.0
+            if underlying_data is not None and underlying_data.tick:
+                tick_prev_close = underlying_data.tick.pre_close or 0.0
+
+            if tick_prev_close:
+                self.prev_underlying_prices[chain.chain_symbol] = tick_prev_close
+            elif chain.chain_symbol not in self.prev_underlying_prices:
                 prev_price = self._load_prev_day_futures_close(chain.chain_symbol)
                 if prev_price is not None:
                     self.prev_underlying_prices[chain.chain_symbol] = prev_price
