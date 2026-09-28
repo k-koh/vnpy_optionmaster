@@ -4548,8 +4548,9 @@ class EntrySignalChart(QtWidgets.QWidget):
         height_ratios: list[float] = [3.0, 2.6] + ([0.6] if show_volume else [])
         gs = self.fig.add_gridspec(
             len(height_ratios), 1, height_ratios=height_ratios, hspace=0.10,
-            left=min(0.12, 58.0 / w_px),
-            right=1.0 - min(0.05, 10.0 / w_px),
+            # 目盛りと軸ラベルを右に出すので、左は最小限・右に場所を取る
+            left=min(0.04, 12.0 / w_px),
+            right=1.0 - min(0.13, 76.0 / w_px),
             top=1.0 - min(0.12, 26.0 / h_px),
             bottom=min(0.12, 28.0 / h_px),
         )
@@ -4557,6 +4558,10 @@ class EntrySignalChart(QtWidgets.QWidget):
         ax_iv = self.fig.add_subplot(gs[1, 0], sharex=ax_fut)
         ax_vol = self.fig.add_subplot(gs[2, 0], sharex=ax_fut) if show_volume else None
         panels: list = [ax_fut, ax_iv] + ([ax_vol] if ax_vol is not None else [])
+        # 目盛りの数値も軸ラベルも右側へ（株価チャートと同じ並び）
+        for panel in panels:
+            panel.yaxis.tick_right()
+            panel.yaxis.set_label_position("right")
         self._panels = panels
         ax_bottom = panels[-1]
 
@@ -4686,6 +4691,27 @@ class EntrySignalChart(QtWidgets.QWidget):
                         textcoords="offset points", color=color, fontsize=8,
                         va="center", ha="left", zorder=4,
                     )
+        # ---- 現在値（株価チャートの現在値線と同じ）
+        # 最新の足の終値に横線を引き、右端に価格を出す。色は陽線/陰線に合わせる。
+        last_row = rows[-1]
+        last_price: float = last_row["close"]
+        last_color: str = (
+            up_color if last_row["close"] >= last_row["open"] else down_color
+        )
+        ax_fut.axhline(
+            last_price, color=last_color, linewidth=0.9, alpha=0.9, zorder=3,
+        )
+        # 価格は右の目盛りの位置にタグとして出す（株価チャートの現在値と同じ）。
+        # 軸の外なので、一番新しいローソクにかぶらない。
+        ax_fut.annotate(
+            f"{last_price:,.0f}",
+            xy=(1.0, last_price), xycoords=ax_fut.get_yaxis_transform(),
+            xytext=(3, 0), textcoords="offset points",
+            ha="left", va="center", color="#101418", fontsize=9,
+            bbox=dict(boxstyle="square,pad=0.25", fc=last_color, ec="none"),
+            annotation_clip=False, zorder=6,
+        )
+
         ax_fut.set_ylabel("先物", color="#cccccc", fontsize=10)
         ax_fut.tick_params(labelbottom=False, labelsize=9)
         ax_fut.grid(True, axis="y", alpha=0.15)
@@ -4791,9 +4817,9 @@ class EntrySignalChart(QtWidgets.QWidget):
         ax_iv.axhline(0, color="#888888", linewidth=0.8, zorder=3)
         ax_iv.set_axisbelow(True)       # grid stays under the bars
         ax_iv.set_ylabel(f"{diff_label}IV", color="#cccccc", fontsize=10)
-        ax_iv.tick_params(labelbottom=False, labelleft=True, labelsize=8)
+        ax_iv.tick_params(labelbottom=False, labelright=True, labelsize=8)
         ax_iv.grid(True, axis="y", alpha=0.12)
-        for spine in ("top", "right"):
+        for spine in ("top", "left"):
             ax_iv.spines[spine].set_visible(False)
         ax_iv.legend(
             handles=[
@@ -4929,9 +4955,9 @@ class EntrySignalChart(QtWidgets.QWidget):
             ax_vol.axhline(0, color="#888888", linewidth=0.8, zorder=3)
             ax_vol.set_axisbelow(True)
             ax_vol.set_ylabel("約定枚数\n買↑/売↓", color="#cccccc", fontsize=9)
-            ax_vol.tick_params(labelbottom=False, labelleft=True, labelsize=8)
+            ax_vol.tick_params(labelbottom=False, labelright=True, labelsize=8)
             ax_vol.grid(True, axis="y", alpha=0.12)
-            for spine in ("top", "right"):
+            for spine in ("top", "left"):
                 ax_vol.spines[spine].set_visible(False)
 
         # ---- time axis under the bottom panel
