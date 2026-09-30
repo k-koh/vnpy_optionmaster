@@ -3484,6 +3484,19 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self.canvas.draw_idle()
 
 
+def _point_segment_distance(
+    px: float, py: float, x0: float, y0: float, x1: float, y1: float
+) -> float:
+    """点と線分の距離（ピクセル）。範囲トレンド線の当たり判定に使う。"""
+    dx: float = x1 - x0
+    dy: float = y1 - y0
+    if dx == 0 and dy == 0:
+        return math.hypot(px - x0, py - y0)
+    t: float = ((px - x0) * dx + (py - y0) * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    return math.hypot(px - (x0 + t * dx), py - (y0 + t * dy))
+
+
 # σラインの段。0.5σ刻みで、そのときのY軸に収まるものだけ描く（軸は広げない）。
 SIGMA_STEPS: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
 
@@ -3558,6 +3571,13 @@ class EntrySignalChart(QtWidgets.QWidget):
         # カーソルが消える。描き直したあと同じ場所へ戻すために覚えておく。
         self._cursor_state: tuple[int, float, int] | None = None
         self._panels: list = []
+
+        # 範囲トレンド（手動）。足が流れても位置がずれないよう、範囲は時刻で
+        # 持つ。_range_geoms は右クリックで消すときの当たり判定用に、実際に
+        # 引いた線の座標を覚えておくもの。
+        self._range_trends: list[tuple[datetime, datetime]] = []
+        self._range_pending: datetime | None = None
+        self._range_geoms: list[tuple[int, list[tuple[float, float, float, float]]]] = []
         # Blitting: the cursor artists are `animated`, so a normal draw skips
         # them; we cache that clean canvas and repaint only the cursor on top.
         self._background = None
@@ -3600,7 +3620,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         # 無い日は飛ばす。
         self.session_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
         self.session_spin.setRange(1, 20)
-        self.session_spin.setValue(2)
+        self.session_spin.setValue(5)
         self.session_spin.setSuffix("ｾｯｼｮﾝ")
         self.session_spin.setFixedWidth(80)
         self.session_spin.setToolTip(
@@ -3631,7 +3651,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         self.interval_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
         for label, _minutes in self.INTERVALS:
             self.interval_combo.addItem(label)
-        self.interval_combo.setCurrentText("10m")
+        self.interval_combo.setCurrentText("15m")
         self.interval_combo.currentTextChanged.connect(self.run_analysis)
 
         # How many bars the grid may draw. 1m足 over a whole session needs a
@@ -3674,6 +3694,16 @@ class EntrySignalChart(QtWidgets.QWidget):
             "※今のセッションだけ表示している間は、どちらも同じ値です。"
         )
         self.fixed_ref_check.toggled.connect(self._on_fixed_ref_toggled)
+
+        # 手動の範囲トレンド線。株価チャートと同じ操作。
+        self.range_trend_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("範囲トレンド")
+        self.range_trend_check.setChecked(False)
+        self.range_trend_check.setToolTip(
+            "ONの間: 先物チャートで開始バー→終了バーをクリックすると、\n"
+            "その範囲の高値どうし・安値どうしを結んだ線を引きます。\n"
+            "引いた線を右クリックで削除（OFFでも削除はできます）。"
+        )
+        self.range_trend_check.toggled.connect(self._on_range_trend_toggled)
 
         # カーソル（十字線・値ラベル・情報ボックス）の表示切替。
         self.cursor_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("カーソル")
@@ -3760,6 +3790,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         hbox.addWidget(self.volume_check)
         hbox.addWidget(self.fixed_ref_check)
         hbox.addWidget(self.cursor_check)
+        hbox.addWidget(self.range_trend_check)
         hbox.addWidget(QtWidgets.QLabel("透明度"))
         hbox.addWidget(self.alpha_spin)
         hbox.addStretch()
@@ -3784,6 +3815,7 @@ class EntrySignalChart(QtWidgets.QWidget):
 
         self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
         self.canvas.mpl_connect("axes_leave_event", self._on_mouse_leave)
+        self.canvas.mpl_connect("button_press_event", self._on_canvas_click)
         self.canvas.mpl_connect("draw_event", self._on_draw)
 
         self._sync_start_edit()
@@ -3804,6 +3836,10 @@ class EntrySignalChart(QtWidgets.QWidget):
             "show_volume": self.volume_check.isChecked(),
             "fixed_reference": self.fixed_ref_check.isChecked(),
             "show_cursor": self.cursor_check.isChecked(),
+            "range_trends": [
+                [start.isoformat(), end.isoformat()]
+                for start, end in self._range_trends
+            ],
             "auto_start": self.auto_start_check.isChecked(),
             "session_count": self.session_spin.value(),
             "now_end": self.now_end_check.isChecked(),
@@ -3822,7 +3858,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         month: str = data.get("month", "")
         if month and self.month_combo.findText(month) >= 0:
             self.month_combo.setCurrentText(month)
-        self.interval_combo.setCurrentText(data.get("interval", "10m"))
+        self.interval_combo.setCurrentText(data.get("interval", "15m"))
         self.max_bars_spin.setValue(data.get("max_bars", self.MAX_COLUMNS))
         self.alpha_spin.setValue(data.get("fill_alpha", 0.45))
         self.atm_check.setChecked(data.get("show_atm", False))
@@ -3832,8 +3868,15 @@ class EntrySignalChart(QtWidgets.QWidget):
         self.volume_check.setChecked(data.get("show_volume", True))
         self.fixed_ref_check.setChecked(data.get("fixed_reference", False))
         self.cursor_check.setChecked(data.get("show_cursor", True))
+        self._range_trends = []
+        for pair in data.get("range_trends", []):
+            try:
+                start, end = (datetime.fromisoformat(value) for value in pair)
+            except (TypeError, ValueError):
+                continue
+            self._range_trends.append((start, end))
         self.auto_start_check.setChecked(data.get("auto_start", True))
-        self.session_spin.setValue(data.get("session_count", 2))
+        self.session_spin.setValue(data.get("session_count", 5))
         self.now_end_check.setChecked(data.get("now_end", True))
         self.tick_check.setChecked(data.get("tick_update", True))
 
@@ -4080,6 +4123,58 @@ class EntrySignalChart(QtWidgets.QWidget):
             self.apply_volume_delta(r, prev)
 
         return rows
+
+    @staticmethod
+    def _range_trend_lines(rows: list[dict], start: int, end: int):
+        """範囲の高値/安値から、上下2本の直線を返す（株価チャートと同じ作り）。
+
+        範囲内のスイング高値/安値を2つ選び、その2点を通る直線を範囲の端まで
+        延ばす。スイングが2つ無いときは、単純に一番高い/安い2本を使う。
+        """
+        if end - start < 2:
+            return None
+
+        look: int = 3
+        highs: list[tuple[int, float]] = []
+        lows: list[tuple[int, float]] = []
+        for i in range(max(start, look), min(end, len(rows) - look - 1) + 1):
+            window = rows[i - look: i + look + 1]
+            high: float = rows[i]["high"]
+            low: float = rows[i]["low"]
+            if (
+                high == max(r["high"] for r in window)
+                and sum(1 for r in window if r["high"] == high) == 1
+            ):
+                highs.append((i, high))
+            if (
+                low == min(r["low"] for r in window)
+                and sum(1 for r in window if r["low"] == low) == 1
+            ):
+                lows.append((i, low))
+
+        def build(pivots: list[tuple[int, float]], use_high: bool):
+            if len(pivots) >= 2:
+                ordered = sorted(pivots, key=lambda t: t[1], reverse=use_high)
+                (xa, ya), (xb, yb) = ordered[0], ordered[1]
+            else:
+                key = "high" if use_high else "low"
+                ranked = sorted(
+                    range(start, end + 1),
+                    key=lambda i: rows[i][key], reverse=use_high,
+                )
+                if len(ranked) < 2:
+                    return None
+                xa, xb = ranked[0], ranked[1]
+                ya, yb = rows[xa][key], rows[xb][key]
+            if xa == xb:
+                return None
+            slope: float = (yb - ya) / (xb - xa)
+            return (
+                float(start), ya + slope * (start - xa),
+                float(end), ya + slope * (end - xa),
+            )
+
+        return build(highs, True), build(lows, False)
 
     @staticmethod
     def apply_volume_delta(r: dict, prev: dict | None) -> None:
@@ -4365,6 +4460,65 @@ class EntrySignalChart(QtWidgets.QWidget):
         self._cursor_key = ()
         self._cursor_ix = -1
         self._on_mouse_move(event)
+
+    def _on_range_trend_toggled(self, checked: bool) -> None:
+        """ツールを切ると、引きかけの範囲は捨てる。"""
+        if not checked:
+            self._range_pending = None
+
+    def _on_canvas_click(self, event) -> None:
+        """先物チャートのクリック: 左で範囲を作り、右で消す。"""
+        rows: list[dict] = getattr(self, "_rows", [])
+        if not rows or not self._panels or event.inaxes is not self._panels[0]:
+            return
+        if event.xdata is None:
+            return
+
+        ix: int = max(0, min(len(rows) - 1, int(round(event.xdata))))
+
+        if event.button == 3:               # 右クリック = 一番近い線を消す
+            if self._remove_range_at(event):
+                self._save_settings()
+                self._show(self._all_rows or rows)
+            return
+
+        if event.button != 1 or not self.range_trend_check.isChecked():
+            return
+
+        if self._range_pending is None:
+            self._range_pending = rows[ix]["dt"]
+            return
+
+        start, end = self._range_pending, rows[ix]["dt"]
+        self._range_pending = None
+        if start == end:
+            return
+        self._range_trends.append((min(start, end), max(start, end)))
+        self._save_settings()
+        self._show(self._all_rows or rows)
+
+    def _remove_range_at(self, event) -> bool:
+        """クリック位置に一番近い範囲トレンド線を消す。"""
+        if not self._range_geoms or event.x is None:
+            return False
+
+        axes = self._panels[0]
+        nearest: int | None = None
+        best: float = 12.0                  # これより遠ければ消さない（ピクセル）
+        for which, segments in self._range_geoms:
+            for x0, y0, x1, y1 in segments:
+                px0, py0 = axes.transData.transform((x0, y0))
+                px1, py1 = axes.transData.transform((x1, y1))
+                distance: float = _point_segment_distance(
+                    event.x, event.y, px0, py0, px1, py1
+                )
+                if distance < best:
+                    best = distance
+                    nearest = which
+        if nearest is None:
+            return False
+        del self._range_trends[nearest]
+        return True
 
     def _on_mouse_leave(self, event) -> None:
         self._cursor_ix = -1
@@ -4702,6 +4856,38 @@ class EntrySignalChart(QtWidgets.QWidget):
                         textcoords="offset points", color=color, fontsize=8,
                         va="center", ha="left", zorder=4,
                     )
+        # ---- 範囲トレンド（手動）
+        # 選んだ範囲の高値どうし・安値どうしを結んで延ばす。線は破線にして、
+        # σや現在値の線と区別する。範囲は時刻で持っているので、足が流れても
+        # 同じ場所に残る（表示外の範囲は描かない）。
+        self._range_geoms = []
+        if self._range_trends:
+            times: list = [r["dt"] for r in rows]
+            for which, (start_dt, end_dt) in enumerate(self._range_trends):
+                if end_dt < times[0] or start_dt > times[-1]:
+                    continue
+                start_ix: int = min(
+                    range(n), key=lambda i: abs(times[i] - start_dt)
+                )
+                end_ix: int = min(range(n), key=lambda i: abs(times[i] - end_dt))
+                if start_ix > end_ix:
+                    start_ix, end_ix = end_ix, start_ix
+                lines = self._range_trend_lines(rows, start_ix, end_ix)
+                if lines is None:
+                    continue
+                drawn: list[tuple[float, float, float, float]] = []
+                for segment, line_color in zip(lines, ("#ffa500", "#00ff80")):
+                    if segment is None:
+                        continue
+                    x0, y0, x1, y1 = segment
+                    ax_fut.plot(
+                        [x0, x1], [y0, y1], color=line_color, linewidth=1.4,
+                        linestyle="--", alpha=0.9, zorder=3.5,
+                    )
+                    drawn.append(segment)
+                if drawn:
+                    self._range_geoms.append((which, drawn))
+
         # ---- 現在値（株価チャートの現在値線と同じ）
         # 最新の足の終値に横線を引き、右端に価格を出す。色は陽線/陰線に合わせる。
         last_row = rows[-1]
