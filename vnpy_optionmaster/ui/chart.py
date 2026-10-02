@@ -3530,6 +3530,12 @@ class EntrySignalChart(QtWidgets.QWidget):
 
     SETTING_FILENAME: str = "entry_signal_chart_setting.json"
 
+    # パネルの高さの配り方。株価チャート（先物 / iv_item / 出来高）を動かした
+    # 状態で測った 586 : 417 : 52 px から。先物の取り分だけを比で持ち、枚数は
+    # ピクセルで止めるので、窓を縦に広げると先物とIVだけが伸びる。
+    FUTURES_PANEL_SHARE: float = 586.0 / (586.0 + 417.0)
+    VOLUME_PANEL_PX: float = 52.0
+
     INTERVALS: list[tuple[str, int]] = [
         ("1m", 1), ("3m", 3), ("5m", 5), ("10m", 10), ("15m", 15), ("20m", 20),
         ("30m", 30)
@@ -4709,15 +4715,33 @@ class EntrySignalChart(QtWidgets.QWidget):
         w_px: float = max(1.0, self.fig.get_size_inches()[0] * self.fig.dpi)
         h_px: float = max(1.0, self.fig.get_size_inches()[1] * self.fig.dpi)
         show_volume: bool = self.volume_check.isChecked()
-        # 枚数は向きと大きさが分かればよいので、IVの半分以下の背丈で足りる。
-        height_ratios: list[float] = [3.0, 2.6] + ([0.6] if show_volume else [])
+        top_margin: float = min(0.12, 26.0 / h_px)
+        bottom_margin: float = min(0.12, 28.0 / h_px)
+        # 株価チャートはパネルどうしを隙間なく積む（GraphicsLayout の
+        # setSpacing(0)）。見比べられるよう、ここも間を空けない。
+        hspace: float = 0.0
+        # 高さの配り方も株価チャートに合わせる。動いている株価チャートを
+        # 実測すると 先物586px / IV417px / 出来高52px だったので、その比で
+        # 分ける。枚数は窓を広げても太らないよう、ピクセルで止める。
+        panel_px: float = h_px * (1.0 - top_margin - bottom_margin)
+        if show_volume:
+            volume_px: float = min(self.VOLUME_PANEL_PX, panel_px * 0.2)
+            rest_px: float = max(2.0, panel_px - volume_px)
+            futures_px: float = rest_px * self.FUTURES_PANEL_SHARE
+            height_ratios: list[float] = [
+                futures_px, rest_px - futures_px, volume_px,
+            ]
+        else:
+            height_ratios = [
+                self.FUTURES_PANEL_SHARE, 1.0 - self.FUTURES_PANEL_SHARE,
+            ]
         gs = self.fig.add_gridspec(
-            len(height_ratios), 1, height_ratios=height_ratios, hspace=0.10,
+            len(height_ratios), 1, height_ratios=height_ratios, hspace=hspace,
             # 目盛りと軸ラベルを右に出すので、左は最小限・右に場所を取る
             left=min(0.04, 12.0 / w_px),
             right=1.0 - min(0.13, 76.0 / w_px),
-            top=1.0 - min(0.12, 26.0 / h_px),
-            bottom=min(0.12, 28.0 / h_px),
+            top=1.0 - top_margin,
+            bottom=bottom_margin,
         )
         ax_fut = self.fig.add_subplot(gs[0, 0])
         ax_iv = self.fig.add_subplot(gs[1, 0], sharex=ax_fut)
@@ -4949,19 +4973,35 @@ class EntrySignalChart(QtWidgets.QWidget):
         # most buried by the others ends up with its fill and its outline on
         # top. Fill and outline are still two passes (zorder 1.5 / 2.5), so no
         # fill can ever wash out an outline.
+        # 行使価格が入れ替わった足は枠線を破線にする（株価チャートの iv_item
+        # と同じ）。前日比は同一行使価格どうしの差なので、銘柄が入れ替わった
+        # 足の段差はIVの動きではない。面の上下はATMの行使価格に乗っている。
+        bar_strike_keys: dict[str, str] = {
+            "d_atm": "as", "d_put": "ps", "d_call": "cs", "d_level": "as",
+        }
         bars: list[tuple] = []
         for key, color, label in specs:
+            strike_key: str = bar_strike_keys.get(key, "")
             for i, r in enumerate(rows):
                 v = r.get(key)
                 if v is None:
                     continue
                 all_values.append(v)
+                now_strike = r.get(strike_key) if strike_key else None
+                prev_strike = (
+                    rows[i - 1].get(strike_key) if strike_key and i else None
+                )
+                rolled: bool = (
+                    now_strike is not None and prev_strike is not None
+                    and now_strike != prev_strike
+                )
                 bars.append((
                     abs(v),
                     [(i - body_w / 2, 0.0), (i + body_w / 2, 0.0),
                      (i + body_w / 2, v), (i - body_w / 2, v)],
                     to_rgba(color, fill_alpha),
                     to_rgba(color, 1.0),
+                    (0.0, (2.2, 1.6)) if rolled else (0.0, None),
                 ))
 
         if bars:
@@ -4971,9 +5011,11 @@ class EntrySignalChart(QtWidgets.QWidget):
                 verts, facecolors=[b[2] for b in bars],
                 edgecolors="none", zorder=1.5,
             ))
+            # 枠線は1つのコレクションのままにして、破線かどうかは棒ごとに
+            # 渡す。2つに分けると「短い棒ほど手前」の並びが崩れる。
             ax_iv.add_collection(PolyCollection(
                 verts, facecolors="none", edgecolors=[b[3] for b in bars],
-                linewidths=1.2, zorder=2.5,
+                linewidths=1.2, linestyles=[b[4] for b in bars], zorder=2.5,
             ))
 
         # ---- ATM ±0.5σ, the same band 株価チャート's iv_item draws
@@ -5272,14 +5314,19 @@ class EntrySignalChart(QtWidgets.QWidget):
 
         # ---- status line: the latest bar's 前日比
         latest = rows[-1]
-        if all(latest.get(k) is None for k in ("d_atm", "d_put", "d_call")):
+        if all(
+            latest.get(k) is None
+            for k in ("d_atm", "d_level", "d_put", "d_call")
+        ):
             state = "前日IVが取得できません（OptionMasterの「前日データ再読込」をお試しください）"
         else:
             def _s(key: str) -> str:
                 v = latest.get(key)
                 return "---" if v is None else f"{v:+.2f}"
-            state = (f"{diff_label}　ATM {_s('d_atm')} / PUT {_s('d_put')} / "
-                     f"CALL {_s('d_call')}")
+            # 面＝ATMの「面の上下だけ」の分。ATMとの差がそのまま滑りなので、
+            # 隣どうしに並べて読めるようにATMの次に置く。
+            state = (f"{diff_label}　ATM {_s('d_atm')} / 面 {_s('d_level')} / "
+                     f"PUT {_s('d_put')} / CALL {_s('d_call')}")
         self.status_label.setText(
             "最終更新: " + datetime.now().strftime("%H:%M:%S") + "　" + state
         )
@@ -5349,6 +5396,14 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         # Futures type selector (for mini/large)
         self.sim_futures_type_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
         self.sim_futures_type_combo.addItems(["先物ミニ", "先物ラージ"])
+
+        # 先物はOPと別の限月で建てることがあるので、先物専用の限月を持つ。
+        # 中身はOP側と同じ（銘柄の限月一覧）。
+        self.sim_futures_month_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        self.sim_futures_month_combo.setFixedWidth(120)
+        self.sim_futures_month_combo.setToolTip(
+            "先物追加で建てる限月。OP側の限月とは別に選べます。"
+        )
 
         # Lots spinbox for OP追加
         self.sim_lots_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
@@ -5435,6 +5490,8 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         sim_param_hbox.addWidget(QtWidgets.QLabel("枚数"))
         sim_param_hbox.addWidget(self.sim_lots_spin)
         sim_param_hbox.addWidget(self.sim_futures_type_combo)
+        sim_param_hbox.addWidget(QtWidgets.QLabel("限月"))
+        sim_param_hbox.addWidget(self.sim_futures_month_combo)
         sim_param_hbox.addWidget(QtWidgets.QLabel("枚数"))
         sim_param_hbox.addWidget(self.sim_futures_lots_spin)
         # RSS履歴クリア on the far left, separated from the frequently-used
@@ -5882,23 +5939,33 @@ class PayoffDiagramChart(QtWidgets.QWidget):
 
     def _populate_months(self) -> None:
         """Populate contract month combo from available chains."""
-        self.sim_month_combo.blockSignals(True)
-        current: str = self.sim_month_combo.currentData() or ""
-        self.sim_month_combo.clear()
         portfolio: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
-        for cs in sorted(portfolio.chains.keys()):
-            self.sim_month_combo.addItem(cs.split(".")[0], cs)
-        if current:
-            idx = self.sim_month_combo.findData(current)
-            if idx >= 0:
-                self.sim_month_combo.setCurrentIndex(idx)
-        self.sim_month_combo.blockSignals(False)
+        chain_symbols: list[str] = sorted(portfolio.chains.keys())
+
+        # OP用と先物用の2つ。選び直しの手間を増やさないよう、入れ替えの前の
+        # 選択は覚えておいて、まだ残っていればそのまま戻す。
+        for combo in (self.sim_month_combo, self.sim_futures_month_combo):
+            combo.blockSignals(True)
+            current: str = combo.currentData() or ""
+            combo.clear()
+            for cs in chain_symbols:
+                combo.addItem(cs.split(".")[0], cs)
+            if current:
+                idx = combo.findData(current)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
         self._populate_strikes()
 
     def _on_month_changed(self) -> None:
         self._populate_strikes()
 
     def _on_cp_changed(self) -> None:
+        # コール買いなら先物売り、プット買いなら先物買いが基本の組み方なので、
+        # 種類を選んだ時点で先物の枚数をその向きの既定に寄せる（手で直せる）。
+        spin = getattr(self, "sim_futures_lots_spin", None)
+        if spin is not None:
+            spin.setValue(5 if self.sim_cp_combo.currentText() == "プット" else -5)
         self._populate_strikes()
 
     def _populate_strikes(self) -> None:
@@ -5968,7 +6035,11 @@ class PayoffDiagramChart(QtWidgets.QWidget):
 
     def _add_sim_futures_row(self) -> None:
         """Add a futures position from the chain's underlying."""
-        chain_symbol: str = self.sim_month_combo.currentData()
+        # 先物はOP側ではなく、先物用に選んだ限月の原資産を使う。
+        chain_symbol: str = (
+            self.sim_futures_month_combo.currentData()
+            or self.sim_month_combo.currentData()
+        )
         if not chain_symbol:
             return
         portfolio: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
