@@ -4131,6 +4131,20 @@ class EntrySignalChart(QtWidgets.QWidget):
         return rows
 
     @staticmethod
+    def futures_sigma(r: dict) -> float | None:
+        """先物の現在値が 0σ（前日終値）から何σ離れているか。
+
+        株価チャートの先物パネルのσのはしごと同じ式:
+        σ = (現在値 − 前日終値) / (前日終値 × ATM日率IV)、
+        ATM日率IV = ATM IV(%) / 100 / √252。基準が無い足では None。
+        """
+        base: float = r.get("pc") or 0.0
+        daily: float = (r.get("atm") or 0.0) / 100.0 / (252 ** 0.5)
+        if base <= 0 or daily <= 0:
+            return None
+        return (r["close"] - base) / (base * daily)
+
+    @staticmethod
     def _range_trend_lines(rows: list[dict], start: int, end: int):
         """範囲の高値/安値から、上下2本の直線を返す（株価チャートと同じ作り）。
 
@@ -5054,6 +5068,7 @@ class EntrySignalChart(QtWidgets.QWidget):
             )
 
         ax_iv.axhline(0, color="#888888", linewidth=0.8, zorder=3)
+
         ax_iv.set_axisbelow(True)       # grid stays under the bars
         ax_iv.set_ylabel(f"{diff_label}IV", color="#cccccc", fontsize=10)
         ax_iv.tick_params(labelbottom=False, labelright=True, labelsize=8)
@@ -5073,6 +5088,29 @@ class EntrySignalChart(QtWidgets.QWidget):
         lo_v: float = min(all_values, default=0.0)
         hi_v: float = max(all_values, default=0.0)
         ax_iv.set_ylim(min(0.0, lo_v) - span * 0.12, hi_v + span * 0.18)
+
+        # ---- 先物の現在σ（株価チャートの iv_item と同じラベル）
+        # 高さはσの値そのもの。PUT/CALL の前日比IVと同じ物差しに並ぶので、
+        # どちらが先行しているかを目で比べられる（単位は σ と IVポイントで
+        # 違うが、見比べるための置き方）。開始位置は先物パネルの現在値タグ
+        # と同じ、右の目盛りの外。軸の外に出たときは端で止めて矢印を足す。
+        iv_sigma: float | None = self.futures_sigma(rows[-1])
+        if iv_sigma is not None:
+            sigma_text: str = f"{iv_sigma:+.2f}σ"
+            sigma_y: float = iv_sigma
+            iv_y0, iv_y1 = ax_iv.get_ylim()
+            if iv_sigma > iv_y1:
+                sigma_y, sigma_text = iv_y1, f"↑{sigma_text}"
+            elif iv_sigma < iv_y0:
+                sigma_y, sigma_text = iv_y0, f"↓{sigma_text}"
+            ax_iv.annotate(
+                sigma_text,
+                xy=(1.0, sigma_y), xycoords=ax_iv.get_yaxis_transform(),
+                xytext=(3, 0), textcoords="offset points",
+                ha="left", va="center", color="#ffff00", fontsize=8,
+                bbox=dict(boxstyle="square,pad=0.2", fc="#101418", ec="none"),
+                annotation_clip=False, zorder=6,
+            )
 
         # ±1.0σ 以上の段は、Y軸に収まるときだけ足す（±0.5σ は上で軸に
         # 入れてあるので常に見える）。軸をこれらに合わせて広げることはしない。
@@ -5327,6 +5365,13 @@ class EntrySignalChart(QtWidgets.QWidget):
             # 隣どうしに並べて読めるようにATMの次に置く。
             state = (f"{diff_label}　ATM {_s('d_atm')} / 面 {_s('d_level')} / "
                      f"PUT {_s('d_put')} / CALL {_s('d_call')}")
+
+        # 先物が 0σ（前日終値）から何σ離れているか。チャートのσのはしごと
+        # 同じ式: σ = (現在値 − 前日終値) / (前日終値 × ATM日率IV)。
+        # はしごは0.5σ刻みの線しかないので、その間のどこにいるかをここで出す。
+        now_sigma: float | None = self.futures_sigma(latest)
+        if now_sigma is not None:
+            state += f"　先物 {now_sigma:+.2f}σ"
         self.status_label.setText(
             "最終更新: " + datetime.now().strftime("%H:%M:%S") + "　" + state
         )
