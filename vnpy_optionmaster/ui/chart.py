@@ -3720,6 +3720,16 @@ class EntrySignalChart(QtWidgets.QWidget):
         )
         self.cursor_check.toggled.connect(self._on_cursor_toggled)
 
+        # 先物σ: 先物が 0σ（前日終値）から何σ離れているか。IVではないが、
+        # 滑りはこれにほぼ比例するので、同じ物差しに並べて見比べられる。
+        self.sigma_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("σ")
+        self.sigma_check.setToolTip(
+            "先物の現在値が 0σ（前日終値）から何σ離れているか。\n"
+            "σ = (現在値 − 前日終値) / (前日終値 × ATM日率IV)。\n"
+            "PUTの滑りはこのσにほぼ 1:1 で比例するので、PUT前日比が\n"
+            "この棒より大きければ、滑りでは説明できない買いが入っています。"
+        )
+
         # 約定枚数パネル（買い手が攻めた枚数を上、売り手が攻めた枚数を下）
         self.volume_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("枚数")
         self.volume_check.setToolTip(
@@ -3728,13 +3738,16 @@ class EntrySignalChart(QtWidgets.QWidget):
             "面の上下と合わせて読むと、本物の買い需要か投げかが分かります。"
         )
         for box in (self.atm_check, self.put_check, self.call_check,
-                    self.level_check, self.volume_check):
+                    self.level_check, self.sigma_check, self.volume_check):
             # ATM と 面の上下 は互いにほぼ重なるので、既定では両方とも
             # 出さず、ウィング（PUT / CALL）と枚数だけを出す。
             # 初期値は必ず connect の前に入れる（接続後に変えると、
             # まだ揃っていないウィジェットを使って再描画が走る）。
-            box.setChecked(box not in (self.atm_check, self.level_check))
-            box.setToolTip("この系列の表示/非表示")
+            box.setChecked(
+                box not in (self.atm_check, self.level_check, self.sigma_check)
+            )
+            if box is not self.sigma_check:
+                box.setToolTip("この系列の表示/非表示")
             box.toggled.connect(self._redraw_only)
 
         self.alpha_spin: QtWidgets.QDoubleSpinBox = QtWidgets.QDoubleSpinBox()
@@ -3793,6 +3806,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         hbox.addWidget(self.put_check)
         hbox.addWidget(self.call_check)
         hbox.addWidget(self.level_check)
+        hbox.addWidget(self.sigma_check)
         hbox.addWidget(self.volume_check)
         hbox.addWidget(self.fixed_ref_check)
         hbox.addWidget(self.cursor_check)
@@ -3839,6 +3853,7 @@ class EntrySignalChart(QtWidgets.QWidget):
             "show_put": self.put_check.isChecked(),
             "show_call": self.call_check.isChecked(),
             "show_level": self.level_check.isChecked(),
+            "show_sigma": self.sigma_check.isChecked(),
             "show_volume": self.volume_check.isChecked(),
             "fixed_reference": self.fixed_ref_check.isChecked(),
             "show_cursor": self.cursor_check.isChecked(),
@@ -3871,6 +3886,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         self.put_check.setChecked(data.get("show_put", True))
         self.call_check.setChecked(data.get("show_call", True))
         self.level_check.setChecked(data.get("show_level", False))
+        self.sigma_check.setChecked(data.get("show_sigma", False))
         self.volume_check.setChecked(data.get("show_volume", True))
         self.fixed_ref_check.setChecked(data.get("fixed_reference", False))
         self.cursor_check.setChecked(data.get("show_cursor", True))
@@ -4223,6 +4239,9 @@ class EntrySignalChart(QtWidgets.QWidget):
         基準固定がONなら、どの足も「現時点から見た直近の引け」1本を0にする
         （株価チャートの基準固定と同じ）。OFFなら各足がそれぞれの前日を見る。
         """
+        # σは前日のIVを要らない（足の中だけで出せる）ので、先に入れておく。
+        r["d_sigma"] = self.futures_sigma(r)
+
         month: str = self.month_combo.currentText()
         r["d_atm"] = r["d_put"] = r["d_call"] = r["d_level"] = None
         if not month:
@@ -4391,6 +4410,8 @@ class EntrySignalChart(QtWidgets.QWidget):
             parts.append(f"PUT{k('ps')} {r['put']:5.2f} ({diff_label} {d('d_put')})")
         if self.call_check.isChecked():
             parts.append(f"CALL{k('cs')} {r['call']:5.2f} ({diff_label} {d('d_call')})")
+        if self.sigma_check.isChecked() and r.get("d_sigma") is not None:
+            parts.append(f"先物σ {r['d_sigma']:+.2f}")
         if self.volume_check.isChecked():
             volume_parts: list[str] = []
             if self.atm_check.isChecked():
@@ -4424,6 +4445,8 @@ class EntrySignalChart(QtWidgets.QWidget):
             if self.call_check.isChecked():
                 lines.append(f"CALL {k('cs')} {r['call']:6.2f} ({d('d_call')})"
                              + volume_suffix('v_cbv', 'v_csv'))
+            if self.sigma_check.isChecked() and r.get("d_sigma") is not None:
+                lines.append(f"先物σ      {r['d_sigma']:+6.2f}")
             lines.append(f"   {diff_label}"
                          + ("　枚数 買/売" if self.volume_check.isChecked() else ""))
             if r.get("roll"):
@@ -4976,6 +4999,7 @@ class EntrySignalChart(QtWidgets.QWidget):
                 ("d_put", "#4bffff", "PUT Δ0.1", self.put_check.isChecked()),
                 ("d_call", "#ff0000", "CALL Δ0.1", self.call_check.isChecked()),
                 ("d_level", "#00ff80", "ATM 面の上下", self.level_check.isChecked()),
+                ("d_sigma", "#ffff00", "先物σ", self.sigma_check.isChecked()),
             )
             if shown
         ]
