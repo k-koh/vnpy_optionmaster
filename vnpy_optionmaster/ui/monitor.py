@@ -628,7 +628,7 @@ class OptionChainMonitor(MonitorTable):
             underlying_cell: MonitorCell = MonitorCell()
 
             self.setItem(row, 0, MonitorCell(chain.chain_symbol.split(".")[0]))
-            self.setItem(row, 1, MonitorCell(str(chain.days_to_expiry)))
+            self.setItem(row, 1, MonitorCell(f"{chain.days_to_expiry:.2f}"))
             self.setItem(row, 2, underlying_cell)
             self.setItem(row, 3, adjustment_cell)
 

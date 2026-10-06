@@ -379,6 +379,12 @@ class OptionEngine(BaseEngine):
             return
         self.timer_count = 0
 
+        # 残存日数を今の時刻で引き直す。起動時の1回きりだと時間が経っても
+        # 減らず、価格から逆算するIVが実際より低く出続ける（再起動して初めて
+        # 正しい値に飛ぶ）。小数日なので、ここで引き直しても段差にならない。
+        for portfolio in self.portfolios.values():
+            portfolio.update_days_to_expiry()
+
         for portfolio in self.active_portfolios.values():
             portfolio.calculate_atm_price()
 

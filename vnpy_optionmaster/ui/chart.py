@@ -29,7 +29,9 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure        # noqa
 from matplotlib.patches import Patch, Rectangle        # noqa
 from matplotlib.lines import Line2D                   # noqa
-from matplotlib.collections import LineCollection, PolyCollection   # noqa
+from matplotlib.collections import (                   # noqa
+    LineCollection, PolyCollection, EllipseCollection,
+)
 from matplotlib.colors import to_rgba                 # noqa
 from matplotlib.transforms import blended_transform_factory  # noqa
 import matplotlib.ticker                   # noqa
@@ -5137,6 +5139,32 @@ class EntrySignalChart(QtWidgets.QWidget):
                 annotation_clip=False, zorder=6,
             )
 
+        # ---- 各系列の現在値（先物σのラベルと同じ、右の目盛りの外）
+        # 出している系列だけ。高さはその値そのものなので、棒の先端の高さに
+        # 並ぶ。札は株価チャートの iv_item と同じ A / P / C / 面。
+        iv_tags: dict = {
+            "d_atm": "A", "d_put": "P", "d_call": "C", "d_level": "面",
+        }
+        iv_y0, iv_y1 = ax_iv.get_ylim()
+        for value_key, color, _label in specs:
+            value = rows[-1].get(value_key)
+            if value is None:
+                continue
+            text: str = f"{iv_tags.get(value_key, '')}{value:+.2f}"
+            label_y: float = value
+            if value > iv_y1:
+                label_y, text = iv_y1, f"↑{text}"
+            elif value < iv_y0:
+                label_y, text = iv_y0, f"↓{text}"
+            ax_iv.annotate(
+                text,
+                xy=(1.0, label_y), xycoords=ax_iv.get_yaxis_transform(),
+                xytext=(3, 0), textcoords="offset points",
+                ha="left", va="center", color=color, fontsize=8,
+                bbox=dict(boxstyle="square,pad=0.2", fc="#101418", ec="none"),
+                annotation_clip=False, zorder=6,
+            )
+
         # ±1.0σ 以上の段は、Y軸に収まるときだけ足す（±0.5σ は上で軸に
         # 入れてあるので常に見える）。軸をこれらに合わせて広げることはしない。
         if sigma_x:
@@ -5440,6 +5468,17 @@ class PointFigureChart(QtWidgets.QWidget):
         self.canvas: FigureCanvas = FigureCanvas(self.fig)
 
         self._columns: list[dict] = []      # 描いている列（build_columns の返り）
+        # 読み込んだ1分足（時刻, 高値, 安値）。Tick更新のたびに30日ぶんを
+        # 読み直すとDBだけで1.4秒かかるので、持ち続けて続きだけ足す。
+        self._points: list = []
+        self._points_key: tuple = ()
+        # σの段の基準。読んだ足のうち一番新しいものの前日終値と ATM日率IV。
+        self._sigma_base: float = 0.0
+        self._sigma_daily: float = 0.0
+        # 直前に描いた図の中身。変わっていなければ描き直さない。
+        self._signature: tuple = ()
+        self._price_line = None
+        self._price_tag = None
         self._box: float = 100.0            # 実際に描いた枠（カーソル表示用）
         self._axes = None
         self._tick_price: float = 0.0
@@ -5520,6 +5559,17 @@ class PointFigureChart(QtWidgets.QWidget):
         )
         self.trend_check.toggled.connect(self._redraw_only)
 
+        # σの段: 今のセッションの 0σ（前日終値）と ±0.5σ 刻み。
+        self.sigma_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("σ")
+        self.sigma_check.setChecked(True)
+        self.sigma_check.setToolTip(
+            "今のセッションの 0σ（前日終値）と ±0.5σ 刻みの横線。\n"
+            "±nσ = 前日終値 × (1 ± ATM日率IV × n)、"
+            "ATM日率IV = ATM IV / √252。\n"
+            "Y軸はこれに合わせて広げないので、入らない段は描きません。"
+        )
+        self.sigma_check.toggled.connect(self._redraw_only)
+
         self.cursor_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("カーソル")
         self.cursor_check.setChecked(True)
         self.cursor_check.toggled.connect(self._on_cursor_toggled)
@@ -5548,6 +5598,7 @@ class PointFigureChart(QtWidgets.QWidget):
         hbox.addWidget(self.days_spin)
         hbox.addWidget(self.date_check)
         hbox.addWidget(self.trend_check)
+        hbox.addWidget(self.sigma_check)
         hbox.addWidget(self.cursor_check)
         hbox.addWidget(self.tick_check)
         hbox.addWidget(self.refresh_button)
@@ -5556,7 +5607,9 @@ class PointFigureChart(QtWidgets.QWidget):
 
         vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
         vbox.addLayout(hbox)
-        vbox.addWidget(self.canvas)
+        # 伸び代は図だけに渡す。これを付けないと、窓を縦に広げたぶんが
+        # ツールバーの行に配られて、上に大きな空きができる。
+        vbox.addWidget(self.canvas, 1)
         self.setLayout(vbox)
 
         self._live_timer: QtCore.QTimer = QtCore.QTimer(self)
@@ -5580,6 +5633,7 @@ class PointFigureChart(QtWidgets.QWidget):
             "days": self.days_spin.value(),
             "show_date": self.date_check.isChecked(),
             "show_trend": self.trend_check.isChecked(),
+            "show_sigma": self.sigma_check.isChecked(),
             "show_cursor": self.cursor_check.isChecked(),
             "tick_update": self.tick_check.isChecked(),
         })
@@ -5600,6 +5654,7 @@ class PointFigureChart(QtWidgets.QWidget):
         self.days_spin.setValue(data.get("days", 30))
         self.date_check.setChecked(data.get("show_date", True))
         self.trend_check.setChecked(data.get("show_trend", True))
+        self.sigma_check.setChecked(data.get("show_sigma", True))
         self.cursor_check.setChecked(data.get("show_cursor", True))
         self.tick_check.setChecked(data.get("tick_update", True))
 
@@ -5644,25 +5699,50 @@ class PointFigureChart(QtWidgets.QWidget):
 
     # -------------------------------------------------------------- データ
     def load_prices(self) -> list:
-        """(時刻, 高値, 安値) の並び。最後にその場のティックを足す。"""
+        """(時刻, 高値, 安値) の並び。最後にその場のティックを足す。
+
+        30日ぶんの1分足はDBから読むだけで1.4秒かかる。Tick更新で毎秒これを
+        走らせるとCPUを食い続けるので、一度読んだぶんは持ち続けて、2回目から
+        は「前回の最後より後」だけを読み足す（毎回ほぼ0本）。限月や期間を
+        変えたときだけ読み直す。
+        """
         month: str = self.month_combo.currentText()
         if not month:
             return []
 
         end: datetime = datetime.now(DB_TZ)
-        start: datetime = end - timedelta(days=self.days_spin.value())
+        days: int = self.days_spin.value()
+        start: datetime = end - timedelta(days=days)
         database: BaseDatabase = get_database()
+        key: tuple = (month, days)
+
+        if key != self._points_key or not self._points:
+            self._points_key = key
+            query_start: datetime = start
+            self._points = []
+            self._sigma_base = self._sigma_daily = 0.0
+        else:
+            query_start = self._points[-1][0] + timedelta(seconds=1)
+
         bars: list[BarData] = database.load_bar_data(
             symbol=f"nk-{month}", exchange=Exchange.JPX,
-            interval=Interval.MINUTE, start=start, end=end,
+            interval=Interval.MINUTE, start=query_start, end=end,
         )
-        points: list = [
-            (bar.datetime, bar.high_price, bar.low_price)
-            for bar in bars if bar.high_price and bar.low_price
-        ]
+        for bar in bars:
+            if bar.high_price and bar.low_price:
+                self._points.append((bar.datetime, bar.high_price, bar.low_price))
+            # σの基準は一番新しい足のもの（＝今のセッションの前日終値）。
+            # 新しい足が無い回は、前に拾った値をそのまま使う。
+            if bar.pre_close and bar.atm_iv:
+                self._sigma_base = bar.pre_close
+                self._sigma_daily = bar.atm_iv / (252 ** 0.5)
+        # 期間から外れた古い足を落とす（先頭が範囲内ならそのまま）
+        if self._points and self._points[0][0] < start:
+            self._points = [p for p in self._points if p[0] >= start]
+
         if self.tick_check.isChecked() and self._tick_price:
-            points.append((end, self._tick_price, self._tick_price))
-        return points
+            return self._points + [(end, self._tick_price, self._tick_price)]
+        return self._points
 
     @staticmethod
     def build_columns(points: list, box: float, reversal: int) -> list:
@@ -5767,13 +5847,73 @@ class PointFigureChart(QtWidgets.QWidget):
             columns = columns[-self.MAX_COLUMNS:]
         self._columns = columns
         self._box = box
+
+        # 図を1枚描くのに0.3秒かかる。ティックが来ても箱が増えないことの方が
+        # 多いので、並びが前と同じなら描き直さず、現在値だけ差し替える。
+        signature: tuple = (
+            box, reversal, truncated, len(columns),
+            tuple((c["up"], c["top"], c["bottom"]) for c in columns[-2:]),
+            self.date_check.isChecked(), self.trend_check.isChecked(),
+            self.sigma_check.isChecked(), self._sigma_base, self._sigma_daily,
+        )
+        if columns and signature == self._signature and self._price_line is not None:
+            self._update_price_overlay(columns[-1], box)
+            self._update_status(columns[-1], box, reversal)
+            return
+
+        self._signature = signature
         self._draw(columns, box, reversal, truncated)
+
+    def _current_price(self, last_column: dict, box: float) -> float:
+        """現在値。ティックが無ければ、一番右の列の先端の値段。"""
+        if self._tick_price:
+            return self._tick_price
+        edge: int = last_column["top"] if last_column["up"] else last_column["bottom"]
+        return edge * box
+
+    def _update_status(self, last_column: dict, box: float, reversal: int) -> None:
+        """一番右の列の様子と、列が変わる値段を出す。
+
+        転換価格は「そこまで来たら次の列に移る」境目。上げの列なら、転換枠
+        ぶん下の箱に入った時点なので、その箱の上端を下回ったとき。下げの列は
+        その逆で、転換枠ぶん上の箱に届いたとき。現在値との差も添える。
+        """
+        boxes: int = last_column["top"] - last_column["bottom"] + 1
+        price: float = self._current_price(last_column, box)
+        if last_column["up"]:
+            trigger: float = (last_column["top"] - reversal + 1) * box
+        else:
+            trigger = (last_column["bottom"] + reversal) * box
+        self.status_label.setText(
+            f"最終更新: {datetime.now():%H:%M:%S}　"
+            f"現在の列: {'×（上げ）' if last_column['up'] else '○（下げ）'} {boxes}箱　"
+            f"{last_column['bottom'] * box:,.0f} 〜 {(last_column['top'] + 1) * box:,.0f}　"
+            f"転換価格 {trigger:,.0f}円（{trigger - price:+,.0f}円）"
+        )
+
+    def _update_price_overlay(self, last_column: dict, box: float) -> None:
+        """現在値の線とタグだけを置き直して、図の上に重ねる。
+
+        この2つは animated にしてあるので通常の描画には入らない。カーソルと
+        同じ仕掛けで、キャッシュした図の上に貼り付けるだけで済む。
+        """
+        if self._price_line is None or self._axes is None:
+            return
+        price: float = self._current_price(last_column, box)
+        color: str = "#ff4b4b" if last_column["up"] else "#4bffff"
+        self._price_line.set_ydata([price / box, price / box])
+        self._price_line.set_color(color)
+        self._price_tag.set_text(f"{price:,.0f}")
+        self._price_tag.xy = (1.0, price / box)
+        self._price_tag.get_bbox_patch().set_facecolor(color)
+        self._blit_overlay()
 
     def _draw(
         self, columns: list, box: float, reversal: int, truncated: bool
     ) -> None:
         self.fig.clear()
         self._cursor_v = self._cursor_h = self._cursor_tag = None
+        self._price_line = self._price_tag = None
         self._background = None
 
         w_px: float = max(1.0, self.fig.get_size_inches()[0] * self.fig.dpi)
@@ -5805,7 +5945,8 @@ class PointFigureChart(QtWidgets.QWidget):
         down_color: str = "#4bffff"
 
         ax.set_xlim(-1.0, n + 1.0)
-        ax.set_ylim(bottom - 1.5, top + 1.5)
+        # 印は箱の真ん中（箱番号 + 0.5）に描く。余白もそれに合わせる。
+        ax.set_ylim(bottom - 1.0, top + 2.0)
         ax.grid(True, axis="y", alpha=0.10)
         ax.set_axisbelow(True)
 
@@ -5832,26 +5973,73 @@ class PointFigureChart(QtWidgets.QWidget):
             for row in range(c["bottom"], c["top"] + 1):
                 if (i, row) in date_marks:
                     continue
+                mid: float = row + 0.5          # 箱の真ん中の高さ
                 if c["up"]:
-                    x_segments.append([(i - r, row - r), (i + r, row + r)])
-                    x_segments.append([(i - r, row + r), (i + r, row - r)])
+                    x_segments.append([(i - r, mid - r), (i + r, mid + r)])
+                    x_segments.append([(i - r, mid + r), (i + r, mid - r)])
                 else:
-                    o_centers.append((i, row))
+                    o_centers.append((i, mid))
 
         if x_segments:
             ax.add_collection(LineCollection(
                 x_segments, colors=up_color, linewidths=1.3, zorder=3,
             ))
-        for cx, cy in o_centers:
-            ax.add_patch(plt.Circle(
-                (cx, cy), r, fill=False, edgecolor=down_color,
-                linewidth=1.3, zorder=3,
+        if o_centers:
+            # 1つずつ Circle を足すと数百個の artist になって描画が遅い。
+            # 大きさを値の単位で持てる EllipseCollection で1つにまとめる。
+            ax.add_collection(EllipseCollection(
+                widths=r * 2, heights=r * 2, angles=0, units="xy",
+                offsets=o_centers, offset_transform=ax.transData,
+                facecolors="none", edgecolors=down_color, linewidths=1.3,
+                zorder=3,
             ))
         for (i, row), text in date_marks.items():
             ax.text(
-                i, row, text, ha="center", va="center", fontsize=7.5,
+                i, row + 0.5, text, ha="center", va="center", fontsize=7.5,
                 color="#ffff00", zorder=4,
             )
+
+        # ---- σの段（今のセッションの 0σ と ±0.5σ 刻み）
+        # 点数図には時間の軸が無いので、足ごとの階段ではなく1組の横線。
+        # 軸に入る段だけを描く（σに合わせてY軸を広げると箱が潰れるため）。
+        if self.sigma_check.isChecked() and self._sigma_base and self._sigma_daily:
+            y_lo, y_hi = ax.get_ylim()
+            base: float = self._sigma_base
+            levels: list = [("0σ", base, "#ffff00")]
+            for mult in SIGMA_STEPS:
+                levels.append((
+                    f"+{mult:.1f}σ", base * (1 + self._sigma_daily * mult), up_color,
+                ))
+                levels.append((
+                    f"-{mult:.1f}σ", base * (1 - self._sigma_daily * mult), down_color,
+                ))
+            for text, price, color in levels:
+                y: float = price / box
+                if not (y_lo <= y <= y_hi):
+                    continue            # 軸の外 → 描かない（軸は広げない）
+                ax.axhline(
+                    y, color=color, linewidth=0.9, linestyle="--",
+                    alpha=0.55 if text != "0σ" else 0.8, zorder=1.5,
+                )
+                # 段の名前は左（チャートの内側）。右端は最新の列が並ぶので、
+                # そこに文字を置くと箱に被る。
+                ax.annotate(
+                    text,
+                    xy=(0.0, y), xycoords=ax.get_yaxis_transform(),
+                    xytext=(6, 0), textcoords="offset points",
+                    color=color, fontsize=8, va="center", ha="left", zorder=4,
+                )
+                # 値段は右の目盛り列（軸の外）。裏の目盛りの数字と重なるので
+                # 地色を敷いて隠す。現在値のタグとは逆で、地が暗く字が段の色。
+                ax.annotate(
+                    f"{price:,.0f}",
+                    xy=(1.0, y), xycoords=ax.get_yaxis_transform(),
+                    xytext=(3, 0), textcoords="offset points",
+                    color=color, fontsize=8, va="center", ha="left",
+                    bbox=dict(boxstyle="square,pad=0.2", fc="#101418",
+                              ec="none"),
+                    annotation_clip=False, zorder=4,
+                )
 
         # ---- 45度線
         if self.trend_check.isChecked():
@@ -5859,33 +6047,41 @@ class PointFigureChart(QtWidgets.QWidget):
                 span: int = end_ix - start_ix
                 end_y: int = level + span if up else level - span
                 ax.plot(
-                    [start_ix, end_ix], [level, end_y],
+                    [start_ix, end_ix], [level + 0.5, end_y + 0.5],
                     color="#ffaa33" if up else "#cc66ff",
                     linewidth=1.2, linestyle="--", alpha=0.9, zorder=2,
                 )
 
         # ---- 現在値
+        # ティックごとに動くので animated にして、図とは別に貼り替える。
         last_column = columns[-1]
-        last_price: float = self._tick_price or 0.0
-        if not last_price:
-            edge: int = last_column["top"] if last_column["up"] else last_column["bottom"]
-            last_price = edge * box
-        level_y: float = last_price / box
+        last_price: float = self._current_price(last_column, box)
         last_color: str = up_color if last_column["up"] else down_color
-        ax.axhline(level_y, color=last_color, linewidth=0.9, alpha=0.9, zorder=2.5)
-        ax.annotate(
+        self._price_line = ax.axhline(
+            last_price / box, color=last_color, linewidth=0.9, alpha=0.9,
+            animated=True, zorder=2.5,
+        )
+        self._price_tag = ax.annotate(
             f"{last_price:,.0f}",
-            xy=(1.0, level_y), xycoords=ax.get_yaxis_transform(),
+            xy=(1.0, last_price / box), xycoords=ax.get_yaxis_transform(),
             xytext=(3, 0), textcoords="offset points",
             ha="left", va="center", color="#101418", fontsize=9,
             bbox=dict(boxstyle="square,pad=0.25", fc=last_color, ec="none"),
-            annotation_clip=False, zorder=6,
+            annotation_clip=False, animated=True, zorder=6,
         )
 
         # ---- 軸。Yは箱の番号だが、読むのは値段なので値段で振る。
         ax.yaxis.tick_right()
         ax.yaxis.set_label_position("right")
         ax.set_ylabel("先物", color="#cccccc", fontsize=10)
+        # 目盛りは1,000円刻み。Yの単位は箱の番号なので、1,000円＝1000/枠 箱。
+        # 値幅が広くて数字が潰れるときだけ粗くする。
+        for yen in (1000, 2000, 5000, 10000, 20000, 50000):
+            if (top - bottom + 3) * box / yen <= 45:
+                break
+        ax.yaxis.set_major_locator(
+            matplotlib.ticker.MultipleLocator(yen / box)
+        )
         ax.yaxis.set_major_formatter(
             matplotlib.ticker.FuncFormatter(lambda v, _p: f"{v * box:,.0f}")
         )
@@ -5900,15 +6096,10 @@ class PointFigureChart(QtWidgets.QWidget):
             loc="left", fontsize=9, color="#cccccc", pad=6,
         )
 
-        boxes: int = last_column["top"] - last_column["bottom"] + 1
-        self.status_label.setText(
-            f"最終更新: {datetime.now():%H:%M:%S}　"
-            f"現在の列: {'×（上げ）' if last_column['up'] else '○（下げ）'} {boxes}箱　"
-            f"{last_column['bottom'] * box:,.0f} 〜 {(last_column['top'] + 1) * box:,.0f}　"
-            f"転換まで {reversal * box:,.0f}円"
-        )
+        self._update_status(last_column, box, reversal)
 
         self.canvas.draw()
+        self._blit_overlay()        # 現在値は animated なので別に重ねる
 
     # -------------------------------------------------------------- カーソル
     def _on_draw(self, _event) -> None:
@@ -5916,6 +6107,10 @@ class PointFigureChart(QtWidgets.QWidget):
             self._background = self.canvas.copy_from_bbox(self.fig.bbox)
         except Exception:
             self._background = None
+            return
+        # 窓の大きさを変えたときなど、こちらが頼んでいない描き直しでも
+        # 現在値が消えないように貼り直す。描画の最中なので一拍おく。
+        QtCore.QTimer.singleShot(0, self._blit_overlay)
 
     def _init_cursor(self, ax) -> None:
         self._cursor_v = ax.axvline(
@@ -5946,10 +6141,10 @@ class PointFigureChart(QtWidgets.QWidget):
         ix: int = max(0, min(len(self._columns) - 1, int(round(event.xdata))))
         column = self._columns[ix]
         box: float = self._box
-        row: int = int(math.floor(event.ydata + 0.5))
+        row: int = int(math.floor(event.ydata))      # その高さが入る箱
 
         self._cursor_v.set_xdata([ix, ix])
-        self._cursor_h.set_ydata([row, row])
+        self._cursor_h.set_ydata([row + 0.5, row + 0.5])
         lines: list = [
             f"{column['start']:%m/%d %H:%M} 〜 {column['end']:%m/%d %H:%M}",
             f"{'×（上げ）' if column['up'] else '○（下げ）'} "
@@ -5966,7 +6161,7 @@ class PointFigureChart(QtWidgets.QWidget):
         self._cursor_tag.set_text("\n".join(lines))
         for artist in (self._cursor_v, self._cursor_h, self._cursor_tag):
             artist.set_visible(True)
-        self._blit_cursor()
+        self._blit_overlay()
 
     def _on_mouse_leave(self, _event) -> None:
         self._hide_cursor()
@@ -5976,14 +6171,18 @@ class PointFigureChart(QtWidgets.QWidget):
             return
         for artist in (self._cursor_v, self._cursor_h, self._cursor_tag):
             artist.set_visible(False)
-        self._blit_cursor()
+        self._blit_overlay()
 
-    def _blit_cursor(self) -> None:
+    def _blit_overlay(self) -> None:
+        """図はそのままに、現在値とカーソルだけを上に貼り直す。"""
         if self._background is None or self._axes is None:
             self.canvas.draw_idle()
             return
         self.canvas.restore_region(self._background)
-        for artist in (self._cursor_v, self._cursor_h, self._cursor_tag):
+        for artist in (
+            self._price_line, self._price_tag,
+            self._cursor_v, self._cursor_h, self._cursor_tag,
+        ):
             if artist is not None and artist.get_visible():
                 self._axes.draw_artist(artist)
         self.canvas.blit(self.fig.bbox)

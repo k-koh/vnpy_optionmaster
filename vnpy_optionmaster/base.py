@@ -108,7 +108,7 @@ class OptionData(InstrumentData):
             self.option_type = -1
 
         self.option_expiry: datetime = contract.option_expiry
-        self.days_to_expiry: int = calculate_days_to_expiry(
+        self.days_to_expiry: float = calculate_days_to_expiry(
             contract.option_expiry
         )
         self.time_to_expiry: float = self.days_to_expiry / ANNUAL_DAYS
@@ -142,6 +142,16 @@ class OptionData(InstrumentData):
         self.pos_gamma: float = 0
         self.pos_theta: float = 0
         self.pos_vega: float = 0
+
+    def update_days_to_expiry(self) -> None:
+        """残存日数を今の時刻で引き直す。
+
+        起動時に一度計算しただけだと、時間が経っても残存が減らない。IVは
+        価格と残存から逆算するので、そのぶん実際より低く出続けてしまう
+        （再起動して初めて正しい値に飛ぶ）。小数日なので連続に減る。
+        """
+        self.days_to_expiry = calculate_days_to_expiry(self.option_expiry)
+        self.time_to_expiry = self.days_to_expiry / ANNUAL_DAYS
 
     def calculate_option_impv(self) -> None:
         """"""
@@ -401,7 +411,7 @@ class ChainData:
         self.atm_index: str = ""
         self.pre_atm_index: str = ""
         self.underlying_adjustment: float = 0
-        self.days_to_expiry: int = 0
+        self.days_to_expiry: float = 0.0
 
         self.use_synthetic: bool = False
         self.atm_impv: float | None = None
@@ -463,6 +473,12 @@ class ChainData:
                 self.indexes.sort()
 
         self.days_to_expiry = option.days_to_expiry
+
+    def update_days_to_expiry(self) -> None:
+        """この限月のオプション全部の残存日数を引き直す。"""
+        for option in self.options.values():
+            option.update_days_to_expiry()
+            self.days_to_expiry = option.days_to_expiry
 
     def remove_option(self, vt_symbol: str) -> None:
         """"""
@@ -1085,6 +1101,11 @@ class PortfolioData:
             chain = option.chain
             print("Removing option from chain:", vt_symbol)
             chain.remove_option(vt_symbol)
+
+    def update_days_to_expiry(self) -> None:
+        """全限月の残存日数を引き直す。タイマーから定期的に呼ぶ。"""
+        for chain in self._chains.values():
+            chain.update_days_to_expiry()
 
     def calculate_atm_price(self) -> None:
         """"""
