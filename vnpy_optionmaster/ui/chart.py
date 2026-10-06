@@ -32,6 +32,7 @@ from matplotlib.lines import Line2D                   # noqa
 from matplotlib.collections import LineCollection, PolyCollection   # noqa
 from matplotlib.colors import to_rgba                 # noqa
 from matplotlib.transforms import blended_transform_factory  # noqa
+import matplotlib.ticker                   # noqa
 from mpl_toolkits.mplot3d import Axes3D     # noqa
 from pylab import mpl                       # noqa
 
@@ -5404,6 +5405,588 @@ class EntrySignalChart(QtWidgets.QWidget):
         # 図を作り直したのでカーソルも新品（非表示）になっている。ティック
         # 更新のたびに消えないよう、最後の位置へ戻す。
         self._restore_cursor()
+
+
+class PointFigureChart(QtWidgets.QWidget):
+    """点数図（ポイント・アンド・フィギュア） - 先物の値動きだけを追う図。
+
+    時間の軸を持たない。値段が「枠」いくつぶん動いたときだけ箱が積まれ、
+    向きが変わるのは逆方向へ「転換」枠ぶん動いたときだけ。上げの列は ×、
+    下げの列は ○。時間で埋める足と違って、動かない時間帯が図を食わないので、
+    何度も止められた水準（支持・抵抗）がそのまま横並びで残る。
+
+    枠の積み方は高値・安値を使う一般的なやり方（上げの列では先に高値を見て、
+    伸びなければ安値で転換を見る。下げの列はその逆）。
+    """
+
+    SETTING_FILENAME: str = "point_figure_chart_setting.json"
+
+    # ティックは毎秒何度も来るので、描き直しはこの間隔まで。
+    LIVE_REDRAW_MS: int = 1000
+
+    # 表示する列数の上限（古い列から落とす）。
+    MAX_COLUMNS: int = 200
+
+    signal_tick: QtCore.Signal = QtCore.Signal(Event)
+
+    def __init__(self, option_engine: OptionEngine, portfolio_name: str) -> None:
+        super().__init__()
+
+        self.option_engine: OptionEngine = option_engine
+        self.portfolio_name: str = portfolio_name
+        self.event_engine: EventEngine = option_engine.event_engine
+
+        self.fig: Figure = Figure(figsize=(14, 8))
+        self.canvas: FigureCanvas = FigureCanvas(self.fig)
+
+        self._columns: list[dict] = []      # 描いている列（build_columns の返り）
+        self._box: float = 100.0            # 実際に描いた枠（カーソル表示用）
+        self._axes = None
+        self._tick_price: float = 0.0
+        self._tick_dirty: bool = False
+        self._cursor_v = None
+        self._cursor_h = None
+        self._cursor_tag = None
+        self._background = None
+
+        self.init_ui()
+        self._load_settings()
+
+    # ------------------------------------------------------------------ UI
+    def init_ui(self) -> None:
+        self.setWindowTitle("点数図（先物）")
+        self.resize(1280, 820)
+
+        portfolio: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
+
+        self.month_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        for chain_symbol in sorted(portfolio.chains.keys()):
+            parts: list[str] = chain_symbol.split(".")[0].split("-")
+            if len(parts) >= 2:
+                self.month_combo.addItem(parts[1])
+        self.month_combo.currentTextChanged.connect(self.run_analysis)
+
+        # 枠: 箱1つぶんの値幅。小さいほど細かい動きが残る。
+        self.box_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.box_spin.setRange(10, 2000)
+        self.box_spin.setSingleStep(10)
+        self.box_spin.setValue(200)
+        self.box_spin.setSuffix("円")
+        self.box_spin.setFixedWidth(85)
+        self.box_spin.setToolTip(
+            "箱1つぶんの値幅。小さくすると細かい動きまで残り、\n"
+            "大きくすると大きな流れだけが残ります。"
+        )
+        self.box_spin.valueChanged.connect(self.run_analysis)
+
+        # 転換: 何枠ぶん逆に動いたら列を変えるか。3枠が一般的。
+        self.reversal_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.reversal_spin.setRange(1, 10)
+        self.reversal_spin.setValue(3)
+        self.reversal_spin.setSuffix("枠")
+        self.reversal_spin.setFixedWidth(70)
+        self.reversal_spin.setToolTip(
+            "逆方向へ何枠ぶん動いたら列を変えるか。\n"
+            "3枠が一般的。大きくすると列が減り、節目だけが残ります。"
+        )
+        self.reversal_spin.valueChanged.connect(self.run_analysis)
+
+        self.days_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
+        self.days_spin.setRange(1, 365)
+        self.days_spin.setValue(30)
+        self.days_spin.setSuffix("日")
+        self.days_spin.setFixedWidth(75)
+        self.days_spin.setToolTip("何日ぶんの値動きから作るか")
+        self.days_spin.valueChanged.connect(self.run_analysis)
+
+        # 日付の印: 新しい日の最初の箱を、数字（日）に置き換える。
+        self.date_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("日付")
+        self.date_check.setChecked(True)
+        self.date_check.setToolTip(
+            "新しい日に入った最初の箱を、×／○ ではなく日にちの数字で描きます。\n"
+            "時間軸が無い図で、どのあたりが最近かを読むための印です。"
+        )
+        self.date_check.toggled.connect(self._redraw_only)
+
+        # 45度線: 直近の底／天井から引く、点数図の標準のトレンドライン。
+        self.trend_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("45度線")
+        self.trend_check.setChecked(True)
+        self.trend_check.setToolTip(
+            "点数図の標準のトレンドライン。直近の安値の列の1つ下から右上がりに、\n"
+            "直近の高値の列の1つ上から右下がりに、1列=1枠の傾きで引きます。\n"
+            "この線を割る／抜けるのが、流れが変わった合図です。\n"
+            "傾きは1列=1枠なので、枠を小さくしすぎると線が立ちすぎて\n"
+            "すぐ破れます（日経なら枠200〜500円あたりが読みやすい）。"
+        )
+        self.trend_check.toggled.connect(self._redraw_only)
+
+        self.cursor_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("カーソル")
+        self.cursor_check.setChecked(True)
+        self.cursor_check.toggled.connect(self._on_cursor_toggled)
+
+        self.tick_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("Tick更新")
+        self.tick_check.setChecked(True)
+        self.tick_check.setToolTip(
+            "配信されるティックで、一番右の列を伸ばします。\n"
+            "枠ぶん動いたときだけ箱が増えるので、普段は何も変わりません。"
+        )
+        self.tick_check.toggled.connect(self._on_tick_toggled)
+
+        self.refresh_button: QtWidgets.QPushButton = QtWidgets.QPushButton("更新")
+        self.refresh_button.clicked.connect(self.run_analysis)
+
+        self.status_label: QtWidgets.QLabel = QtWidgets.QLabel("")
+
+        hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        hbox.addWidget(QtWidgets.QLabel("限月"))
+        hbox.addWidget(self.month_combo)
+        hbox.addWidget(QtWidgets.QLabel("枠"))
+        hbox.addWidget(self.box_spin)
+        hbox.addWidget(QtWidgets.QLabel("転換"))
+        hbox.addWidget(self.reversal_spin)
+        hbox.addWidget(QtWidgets.QLabel("期間"))
+        hbox.addWidget(self.days_spin)
+        hbox.addWidget(self.date_check)
+        hbox.addWidget(self.trend_check)
+        hbox.addWidget(self.cursor_check)
+        hbox.addWidget(self.tick_check)
+        hbox.addWidget(self.refresh_button)
+        hbox.addStretch()
+        hbox.addWidget(self.status_label)
+
+        vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
+        vbox.addLayout(hbox)
+        vbox.addWidget(self.canvas)
+        self.setLayout(vbox)
+
+        self._live_timer: QtCore.QTimer = QtCore.QTimer(self)
+        self._live_timer.timeout.connect(self._on_live_timer)
+
+        self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+        self.canvas.mpl_connect("axes_leave_event", self._on_mouse_leave)
+        self.canvas.mpl_connect("draw_event", self._on_draw)
+
+        self.signal_tick.connect(self._process_tick_event)
+        self.event_engine.register(EVENT_TICK, self.signal_tick.emit)
+
+    # -------------------------------------------------------------- 設定
+    def _save_settings(self) -> None:
+        save_json(self.SETTING_FILENAME, {
+            "window_width": self.width(),
+            "window_height": self.height(),
+            "month": self.month_combo.currentText(),
+            "box": self.box_spin.value(),
+            "reversal": self.reversal_spin.value(),
+            "days": self.days_spin.value(),
+            "show_date": self.date_check.isChecked(),
+            "show_trend": self.trend_check.isChecked(),
+            "show_cursor": self.cursor_check.isChecked(),
+            "tick_update": self.tick_check.isChecked(),
+        })
+
+    def _load_settings(self) -> None:
+        data: dict = load_json(self.SETTING_FILENAME)
+        if not data:
+            return
+        win_w: int = data.get("window_width", 0)
+        win_h: int = data.get("window_height", 0)
+        if win_w > 0 and win_h > 0:
+            self.resize(win_w, win_h)
+        month: str = data.get("month", "")
+        if month and self.month_combo.findText(month) >= 0:
+            self.month_combo.setCurrentText(month)
+        self.box_spin.setValue(data.get("box", 200))
+        self.reversal_spin.setValue(data.get("reversal", 3))
+        self.days_spin.setValue(data.get("days", 30))
+        self.date_check.setChecked(data.get("show_date", True))
+        self.trend_check.setChecked(data.get("show_trend", True))
+        self.cursor_check.setChecked(data.get("show_cursor", True))
+        self.tick_check.setChecked(data.get("tick_update", True))
+
+    # -------------------------------------------------------------- 開閉
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        if self.tick_check.isChecked():
+            self._live_timer.start(self.LIVE_REDRAW_MS)
+        self.run_analysis()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self._live_timer.stop()
+        self._save_settings()
+        super().closeEvent(event)
+
+    def _on_tick_toggled(self, checked: bool) -> None:
+        if checked and self.isVisible():
+            self._live_timer.start(self.LIVE_REDRAW_MS)
+        else:
+            self._live_timer.stop()
+
+    def _on_cursor_toggled(self, checked: bool) -> None:
+        if not checked:
+            self._hide_cursor()
+
+    def _process_tick_event(self, event: Event) -> None:
+        tick = event.data
+        if tick.vt_symbol != f"nk-{self.month_combo.currentText()}.JPX":
+            return
+        price: float = tick.last_price or 0.0
+        if price:
+            self._tick_price = price
+            self._tick_dirty = True
+
+    def _on_live_timer(self) -> None:
+        if self._tick_dirty:
+            self._tick_dirty = False
+            self.run_analysis()
+
+    def _redraw_only(self, *_args) -> None:
+        self.run_analysis()
+
+    # -------------------------------------------------------------- データ
+    def load_prices(self) -> list:
+        """(時刻, 高値, 安値) の並び。最後にその場のティックを足す。"""
+        month: str = self.month_combo.currentText()
+        if not month:
+            return []
+
+        end: datetime = datetime.now(DB_TZ)
+        start: datetime = end - timedelta(days=self.days_spin.value())
+        database: BaseDatabase = get_database()
+        bars: list[BarData] = database.load_bar_data(
+            symbol=f"nk-{month}", exchange=Exchange.JPX,
+            interval=Interval.MINUTE, start=start, end=end,
+        )
+        points: list = [
+            (bar.datetime, bar.high_price, bar.low_price)
+            for bar in bars if bar.high_price and bar.low_price
+        ]
+        if self.tick_check.isChecked() and self._tick_price:
+            points.append((end, self._tick_price, self._tick_price))
+        return points
+
+    @staticmethod
+    def build_columns(points: list, box: float, reversal: int) -> list:
+        """値動きを点数図の列に畳む。
+
+        箱は「index × box 以上、(index+1) × box 未満」の値段の帯。上げの列は
+        先に高値で伸びるかを見て、伸びなければ安値で転換を見る（下げの列は
+        その逆）。1本の足で伸びと転換の両方は起こさない。
+
+        返すのは {"up": 上げか, "top": 一番上の箱, "bottom": 一番下の箱,
+        "start": その列が始まった時刻, "end": 最後に伸びた時刻} の並び。
+        """
+        if not points or box <= 0:
+            return []
+
+        def index(price: float) -> int:
+            return int(math.floor(price / box))
+
+        columns: list = []
+        current: dict | None = None
+
+        for dt, high, low in points:
+            hi_ix: int = index(high)
+            lo_ix: int = index(low)
+
+            if current is None:
+                # 最初の列は上げとして置き、転換が来たらそこで切り替わる
+                current = {"up": True, "top": hi_ix, "bottom": hi_ix,
+                           "start": dt, "end": dt}
+                columns.append(current)
+                continue
+
+            if current["up"]:
+                if hi_ix > current["top"]:
+                    current["top"] = hi_ix
+                    current["end"] = dt
+                elif lo_ix <= current["top"] - reversal:
+                    current = {"up": False, "top": current["top"] - 1,
+                               "bottom": lo_ix, "start": dt, "end": dt}
+                    columns.append(current)
+            else:
+                if lo_ix < current["bottom"]:
+                    current["bottom"] = lo_ix
+                    current["end"] = dt
+                elif hi_ix >= current["bottom"] + reversal:
+                    current = {"up": True, "bottom": current["bottom"] + 1,
+                               "top": hi_ix, "start": dt, "end": dt}
+                    columns.append(current)
+
+        # 1箱も積めなかった列は図にならないので落とす
+        return [c for c in columns if c["top"] >= c["bottom"]]
+
+    @staticmethod
+    def trend_lines(columns: list) -> list:
+        """45度線。(開始列, 開始の箱, 終了列, 上げか) の並びで返す。
+
+        点数図の標準の引き方で、安値の列の1つ下から右上がりに、高値の列の
+        1つ上から右下がりに、1列=1枠の傾きで引く。意味があるのは「いまも
+        破られていない線」なので、右端まで一度も当たらずに届く線だけを残し、
+        その中で一番古く（＝一番長く効いている）引けるものを採る。
+        """
+        if len(columns) < 3:
+            return []
+
+        lines: list = []
+        last: int = len(columns) - 1
+
+        # 上昇支持線: ○ の列の1つ下から。右端まで一度も割られないもの。
+        for i, column in enumerate(columns[:-1]):
+            if column["up"]:
+                continue
+            level: int = column["bottom"] - 1
+            if all(
+                columns[j]["bottom"] > level + (j - i)
+                for j in range(i + 1, last + 1)
+            ):
+                lines.append((i, level, last, True))
+                break               # 一番古いものが、一番長く効いている線
+
+        # 下降抵抗線: × の列の1つ上から。右端まで一度も抜かれないもの。
+        for i, column in enumerate(columns[:-1]):
+            if not column["up"]:
+                continue
+            level = column["top"] + 1
+            if all(
+                columns[j]["top"] < level - (j - i)
+                for j in range(i + 1, last + 1)
+            ):
+                lines.append((i, level, last, False))
+                break
+
+        return lines
+
+    # -------------------------------------------------------------- 描画
+    def run_analysis(self, *_args) -> None:
+        box: float = float(self.box_spin.value())
+        reversal: int = self.reversal_spin.value()
+        points = self.load_prices()
+        columns = self.build_columns(points, box, reversal)
+        truncated: bool = len(columns) > self.MAX_COLUMNS
+        if truncated:
+            columns = columns[-self.MAX_COLUMNS:]
+        self._columns = columns
+        self._box = box
+        self._draw(columns, box, reversal, truncated)
+
+    def _draw(
+        self, columns: list, box: float, reversal: int, truncated: bool
+    ) -> None:
+        self.fig.clear()
+        self._cursor_v = self._cursor_h = self._cursor_tag = None
+        self._background = None
+
+        w_px: float = max(1.0, self.fig.get_size_inches()[0] * self.fig.dpi)
+        h_px: float = max(1.0, self.fig.get_size_inches()[1] * self.fig.dpi)
+        left: float = min(0.04, 12.0 / w_px)
+        bottom_m: float = min(0.10, 30.0 / h_px)
+        ax = self.fig.add_axes([
+            left, bottom_m,
+            1.0 - left - min(0.13, 80.0 / w_px),
+            1.0 - bottom_m - min(0.10, 30.0 / h_px),
+        ])
+        self._axes = ax
+        ax.set_facecolor("#000000")
+
+        if not columns:
+            ax.text(0.5, 0.5, "データがありません", ha="center", va="center",
+                    color="#888888", fontsize=12, transform=ax.transAxes)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            self.status_label.setText("データなし")
+            self.canvas.draw()
+            return
+
+        top: int = max(c["top"] for c in columns)
+        bottom: int = min(c["bottom"] for c in columns)
+        n: int = len(columns)
+
+        up_color: str = "#ff4b4b"
+        down_color: str = "#4bffff"
+
+        ax.set_xlim(-1.0, n + 1.0)
+        ax.set_ylim(bottom - 1.5, top + 1.5)
+        ax.grid(True, axis="y", alpha=0.10)
+        ax.set_axisbelow(True)
+
+        # ---- 日付の印を置く箱（新しい日に入った最初の1箱）
+        date_marks: dict = {}
+        if self.date_check.isChecked():
+            seen: set = set()
+            for i, c in enumerate(columns):
+                day = c["start"].date()
+                if day in seen:
+                    continue
+                seen.add(day)
+                # その列の、その日が始まった側の端に置く
+                row: int = c["bottom"] if c["up"] else c["top"]
+                date_marks[(i, row)] = f"{day.day}"
+
+        # ---- × と ○
+        # 文字で描くと列が増えたときに重くなるので、× は2本の線をまとめて、
+        # ○ は円として置く。
+        x_segments: list = []
+        o_centers: list = []
+        r: float = 0.34
+        for i, c in enumerate(columns):
+            for row in range(c["bottom"], c["top"] + 1):
+                if (i, row) in date_marks:
+                    continue
+                if c["up"]:
+                    x_segments.append([(i - r, row - r), (i + r, row + r)])
+                    x_segments.append([(i - r, row + r), (i + r, row - r)])
+                else:
+                    o_centers.append((i, row))
+
+        if x_segments:
+            ax.add_collection(LineCollection(
+                x_segments, colors=up_color, linewidths=1.3, zorder=3,
+            ))
+        for cx, cy in o_centers:
+            ax.add_patch(plt.Circle(
+                (cx, cy), r, fill=False, edgecolor=down_color,
+                linewidth=1.3, zorder=3,
+            ))
+        for (i, row), text in date_marks.items():
+            ax.text(
+                i, row, text, ha="center", va="center", fontsize=7.5,
+                color="#ffff00", zorder=4,
+            )
+
+        # ---- 45度線
+        if self.trend_check.isChecked():
+            for start_ix, level, end_ix, up in self.trend_lines(columns):
+                span: int = end_ix - start_ix
+                end_y: int = level + span if up else level - span
+                ax.plot(
+                    [start_ix, end_ix], [level, end_y],
+                    color="#ffaa33" if up else "#cc66ff",
+                    linewidth=1.2, linestyle="--", alpha=0.9, zorder=2,
+                )
+
+        # ---- 現在値
+        last_column = columns[-1]
+        last_price: float = self._tick_price or 0.0
+        if not last_price:
+            edge: int = last_column["top"] if last_column["up"] else last_column["bottom"]
+            last_price = edge * box
+        level_y: float = last_price / box
+        last_color: str = up_color if last_column["up"] else down_color
+        ax.axhline(level_y, color=last_color, linewidth=0.9, alpha=0.9, zorder=2.5)
+        ax.annotate(
+            f"{last_price:,.0f}",
+            xy=(1.0, level_y), xycoords=ax.get_yaxis_transform(),
+            xytext=(3, 0), textcoords="offset points",
+            ha="left", va="center", color="#101418", fontsize=9,
+            bbox=dict(boxstyle="square,pad=0.25", fc=last_color, ec="none"),
+            annotation_clip=False, zorder=6,
+        )
+
+        # ---- 軸。Yは箱の番号だが、読むのは値段なので値段で振る。
+        ax.yaxis.tick_right()
+        ax.yaxis.set_label_position("right")
+        ax.set_ylabel("先物", color="#cccccc", fontsize=10)
+        ax.yaxis.set_major_formatter(
+            matplotlib.ticker.FuncFormatter(lambda v, _p: f"{v * box:,.0f}")
+        )
+        ax.tick_params(labelsize=8, labelright=True, labelleft=False)
+        ax.set_xticks([])
+        for spine in ("top", "left"):
+            ax.spines[spine].set_visible(False)
+
+        ax.set_title(
+            f"nk-{self.month_combo.currentText()}   枠 {box:,.0f}円 × 転換 {reversal}枠"
+            f"   {n}列" + ("（古い列は省略）" if truncated else ""),
+            loc="left", fontsize=9, color="#cccccc", pad=6,
+        )
+
+        boxes: int = last_column["top"] - last_column["bottom"] + 1
+        self.status_label.setText(
+            f"最終更新: {datetime.now():%H:%M:%S}　"
+            f"現在の列: {'×（上げ）' if last_column['up'] else '○（下げ）'} {boxes}箱　"
+            f"{last_column['bottom'] * box:,.0f} 〜 {(last_column['top'] + 1) * box:,.0f}　"
+            f"転換まで {reversal * box:,.0f}円"
+        )
+
+        self.canvas.draw()
+
+    # -------------------------------------------------------------- カーソル
+    def _on_draw(self, _event) -> None:
+        try:
+            self._background = self.canvas.copy_from_bbox(self.fig.bbox)
+        except Exception:
+            self._background = None
+
+    def _init_cursor(self, ax) -> None:
+        self._cursor_v = ax.axvline(
+            0, color="#888888", linewidth=0.8, animated=True, zorder=7)
+        self._cursor_h = ax.axhline(
+            0, color="#888888", linewidth=0.8, animated=True, zorder=7)
+        self._cursor_tag = ax.text(
+            0, 0, "", fontsize=8.5, color="#e8e8e8", va="top", ha="left",
+            linespacing=1.4,
+            bbox=dict(boxstyle="round,pad=0.35", fc="#12161b", ec="#5a6068",
+                      alpha=0.94),
+            animated=True, zorder=8,
+        )
+        for artist in (self._cursor_v, self._cursor_h, self._cursor_tag):
+            artist.set_visible(False)
+
+    def _on_mouse_move(self, event) -> None:
+        ax = self._axes
+        if (
+            ax is None or not self.cursor_check.isChecked()
+            or event.inaxes is not ax or event.xdata is None
+            or event.ydata is None or not self._columns
+        ):
+            return
+        if self._cursor_v is None:
+            self._init_cursor(ax)
+
+        ix: int = max(0, min(len(self._columns) - 1, int(round(event.xdata))))
+        column = self._columns[ix]
+        box: float = self._box
+        row: int = int(math.floor(event.ydata + 0.5))
+
+        self._cursor_v.set_xdata([ix, ix])
+        self._cursor_h.set_ydata([row, row])
+        lines: list = [
+            f"{column['start']:%m/%d %H:%M} 〜 {column['end']:%m/%d %H:%M}",
+            f"{'×（上げ）' if column['up'] else '○（下げ）'} "
+            f"{column['top'] - column['bottom'] + 1}箱",
+            f"列  {column['bottom'] * box:,.0f} 〜 {(column['top'] + 1) * box:,.0f}",
+            f"箱  {row * box:,.0f} 〜 {(row + 1) * box:,.0f}",
+        ]
+        x0, x1 = ax.get_xlim()
+        on_right: bool = event.xdata > x0 + (x1 - x0) * 0.8
+        self._cursor_tag.set_ha("right" if on_right else "left")
+        self._cursor_tag.set_position((
+            ix + (-0.6 if on_right else 0.6), ax.get_ylim()[1] - 0.4
+        ))
+        self._cursor_tag.set_text("\n".join(lines))
+        for artist in (self._cursor_v, self._cursor_h, self._cursor_tag):
+            artist.set_visible(True)
+        self._blit_cursor()
+
+    def _on_mouse_leave(self, _event) -> None:
+        self._hide_cursor()
+
+    def _hide_cursor(self) -> None:
+        if self._cursor_v is None:
+            return
+        for artist in (self._cursor_v, self._cursor_h, self._cursor_tag):
+            artist.set_visible(False)
+        self._blit_cursor()
+
+    def _blit_cursor(self) -> None:
+        if self._background is None or self._axes is None:
+            self.canvas.draw_idle()
+            return
+        self.canvas.restore_region(self._background)
+        for artist in (self._cursor_v, self._cursor_h, self._cursor_tag):
+            if artist is not None and artist.get_visible():
+                self._axes.draw_artist(artist)
+        self.canvas.blit(self.fig.bbox)
 
 
 class PayoffDiagramChart(QtWidgets.QWidget):
