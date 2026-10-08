@@ -2249,7 +2249,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self.days_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
         self.days_spin.setMinimum(3)
         self.days_spin.setMaximum(90)
-        self.days_spin.setValue(14)
+        self.days_spin.setValue(21)
         self.days_spin.setSuffix("日")
 
         self.month_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
@@ -3327,6 +3327,28 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             for i in day_idx:
                 target_ax.axvline(x=i, color="#5f6368", linewidth=0.6,
                                   linestyle="--", alpha=0.4, zorder=0)
+
+        # ---- 週の変わり目の縦線（株価チャートの先物チャートと同じ）
+        # ISO週が変わった最初の位置に白の実線。セッションの区切り（灰色の
+        # 実線・破線）より明るくして、何週ぶん見ているかを数えられるように
+        # する。ラベルは "YYYY-MM-DD" か "YYYY-MM-DD HH:MM"。
+        week_idx: list[int] = []
+        prev_week: tuple | None = None
+        for i, label_text in enumerate(date_labels):
+            try:
+                day = datetime.strptime(label_text[:10], "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            week: tuple = day.isocalendar()[:2]
+            if prev_week is not None and week != prev_week:
+                week_idx.append(i)
+            prev_week = week
+        for target_ax in (ax, ax_skew):
+            if target_ax is None:
+                continue
+            for i in week_idx:
+                target_ax.axvline(x=i, color="#ffffff", linewidth=1.6,
+                                  linestyle="-", alpha=0.75, zorder=0.5)
 
         if night_idx:
             # Date labels at night-session boundaries (thin if too many).
@@ -6300,8 +6322,15 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         # setMaximumHeight has no effect here — the result_table below has
         # stretch=1 and absorbs all the extra vertical space, so the table
         # stays at its small content-based size hint. setMinimumHeight forces
-        # the layout to give it the space. (600 = triple the original 200.)
-        self.sim_table.setMinimumHeight(1013)
+        # the layout to give it the space。行の高さは18pxなので、
+        # 1400px でヘッダを除き約75行ぶん見える。
+        self.sim_table.setMinimumHeight(1400)
+        # 窓を縦に広げたぶんも建玉の表に回す（これが無いと、増えた高さは
+        # 下の収益テーブル（stretch=1）が全部持っていく）。
+        self.sim_table.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
         # Reduce cell padding for a tighter layout
         self.sim_table.setStyleSheet(
             "QTableWidget::item { padding: 0px 2px; }"
@@ -6513,7 +6542,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
 
         right_vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
         right_vbox.addLayout(mode_hbox)
-        right_vbox.addWidget(self.sim_group)
+        right_vbox.addWidget(self.sim_group, stretch=3)
         right_vbox.addLayout(ctrl_grid)
         right_vbox.addLayout(btn_hbox)
         right_vbox.addWidget(self.result_table, stretch=1)
