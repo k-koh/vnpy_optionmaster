@@ -325,13 +325,26 @@ class OptionMarketMonitor(MonitorTable):
         if not option:
             return
 
-        tick: TickData = option.tick
-        option_cells["bid_price"].setText(f'{tick.bid_price_1:0.4f}')
-        option_cells["bid_volume"].setText(str(tick.bid_volume_1))
-        option_cells["ask_price"].setText(f'{tick.ask_price_1:0.4f}')
-        option_cells["ask_volume"].setText(str(tick.ask_volume_1))
-        option_cells["volume"].setText(str(tick.volume))
-        option_cells["open_interest"].setText(str(tick.open_interest))
+        # ティックはまだ来ていないことがある。EVENT_TICK の受け手はこの表と
+        # エンジンの2つで、表の方が先に呼ばれると option.tick はまだ None。
+        # 板の値も、配信に入っていない項目は None で来る（kabus は変わった
+        # 項目だけを送る）。どちらも落とさず空欄にする。
+        tick: TickData | None = option.tick
+        if tick is None:
+            return
+
+        def _price(value: float | None) -> str:
+            return "" if value is None else f"{value:0.4f}"
+
+        def _count(value: float | None) -> str:
+            return "" if value is None else str(value)
+
+        option_cells["bid_price"].setText(_price(tick.bid_price_1))
+        option_cells["bid_volume"].setText(_count(tick.bid_volume_1))
+        option_cells["ask_price"].setText(_price(tick.ask_price_1))
+        option_cells["ask_volume"].setText(_count(tick.ask_volume_1))
+        option_cells["volume"].setText(_count(tick.volume))
+        option_cells["open_interest"].setText(_count(tick.open_interest))
 
     def update_impv(self, vt_symbol: str) -> None:
         """"""

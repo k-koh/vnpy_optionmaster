@@ -3701,8 +3701,20 @@ class EntrySignalChart(QtWidgets.QWidget):
 
         # Which of the three series are drawn, and how solid their fills are.
         self.atm_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("ATM")
-        self.put_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("PUT")
-        self.call_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("CALL")
+        # PUT / CALL は Δ0.1 の系列。隣に Δ0.02 が並ぶので、どちらのデルタか
+        # 札で分かるようにしておく（株価チャートの iv_item と同じ呼び方）。
+        self.put_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("Δ0.1PUT")
+        self.call_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("Δ0.1CALL")
+        # Δ0.02: さらに外側のウィング。板が薄いぶん水準は高いが、両翼が揃って
+        # 動いたときは本物のボラ需要が出ている合図になる。
+        self.d002_put_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("Δ0.02PUT")
+        self.d002_call_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("Δ0.02CALL")
+        for box in (self.d002_put_check, self.d002_call_check):
+            box.setToolTip(
+                "Δ0.02 の前日比IV（同一行使価格）。\n"
+                "Δ0.1 よりさらに外側のウィング。水準が高く振れ幅も大きいので、\n"
+                "出すとY軸がそちらに引っ張られます。"
+            )
         # 面の上下だけ: 前日比IVから「滑り」を取り除いた、ボラ水準そのものの動き
         self.level_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("面")
         self.level_check.setToolTip(
@@ -3763,15 +3775,18 @@ class EntrySignalChart(QtWidgets.QWidget):
             "面の上下と合わせて読むと、本物の買い需要か投げかが分かります。"
         )
         for box in (self.atm_check, self.put_check, self.call_check,
-                    self.level_check, self.sigma_check, self.volume_check):
+                    self.level_check, self.sigma_check, self.d002_put_check,
+                    self.d002_call_check, self.volume_check):
             # ATM と 面の上下 は互いにほぼ重なるので、既定では両方とも
             # 出さず、ウィング（PUT / CALL）と枚数だけを出す。
             # 初期値は必ず connect の前に入れる（接続後に変えると、
             # まだ揃っていないウィジェットを使って再描画が走る）。
-            box.setChecked(
-                box not in (self.atm_check, self.level_check, self.sigma_check)
-            )
-            if box is not self.sigma_check:
+            box.setChecked(box not in (
+                self.atm_check, self.level_check, self.sigma_check,
+                self.d002_put_check, self.d002_call_check,
+            ))
+            if box not in (self.sigma_check, self.d002_put_check,
+                           self.d002_call_check):
                 box.setToolTip("この系列の表示/非表示")
             box.toggled.connect(self._redraw_only)
 
@@ -3832,6 +3847,8 @@ class EntrySignalChart(QtWidgets.QWidget):
         hbox.addWidget(self.call_check)
         hbox.addWidget(self.level_check)
         hbox.addWidget(self.sigma_check)
+        hbox.addWidget(self.d002_put_check)
+        hbox.addWidget(self.d002_call_check)
         hbox.addWidget(self.volume_check)
         hbox.addWidget(self.fixed_ref_check)
         hbox.addWidget(self.cursor_check)
@@ -3879,6 +3896,8 @@ class EntrySignalChart(QtWidgets.QWidget):
             "show_call": self.call_check.isChecked(),
             "show_level": self.level_check.isChecked(),
             "show_sigma": self.sigma_check.isChecked(),
+            "show_d002_put": self.d002_put_check.isChecked(),
+            "show_d002_call": self.d002_call_check.isChecked(),
             "show_volume": self.volume_check.isChecked(),
             "fixed_reference": self.fixed_ref_check.isChecked(),
             "show_cursor": self.cursor_check.isChecked(),
@@ -3912,6 +3931,8 @@ class EntrySignalChart(QtWidgets.QWidget):
         self.call_check.setChecked(data.get("show_call", True))
         self.level_check.setChecked(data.get("show_level", False))
         self.sigma_check.setChecked(data.get("show_sigma", False))
+        self.d002_put_check.setChecked(data.get("show_d002_put", False))
+        self.d002_call_check.setChecked(data.get("show_d002_call", False))
         self.volume_check.setChecked(data.get("show_volume", True))
         self.fixed_ref_check.setChecked(data.get("fixed_reference", False))
         self.cursor_check.setChecked(data.get("show_cursor", True))
@@ -4127,6 +4148,7 @@ class EntrySignalChart(QtWidgets.QWidget):
                     "open": bar.open_price, "high": bar.high_price,
                     "low": bar.low_price, "close": bar.close_price,
                     "atm": 0.0, "put": 0.0, "call": 0.0, "lvl": 0.0,
+                    "p2": 0.0, "c2": 0.0, "p2s": 0, "c2s": 0,
                     "pc": bar.pre_close, "ps": 0, "cs": 0,
                     **{key: None for key, _field in _VOLUME_FIELDS},
                 }
@@ -4153,6 +4175,14 @@ class EntrySignalChart(QtWidgets.QWidget):
                 b["ps"] = int(bar.eris_p_strike)
             if bar.eris_c_strike:
                 b["cs"] = int(bar.eris_c_strike)
+            if getattr(bar, "delta002_p_iv", 0):
+                b["p2"] = bar.delta002_p_iv * 100
+            if getattr(bar, "delta002_c_iv", 0):
+                b["c2"] = bar.delta002_c_iv * 100
+            if getattr(bar, "delta002_p_strike", 0):
+                b["p2s"] = int(bar.delta002_p_strike)
+            if getattr(bar, "delta002_c_strike", 0):
+                b["c2s"] = int(bar.delta002_c_strike)
 
         rows: list[dict] = [buckets[k] for k in sorted(buckets) if buckets[k]["atm"]]
 
@@ -4269,6 +4299,7 @@ class EntrySignalChart(QtWidgets.QWidget):
 
         month: str = self.month_combo.currentText()
         r["d_atm"] = r["d_put"] = r["d_call"] = r["d_level"] = None
+        r["d_p2"] = r["d_c2"] = None
         if not month:
             return
 
@@ -4303,6 +4334,22 @@ class EntrySignalChart(QtWidgets.QWidget):
             r["d_put"] = r["put"] - p_prev * 100
         if r["call"] and c_prev:
             r["d_call"] = r["call"] - c_prev * 100
+
+        # Δ0.02 は行使価格が別なので、その行使価格で前日IVを引き直す。
+        # 片翼の行使価格しか無い足もあるので、0 を渡して取れる方だけ使う。
+        if r.get("p2s") or r.get("c2s"):
+            try:
+                p2_prev, c2_prev, _ = self.option_engine.get_prev_day_option_iv(
+                    f"nk-{month}", OptionPrevIvType.SAME_STRIKE,
+                    r.get("p2s") or 0, r.get("c2s") or 0,
+                    atm_strike, reference_dt,
+                )
+            except Exception:
+                return
+            if r.get("p2") and p2_prev:
+                r["d_p2"] = r["p2"] - p2_prev * 100
+            if r.get("c2") and c2_prev:
+                r["d_c2"] = r["c2"] - c2_prev * 100
 
     # -------------------------------------------------------------- cursor
     def _on_draw(self, event) -> None:
@@ -4660,6 +4707,8 @@ class EntrySignalChart(QtWidgets.QWidget):
                 atm=last["atm"], put=last["put"], call=last["call"],
                 lvl=last.get("lvl", 0.0), pc=last.get("pc", 0.0),
                 ps=last["ps"], cs=last["cs"],
+                p2=last.get("p2", 0.0), c2=last.get("c2", 0.0),
+                p2s=last.get("p2s", 0), c2s=last.get("c2s", 0),
                 **{key: last.get(key) for key, _field in _VOLUME_FIELDS},
             )
             rows.append(last)
@@ -4690,6 +4739,14 @@ class EntrySignalChart(QtWidgets.QWidget):
                 last["ps"] = int(chain.eris_p_strike)
             if chain.eris_c_strike:
                 last["cs"] = int(chain.eris_c_strike)
+            if chain.delta002_p_iv:
+                last["p2"] = chain.delta002_p_iv * 100
+            if chain.delta002_c_iv:
+                last["c2"] = chain.delta002_c_iv * 100
+            if chain.delta002_p_strike:
+                last["p2s"] = int(chain.delta002_p_strike)
+            if chain.delta002_c_strike:
+                last["c2s"] = int(chain.delta002_c_strike)
 
         prev = rows[-2] if len(rows) > 1 else None
         last["roll"] = bool(
@@ -5024,6 +5081,8 @@ class EntrySignalChart(QtWidgets.QWidget):
                 ("d_put", "#4bffff", "PUT Δ0.1", self.put_check.isChecked()),
                 ("d_call", "#ff0000", "CALL Δ0.1", self.call_check.isChecked()),
                 ("d_level", "#00ff80", "ATM 面の上下", self.level_check.isChecked()),
+                ("d_p2", "#9b7bff", "PUT Δ0.02", self.d002_put_check.isChecked()),
+                ("d_c2", "#ffa500", "CALL Δ0.02", self.d002_call_check.isChecked()),
                 ("d_sigma", "#ffff00", "先物σ", self.sigma_check.isChecked()),
             )
             if shown
@@ -5041,6 +5100,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         # 足の段差はIVの動きではない。面の上下はATMの行使価格に乗っている。
         bar_strike_keys: dict[str, str] = {
             "d_atm": "as", "d_put": "ps", "d_call": "cs", "d_level": "as",
+            "d_p2": "p2s", "d_c2": "c2s",
         }
         bars: list[tuple] = []
         for key, color, label in specs:
@@ -5166,6 +5226,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         # 並ぶ。札は株価チャートの iv_item と同じ A / P / C / 面。
         iv_tags: dict = {
             "d_atm": "A", "d_put": "P", "d_call": "C", "d_level": "面",
+            "d_p2": "P2", "d_c2": "C2",
         }
         iv_y0, iv_y1 = ax_iv.get_ylim()
         for value_key, color, _label in specs:
@@ -5440,6 +5501,11 @@ class EntrySignalChart(QtWidgets.QWidget):
             # 隣どうしに並べて読めるようにATMの次に置く。
             state = (f"{diff_label}　ATM {_s('d_atm')} / 面 {_s('d_level')} / "
                      f"PUT {_s('d_put')} / CALL {_s('d_call')}")
+            # Δ0.02 は出しているときだけ。両翼が揃って上がると本物のボラ需要。
+            if self.d002_put_check.isChecked():
+                state += f" / 0.02PUT {_s('d_p2')}"
+            if self.d002_call_check.isChecked():
+                state += f" / 0.02CALL {_s('d_c2')}"
 
         # 先物が 0σ（前日終値）から何σ離れているか。チャートのσのはしごと
         # 同じ式: σ = (現在値 − 前日終値) / (前日終値 × ATM日率IV)。
@@ -6345,6 +6411,17 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         add_btn.clicked.connect(self._add_sim_row)
         add_futures_btn: QtWidgets.QPushButton = QtWidgets.QPushButton("先物追加")
         add_futures_btn.clicked.connect(self._add_sim_futures_row)
+        preset_btn: QtWidgets.QPushButton = QtWidgets.QPushButton("セット追加")
+        preset_btn.setToolTip(
+            "次の4組8本をまとめて積みます。\n"
+            "  Δ0.1  コール買い + 先物売り\n"
+            "  Δ0.1  プット買い + 先物買い\n"
+            "  Δ0.02 コール買い + 先物売り\n"
+            "  Δ0.02 プット買い + 先物買い\n"
+            "枚数は左の指定どおり。Δ0.02 だけは、先物のデルタを打ち消す\n"
+            "枚数をその場の実デルタから計算します。"
+        )
+        preset_btn.clicked.connect(self._add_sim_preset_set)
         del_btn: QtWidgets.QPushButton = QtWidgets.QPushButton("行削除")
         del_btn.clicked.connect(self._remove_sim_row)
         rss_btn: QtWidgets.QPushButton = QtWidgets.QPushButton("約定取込(RSS)")
@@ -6380,6 +6457,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         sim_param_hbox.addStretch()
         sim_param_hbox.addWidget(add_btn)
         sim_param_hbox.addWidget(add_futures_btn)
+        sim_param_hbox.addWidget(preset_btn)
         sim_param_hbox.addWidget(del_btn)
         sim_param_hbox.addWidget(rss_btn)
 
@@ -6885,9 +6963,19 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         lots: int = self.sim_lots_spin.value()
         if lots == 0:
             return
+        self.sim_positions.append(
+            self._make_option_position(chain_symbol, option, lots)
+        )
+        self._refresh_sim_table()
+
+    @staticmethod
+    def _make_option_position(
+        chain_symbol: str, option: OptionData, lots: int
+    ) -> dict:
+        """オプション建玉1本ぶんの辞書。OP追加とセット追加で共用する。"""
         cp_str: str = "C" if option.option_type > 0 else "P"
         entry_underlying: float = option.underlying.mid_price if option.underlying else 0
-        self.sim_positions.append({
+        return {
             "option_data": option,
             "underlying_data": None,
             "chain_symbol": chain_symbol,
@@ -6910,8 +6998,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             "enabled": True,
             "closed": False,
             "close_price": 0.0,
-        })
-        self._refresh_sim_table()
+        }
 
     def _add_sim_futures_row(self) -> None:
         """Add a futures position from the chain's underlying."""
@@ -6931,13 +7018,20 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         if lots == 0:
             return
 
-        futures_type: str = self.sim_futures_type_combo.currentText()
-        if futures_type == "先物ミニ":
-            futures_multiplier: float = 0.1
-        else:
-            futures_multiplier = 1.0
+        self.sim_positions.append(self._make_futures_position(
+            chain_symbol, underlying, lots,
+            self.sim_futures_type_combo.currentText(),
+        ))
+        self._refresh_sim_table()
 
-        self.sim_positions.append({
+    @staticmethod
+    def _make_futures_position(
+        chain_symbol: str, underlying: UnderlyingData, lots: int,
+        futures_type: str
+    ) -> dict:
+        """先物建玉1本ぶんの辞書。先物追加とセット追加で共用する。"""
+        futures_multiplier: float = 0.1 if futures_type == "先物ミニ" else 1.0
+        return {
             "option_data": None,
             "underlying_data": underlying,
             "chain_symbol": chain_symbol,
@@ -6961,8 +7055,89 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             "enabled": True,
             "closed": False,
             "close_price": 0.0,
-        })
+        }
+
+    def _add_sim_preset_set(self) -> None:
+        """Δ0.1 と Δ0.02 の「OP買い＋先物」を4組まとめて積む。
+
+        組み方:
+          Δ0.1  コール買い ×n   + 先物 売り ×n
+          Δ0.1  プット買い ×n   + 先物 買い ×n
+          Δ0.02 コール買い ×N   + 先物 売り ×n
+          Δ0.02 プット買い ×N   + 先物 買い ×n
+
+        n は 枚数 の指定（OP側・先物側とも絶対値）。Δ0.02 の N だけは、
+        先物 n 枚ぶんのデルタを打ち消す枚数を実デルタから出す:
+
+            N = round(先物のデルタ合計 / OP1枚のデルタ)
+
+        Δ0.02 は板が薄くデルタが日々変わるので、固定枚数ではなくその場の
+        デルタから計算する。
+        """
+        portfolio: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
+
+        op_symbol: str = self.sim_month_combo.currentData() or ""
+        fut_symbol: str = self.sim_futures_month_combo.currentData() or op_symbol
+        op_chain: ChainData | None = portfolio.chains.get(op_symbol)
+        fut_chain: ChainData | None = portfolio.chains.get(fut_symbol)
+        if not op_chain or not fut_chain or not fut_chain.underlying:
+            self._warn_preset("限月の銘柄が揃っていません")
+            return
+
+        underlying: UnderlyingData = fut_chain.underlying
+        futures_type: str = self.sim_futures_type_combo.currentText()
+        lots: int = abs(self.sim_lots_spin.value()) or 5
+        fut_lots: int = abs(self.sim_futures_lots_spin.value()) or 5
+        futures_delta: float = (
+            underlying.size * (0.1 if futures_type == "先物ミニ" else 1.0) * fut_lots
+        )
+
+        # 行使価格 → OptionData。チェーンが持っているΔ0.1／Δ0.02の行使価格から引く。
+        calls: dict = {o.strike_price: o for o in op_chain.calls.values()}
+        puts: dict = {o.strike_price: o for o in op_chain.puts.values()}
+
+        # (名前, 行使価格, 表から引く辞書, 先物の向き, 枚数の決め方)
+        plan: list = [
+            ("Δ0.1 コール", op_chain.eris_c_strike, calls, -1, None),
+            ("Δ0.1 プット", op_chain.eris_p_strike, puts, +1, None),
+            ("Δ0.02 コール", op_chain.delta002_c_strike, calls, -1, futures_delta),
+            ("Δ0.02 プット", op_chain.delta002_p_strike, puts, +1, futures_delta),
+        ]
+
+        rows: list = []
+        notes: list = []
+        for name, strike, table, side, hedge in plan:
+            option = table.get(strike) if strike else None
+            if option is None:
+                notes.append(f"{name}: 行使価格が取れません")
+                continue
+            if hedge is None:
+                op_lots: int = lots
+            else:
+                per_lot: float = abs(option.theo_delta or 0.0)
+                if per_lot <= 0:
+                    notes.append(f"{name}: デルタが0なので枚数を出せません")
+                    continue
+                op_lots = max(1, round(hedge / per_lot))
+            rows.append(self._make_option_position(op_symbol, option, op_lots))
+            rows.append(self._make_futures_position(
+                fut_symbol, underlying, side * fut_lots, futures_type
+            ))
+            notes.append(
+                f"{name} {option.strike_price:.0f} 買い×{op_lots} / "
+                f"{futures_type} {'売' if side < 0 else '買'}×{fut_lots}"
+            )
+
+        if not rows:
+            self._warn_preset("\n".join(notes) or "追加できる建玉がありません")
+            return
+
+        self.sim_positions.extend(rows)
         self._refresh_sim_table()
+        print("[セット追加] " + " | ".join(notes))
+
+    def _warn_preset(self, message: str) -> None:
+        QtWidgets.QMessageBox.warning(self, "セット追加", message)
 
     def _rss_file_path(self) -> str:
         """Path to rss_fop.xlsx inside the vnpy_optionmaster package."""
