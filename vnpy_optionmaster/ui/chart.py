@@ -3563,10 +3563,23 @@ class EntrySignalChart(QtWidgets.QWidget):
 
     INTERVALS: list[tuple[str, int]] = [
         ("1m", 1), ("3m", 3), ("5m", 5), ("10m", 10), ("15m", 15), ("20m", 20),
-        ("30m", 30)
+        ("30m", 30), ("1h", 60), ("2h", 120), ("4h", 240), ("8h", 480),
+        ("1d", 1440)
     ]
 
+    # 日足の区切り。株価チャートの BarGenerator に合わせて 15:45 の引けで
+    # 確定し、その引けの日付を名乗る（夜間セッションは翌営業日のぶん）。
+    DAILY_END_HOUR: int = 15
+    DAILY_END_MINUTE: int = 45
+
     MAX_COLUMNS: int = 120
+
+    # 「セッション開始」から何セッションぶん遡るかの選択肢。細かいところは
+    # 1刻み、長く遡るところは粗く。2セッションで約1営業日。
+    SESSION_COUNTS: tuple[int, ...] = (
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 20, 25, 30, 40, 50, 60, 70,
+        80, 90
+    )
 
     # Ticks arrive many times per second; the chart repaints at most this often.
     LIVE_REDRAW_MS: int = 1000
@@ -3649,18 +3662,24 @@ class EntrySignalChart(QtWidgets.QWidget):
         # 何セッションぶん表示するか。1 = 今のセッションだけ、2 = 1つ前から、…
         # 日中(08:45)と夜間(17:00)をそれぞれ1セッションと数え、土日・立会の
         # 無い日は飛ばす。
-        self.session_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
-        self.session_spin.setRange(1, 20)
-        self.session_spin.setValue(5)
-        self.session_spin.setSuffix("ｾｯｼｮﾝ")
-        self.session_spin.setFixedWidth(80)
-        self.session_spin.setToolTip(
+        self.session_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        # 幅は中身に合わせる（既定だと最初の表示で固まり「...」になる）。
+        self.session_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self.session_combo.setMinimumContentsLength(3)
+        self.session_combo.setMinimumWidth(65)
+        self.session_combo.view().setMinimumWidth(65)
+        for count in self.SESSION_COUNTS:
+            self.session_combo.addItem(str(count), count)
+        self.session_combo.setCurrentText("14")
+        self.session_combo.setToolTip(
             "「セッション開始」から何セッションぶん遡って表示するか。\n"
             "1 = 今のセッションだけ / 2 = 1つ前のセッションから。\n"
             "日中(08:45)と夜間(17:00)をそれぞれ1セッションと数えます。\n"
             "本数が増えるので、必要なら「最大」も合わせて増やしてください。"
         )
-        self.session_spin.valueChanged.connect(self._on_session_count_changed)
+        self.session_combo.currentTextChanged.connect(self._on_session_count_changed)
 
         # End of the window. Follows the clock unless pinned, so a past
         # session can be replayed for 検証.
@@ -3680,9 +3699,17 @@ class EntrySignalChart(QtWidgets.QWidget):
         self.now_end_check.toggled.connect(self._on_now_end_toggled)
 
         self.interval_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        # 幅を札の長さに合わせる。既定のままだと「1m」に合わせて縮み、
+        # 「30m」などが「...」に省略されてしまう（株価チャートと同じ設定）。
+        self.interval_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self.interval_combo.setMinimumContentsLength(4)
+        self.interval_combo.setMinimumWidth(70)
+        self.interval_combo.view().setMinimumWidth(70)
         for label, _minutes in self.INTERVALS:
             self.interval_combo.addItem(label)
-        self.interval_combo.setCurrentText("15m")
+        self.interval_combo.setCurrentText("30m")
         self.interval_combo.currentTextChanged.connect(self.run_analysis)
 
         # How many bars the grid may draw. 1m足 over a whole session needs a
@@ -3777,13 +3804,13 @@ class EntrySignalChart(QtWidgets.QWidget):
         for box in (self.atm_check, self.put_check, self.call_check,
                     self.level_check, self.sigma_check, self.d002_put_check,
                     self.d002_call_check, self.volume_check):
-            # ATM と 面の上下 は互いにほぼ重なるので、既定では両方とも
-            # 出さず、ウィング（PUT / CALL）と枚数だけを出す。
+            # 既定は Δ0.02 の両翼と枚数だけ。ATM と 面の上下 は互いにほぼ
+            # 重なり、Δ0.1 は Δ0.02 と形が似るので、まずは一番外側の
+            # ウィングだけを出して、必要に応じて足していく。
             # 初期値は必ず connect の前に入れる（接続後に変えると、
             # まだ揃っていないウィジェットを使って再描画が走る）。
-            box.setChecked(box not in (
-                self.atm_check, self.level_check, self.sigma_check,
-                self.d002_put_check, self.d002_call_check,
+            box.setChecked(box in (
+                self.d002_put_check, self.d002_call_check, self.volume_check,
             ))
             if box not in (self.sigma_check, self.d002_put_check,
                            self.d002_call_check):
@@ -3833,7 +3860,8 @@ class EntrySignalChart(QtWidgets.QWidget):
         hbox.addWidget(QtWidgets.QLabel("開始"))
         hbox.addWidget(self.start_edit)
         hbox.addWidget(self.auto_start_check)
-        hbox.addWidget(self.session_spin)
+        hbox.addWidget(self.session_combo)
+        hbox.addWidget(QtWidgets.QLabel("ｾｯｼｮﾝ"))
         hbox.addWidget(QtWidgets.QLabel("終了"))
         hbox.addWidget(self.end_edit)
         hbox.addWidget(self.now_end_check)
@@ -3906,7 +3934,7 @@ class EntrySignalChart(QtWidgets.QWidget):
                 for start, end in self._range_trends
             ],
             "auto_start": self.auto_start_check.isChecked(),
-            "session_count": self.session_spin.value(),
+            "session_count": self.session_count(),
             "now_end": self.now_end_check.isChecked(),
             "tick_update": self.tick_check.isChecked(),
         }
@@ -3923,16 +3951,16 @@ class EntrySignalChart(QtWidgets.QWidget):
         month: str = data.get("month", "")
         if month and self.month_combo.findText(month) >= 0:
             self.month_combo.setCurrentText(month)
-        self.interval_combo.setCurrentText(data.get("interval", "15m"))
+        self.interval_combo.setCurrentText(data.get("interval", "30m"))
         self.max_bars_spin.setValue(data.get("max_bars", self.MAX_COLUMNS))
         self.alpha_spin.setValue(data.get("fill_alpha", 0.45))
         self.atm_check.setChecked(data.get("show_atm", False))
-        self.put_check.setChecked(data.get("show_put", True))
-        self.call_check.setChecked(data.get("show_call", True))
+        self.put_check.setChecked(data.get("show_put", False))
+        self.call_check.setChecked(data.get("show_call", False))
         self.level_check.setChecked(data.get("show_level", False))
         self.sigma_check.setChecked(data.get("show_sigma", False))
-        self.d002_put_check.setChecked(data.get("show_d002_put", False))
-        self.d002_call_check.setChecked(data.get("show_d002_call", False))
+        self.d002_put_check.setChecked(data.get("show_d002_put", True))
+        self.d002_call_check.setChecked(data.get("show_d002_call", True))
         self.volume_check.setChecked(data.get("show_volume", True))
         self.fixed_ref_check.setChecked(data.get("fixed_reference", False))
         self.cursor_check.setChecked(data.get("show_cursor", True))
@@ -3944,7 +3972,13 @@ class EntrySignalChart(QtWidgets.QWidget):
                 continue
             self._range_trends.append((start, end))
         self.auto_start_check.setChecked(data.get("auto_start", True))
-        self.session_spin.setValue(data.get("session_count", 5))
+        saved_sessions: int = data.get("session_count", 14)
+        if self.session_combo.findText(str(saved_sessions)) < 0:
+            # 以前の入力欄では一覧に無い数も選べた。近い方に寄せる。
+            saved_sessions = min(
+                self.SESSION_COUNTS, key=lambda c: abs(c - saved_sessions)
+            )
+        self.session_combo.setCurrentText(str(saved_sessions))
         self.now_end_check.setChecked(data.get("now_end", True))
         self.tick_check.setChecked(data.get("tick_update", True))
 
@@ -3995,11 +4029,18 @@ class EntrySignalChart(QtWidgets.QWidget):
     def _auto_start_datetime(self) -> datetime:
         """「セッション開始」が指す時刻（指定セッション数だけ遡ったもの）。"""
         start: datetime = self._session_start(datetime.now(DB_TZ))
-        for _ in range(self.session_spin.value() - 1):
+        for _ in range(self.session_count() - 1):
             start = self._previous_session_start(start)
         return start
 
-    def _on_session_count_changed(self, _value: int) -> None:
+    def session_count(self) -> int:
+        """遡るセッション数。選べない値が入っていても落ちないようにする。"""
+        try:
+            return int(self.session_combo.currentText())
+        except (TypeError, ValueError):
+            return 1
+
+    def _on_session_count_changed(self, _value: str) -> None:
         """遡るセッション数が変わったら、開始時刻を引き直して読み込む。"""
         if not self.auto_start_check.isChecked():
             return
@@ -4094,6 +4135,39 @@ class EntrySignalChart(QtWidgets.QWidget):
                 return minutes
         return 10
 
+    @classmethod
+    def bucket_floor(cls, dt: datetime, minutes: int) -> datetime:
+        """その時刻が入る足の開始時刻。
+
+        株価チャートの BarGenerator と同じ切り方にして、同じ時間足なら
+        同じ足になるようにする。
+          分足   : minute - minute % 幅（時間はそのまま）
+          時間足 : hour - hour % 幅、分は0
+          日足   : 15:45 の引けで確定。引けを過ぎた足は次の営業日のぶん。
+        """
+        if minutes < 60:
+            return dt.replace(
+                minute=dt.minute - dt.minute % minutes, second=0, microsecond=0
+            )
+        if minutes < 24 * 60:
+            hours: int = minutes // 60
+            return dt.replace(
+                hour=dt.hour - dt.hour % hours, minute=0, second=0, microsecond=0
+            )
+
+        after_close: bool = (
+            dt.hour > cls.DAILY_END_HOUR
+            or (dt.hour == cls.DAILY_END_HOUR and dt.minute > cls.DAILY_END_MINUTE)
+        )
+        day: datetime = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        if after_close:
+            day += timedelta(days=1)
+        # 金曜夜間は土日をまたいで月曜の引けで確定するので、土日に落ちた
+        # 場合は次の営業日へ送る（土曜未明の足もここで月曜になる）。
+        while day.weekday() >= 5:
+            day += timedelta(days=1)
+        return day
+
     def _start_datetime(self) -> datetime:
         qdt: QtCore.QDateTime = self.start_edit.dateTime()
         py: datetime = qdt.toPython() if hasattr(qdt, "toPython") else qdt.toPyDateTime()
@@ -4137,10 +4211,7 @@ class EntrySignalChart(QtWidgets.QWidget):
 
         buckets: dict[datetime, dict] = {}
         for bar in bars:
-            floor: datetime = bar.datetime.replace(
-                minute=bar.datetime.minute - bar.datetime.minute % minutes,
-                second=0, microsecond=0
-            )
+            floor: datetime = self.bucket_floor(bar.datetime, minutes)
             b = buckets.get(floor)
             if b is None:
                 buckets[floor] = b = {
@@ -4321,6 +4392,13 @@ class EntrySignalChart(QtWidgets.QWidget):
         prev_day_option = getattr(self.option_engine, "prev_day_option", None)
         r["ref"] = (
             prev_day_option.get_prev_day_datetime(reference_dt)
+            if prev_day_option is not None else None
+        )
+        # 基準固定とは関係なく、その足が本来くらべる引け。区切り線を引く
+        # 位置（毎日17:00）を出すのに使う。
+        r["own_ref"] = (
+            r["ref"] if not self.fixed_ref_check.isChecked()
+            else prev_day_option.get_prev_day_datetime(r["dt"])
             if prev_day_option is not None else None
         )
 
@@ -4691,9 +4769,7 @@ class EntrySignalChart(QtWidgets.QWidget):
 
         minutes: int = self._interval_minutes()
         now: datetime = datetime.now(DB_TZ)
-        floor: datetime = now.replace(
-            minute=now.minute - now.minute % minutes, second=0, microsecond=0
-        )
+        floor: datetime = self.bucket_floor(now, minutes)
         last: dict = rows[-1]
         price: float = self._tick_price
 
@@ -4904,17 +4980,22 @@ class EntrySignalChart(QtWidgets.QWidget):
             ]
             (filled_bodies if up else hollow_bodies).append(verts)
 
+        # zorder は週線やσ線より前。陰線の中身は「透明」ではなく地色の黒で
+        # 塗る（株価チャートの CandleItem と同じ）。none のままだと、裏を
+        # 通っている週線やσの線が胴の中に透けて、足が読みにくくなる。
         if wick_segs:
             ax_fut.add_collection(LineCollection(
-                wick_segs, colors=wick_colors, linewidths=1.0
+                wick_segs, colors=wick_colors, linewidths=1.0, zorder=2.2
             ))
         if filled_bodies:
             ax_fut.add_collection(PolyCollection(
-                filled_bodies, facecolors=up_color, edgecolors=up_color, linewidths=1.0
+                filled_bodies, facecolors=up_color, edgecolors=up_color,
+                linewidths=1.0, zorder=2.2
             ))
         if hollow_bodies:
             ax_fut.add_collection(PolyCollection(
-                hollow_bodies, facecolors="none", edgecolors=down_color, linewidths=1.0
+                hollow_bodies, facecolors="#000000", edgecolors=down_color,
+                linewidths=1.0, zorder=2.2
             ))
 
         # ---- 前日先物（0σ）と ±0.5σ
@@ -5401,14 +5482,27 @@ class EntrySignalChart(QtWidgets.QWidget):
                     )
             prev_session = session
 
+        # ---- 週の変わり目の縦線（株価チャートの先物チャートと同じ）
+        # ISO週が1本前と変わった最初の足に白の実線。セッションの破線より
+        # 明るくして、何週ぶん見ているかを数えられるようにする。
+        prev_week: tuple | None = None
+        for i, r in enumerate(rows):
+            week: tuple = r["dt"].isocalendar()[:2]
+            if prev_week is not None and week != prev_week:
+                ax_fut.axvline(
+                    i, color="#ffffff", linewidth=1.6,
+                    linestyle="-", alpha=0.75, zorder=0.7,
+                )
+            prev_week = week
+
         # 基準が入れ替わった足の区切り線（株価チャートの iv_item と同じ）。
         # 基準固定がOFFのときだけ出る（ONなら全足同じ基準なので変わらない）。
         # 足の開始位置（左端）に引くので、セッション線（足の中心）とは重ならない。
         for i, r in enumerate(rows):
             if not i:
                 continue
-            reference = r.get("ref")
-            previous_reference = rows[i - 1].get("ref")
+            reference = r.get("own_ref")
+            previous_reference = rows[i - 1].get("own_ref")
             if reference and previous_reference and reference != previous_reference:
                 for ax in (panel for panel in (ax_iv, ax_vol) if panel is not None):
                     ax.axvline(
@@ -6276,6 +6370,43 @@ class PointFigureChart(QtWidgets.QWidget):
         self.canvas.blit(self.fig.bbox)
 
 
+class SimSetBorderDelegate(QtWidgets.QStyledItemDelegate):
+    """建玉の表で、1セットのまとまりを枠線で囲む。
+
+    row_bounds に {行番号: (上端か, 下端か)} を入れておくと、その行の
+    セルに上下の線を足す。左右の線は先頭列・最終列に引く。入っていない
+    行には何もしないので、セットになっていない行は枠無しのままになる。
+    """
+
+    BORDER_COLOR: tuple = (150, 170, 205)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.row_bounds: dict = {}
+        self.last_column: int = 0
+
+    def paint(self, painter, option, index) -> None:
+        super().paint(painter, option, index)
+
+        bounds = self.row_bounds.get(index.row())
+        if bounds is None:
+            return
+        top_edge, bottom_edge = bounds
+
+        rect = option.rect
+        painter.save()
+        painter.setPen(QtGui.QPen(QtGui.QColor(*self.BORDER_COLOR), 1))
+        if top_edge:
+            painter.drawLine(rect.topLeft(), rect.topRight())
+        if bottom_edge:
+            painter.drawLine(rect.bottomLeft(), rect.bottomRight())
+        if index.column() == 0:
+            painter.drawLine(rect.topLeft(), rect.bottomLeft())
+        if index.column() == self.last_column:
+            painter.drawLine(rect.topRight(), rect.bottomRight())
+        painter.restore()
+
+
 class PayoffDiagramChart(QtWidgets.QWidget):
     """ペイオフ図 - Position payoff diagram with IV adjustment."""
 
@@ -6384,15 +6515,15 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         self.sim_table.setVerticalScrollBarPolicy(
             QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOn
         )
-        # Reserve height so the positions table actually shows taller. A bare
-        # setMaximumHeight has no effect here — the result_table below has
-        # stretch=1 and absorbs all the extra vertical space, so the table
-        # stays at its small content-based size hint. setMinimumHeight forces
-        # the layout to give it the space。行の高さは18pxなので、
-        # 1400px でヘッダを除き約75行ぶん見える。
-        self.sim_table.setMinimumHeight(1400)
+        # 高さは「窓に残っている分」をもらう形にする。最小高さを大きく取ると、
+        # 窓がそれより低いときにレイアウトが削れず表が窓からはみ出し、下端の
+        # 横スクロールバーが隠れてしまう。縦スクロールバーも、はみ出したぶん
+        # まで含めた高さで目盛りを作るため、一番下まで下げても最終行が出ない。
+        # ここは潰れない程度（約10行）だけ確保し、残りは stretch に任せる。
+        self.sim_table.setMinimumHeight(200)
         # 窓を縦に広げたぶんも建玉の表に回す（これが無いと、増えた高さは
-        # 下の収益テーブル（stretch=1）が全部持っていく）。
+        # 下の収益テーブル（stretch=1）が全部持っていく）。sim_group は
+        # right_vbox に stretch=3 で入れてあるので、余白の3/4がここに来る。
         self.sim_table.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Expanding,
@@ -6406,6 +6537,11 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         self.sim_table.horizontalHeader().setDefaultSectionSize(55)
         self.sim_table.horizontalHeader().setMinimumSectionSize(30)
         self.sim_table.itemChanged.connect(self._on_sim_table_item_changed)
+        # セット（OP＋先物）を枠線で囲む。枠の範囲は _refresh_sim_table が
+        # 合計損益と同じ区切りで入れる。
+        self.sim_set_delegate: SimSetBorderDelegate = SimSetBorderDelegate(self.sim_table)
+        self.sim_set_delegate.last_column = len(sim_table_headers) - 1
+        self.sim_table.setItemDelegate(self.sim_set_delegate)
 
         add_btn: QtWidgets.QPushButton = QtWidgets.QPushButton("OP追加")
         add_btn.clicked.connect(self._add_sim_row)
@@ -6421,7 +6557,24 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             "枚数は左の指定どおり。Δ0.02 だけは、先物のデルタを打ち消す\n"
             "枚数をその場の実デルタから計算します。"
         )
-        preset_btn.clicked.connect(self._add_sim_preset_set)
+        preset_btn.clicked.connect(lambda: self._add_sim_preset_set("all"))
+        preset_d01_btn: QtWidgets.QPushButton = QtWidgets.QPushButton("Δ0.1セット")
+        preset_d01_btn.setToolTip(
+            "Δ0.1 の2組4本だけを積みます。\n"
+            "  Δ0.1 コール買い + 先物売り\n"
+            "  Δ0.1 プット買い + 先物買い\n"
+            "枚数は左の指定どおりです。"
+        )
+        preset_d01_btn.clicked.connect(lambda: self._add_sim_preset_set("d01"))
+        preset_d002_btn: QtWidgets.QPushButton = QtWidgets.QPushButton("Δ0.02セット")
+        preset_d002_btn.setToolTip(
+            "Δ0.02 の2組4本だけを積みます。\n"
+            "  Δ0.02 コール買い + 先物売り\n"
+            "  Δ0.02 プット買い + 先物買い\n"
+            "OPの枚数は、先物のデルタを打ち消す枚数をその場の実デルタから\n"
+            "計算します（先物の枚数は左の指定どおり）。"
+        )
+        preset_d002_btn.clicked.connect(lambda: self._add_sim_preset_set("d002"))
         del_btn: QtWidgets.QPushButton = QtWidgets.QPushButton("行削除")
         del_btn.clicked.connect(self._remove_sim_row)
         rss_btn: QtWidgets.QPushButton = QtWidgets.QPushButton("約定取込(RSS)")
@@ -6458,6 +6611,8 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         sim_param_hbox.addWidget(add_btn)
         sim_param_hbox.addWidget(add_futures_btn)
         sim_param_hbox.addWidget(preset_btn)
+        sim_param_hbox.addWidget(preset_d01_btn)
+        sim_param_hbox.addWidget(preset_d002_btn)
         sim_param_hbox.addWidget(del_btn)
         sim_param_hbox.addWidget(rss_btn)
 
@@ -6943,6 +7098,13 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             if option:
                 self.sim_strike_combo.addItem(str(int(option.strike_price)), index)
 
+    # セット追加ボタンの種類 → 見出し（警告ダイアログとログで使う）
+    PRESET_TITLES: dict = {
+        "all": "セット追加",
+        "d01": "Δ0.1セット",
+        "d002": "Δ0.02セット",
+    }
+
     def _add_sim_row(self) -> None:
         """Add an option position from live data."""
         chain_symbol: str = self.sim_month_combo.currentData()
@@ -7057,14 +7219,16 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             "close_price": 0.0,
         }
 
-    def _add_sim_preset_set(self) -> None:
-        """Δ0.1 と Δ0.02 の「OP買い＋先物」を4組まとめて積む。
+    def _add_sim_preset_set(self, kind: str = "all") -> None:
+        """「OP買い＋先物」の組をまとめて積む。
 
-        組み方:
+        組み方（kind="all" なら4組8本）:
           Δ0.1  コール買い ×n   + 先物 売り ×n
           Δ0.1  プット買い ×n   + 先物 買い ×n
           Δ0.02 コール買い ×N   + 先物 売り ×n
           Δ0.02 プット買い ×N   + 先物 買い ×n
+
+        kind が "d01" なら上の2組だけ、"d002" なら下の2組だけを積む。
 
         n は 枚数 の指定（OP側・先物側とも絶対値）。Δ0.02 の N だけは、
         先物 n 枚ぶんのデルタを打ち消す枚数を実デルタから出す:
@@ -7074,6 +7238,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         Δ0.02 は板が薄くデルタが日々変わるので、固定枚数ではなくその場の
         デルタから計算する。
         """
+        title: str = self.PRESET_TITLES.get(kind, "セット追加")
         portfolio: PortfolioData = self.option_engine.get_portfolio(self.portfolio_name)
 
         op_symbol: str = self.sim_month_combo.currentData() or ""
@@ -7081,7 +7246,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         op_chain: ChainData | None = portfolio.chains.get(op_symbol)
         fut_chain: ChainData | None = portfolio.chains.get(fut_symbol)
         if not op_chain or not fut_chain or not fut_chain.underlying:
-            self._warn_preset("限月の銘柄が揃っていません")
+            self._warn_preset(title, "限月の銘柄が揃っていません")
             return
 
         underlying: UnderlyingData = fut_chain.underlying
@@ -7096,17 +7261,19 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         calls: dict = {o.strike_price: o for o in op_chain.calls.values()}
         puts: dict = {o.strike_price: o for o in op_chain.puts.values()}
 
-        # (名前, 行使価格, 表から引く辞書, 先物の向き, 枚数の決め方)
+        # (組, 名前, 行使価格, 表から引く辞書, 先物の向き, 枚数の決め方)
         plan: list = [
-            ("Δ0.1 コール", op_chain.eris_c_strike, calls, -1, None),
-            ("Δ0.1 プット", op_chain.eris_p_strike, puts, +1, None),
-            ("Δ0.02 コール", op_chain.delta002_c_strike, calls, -1, futures_delta),
-            ("Δ0.02 プット", op_chain.delta002_p_strike, puts, +1, futures_delta),
+            ("d01", "Δ0.1 コール", op_chain.eris_c_strike, calls, -1, None),
+            ("d01", "Δ0.1 プット", op_chain.eris_p_strike, puts, +1, None),
+            ("d002", "Δ0.02 コール", op_chain.delta002_c_strike, calls, -1, futures_delta),
+            ("d002", "Δ0.02 プット", op_chain.delta002_p_strike, puts, +1, futures_delta),
         ]
+        if kind != "all":
+            plan = [row for row in plan if row[0] == kind]
 
         rows: list = []
         notes: list = []
-        for name, strike, table, side, hedge in plan:
+        for _group, name, strike, table, side, hedge in plan:
             option = table.get(strike) if strike else None
             if option is None:
                 notes.append(f"{name}: 行使価格が取れません")
@@ -7129,15 +7296,15 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             )
 
         if not rows:
-            self._warn_preset("\n".join(notes) or "追加できる建玉がありません")
+            self._warn_preset(title, "\n".join(notes) or "追加できる建玉がありません")
             return
 
         self.sim_positions.extend(rows)
         self._refresh_sim_table()
-        print("[セット追加] " + " | ".join(notes))
+        print(f"[{title}] " + " | ".join(notes))
 
-    def _warn_preset(self, message: str) -> None:
-        QtWidgets.QMessageBox.warning(self, "セット追加", message)
+    def _warn_preset(self, title: str, message: str) -> None:
+        QtWidgets.QMessageBox.warning(self, title, message)
 
     def _rss_file_path(self) -> str:
         """Path to rss_fop.xlsx inside the vnpy_optionmaster package."""
@@ -7880,6 +8047,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             return it
 
         n_rows: int = len(self.sim_positions)
+        row_bounds: dict = {}
         i: int = 0
         while i < n_rows:
             if row_is_option[i] and i + 1 < n_rows and not row_is_option[i + 1]:
@@ -7889,6 +8057,12 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 set_rows = [i]
                 i += 1
             leader: int = set_rows[0]
+
+            # 2行以上がひとまとまりのときだけ枠で囲む。単独の行に枠を
+            # 描くと、どれがセットなのか分からなくなる。
+            if len(set_rows) > 1:
+                for position, r in enumerate(set_rows):
+                    row_bounds[r] = (position == 0, position == len(set_rows) - 1)
 
             # 先物差: futures diff within the set (blank if no futures row)
             fut_vals: list[float] = [
@@ -7907,6 +8081,9 @@ class PayoffDiagramChart(QtWidgets.QWidget):
             )
 
         self.sim_table.blockSignals(False)
+
+        self.sim_set_delegate.row_bounds = row_bounds
+        self.sim_table.viewport().update()
 
         # Update total P&L label (unrealized)
         if total_pnl > 0:
