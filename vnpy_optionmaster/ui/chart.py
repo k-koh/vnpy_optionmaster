@@ -7765,6 +7765,8 @@ class PayoffDiagramChart(QtWidgets.QWidget):
 
     def _refresh_sim_table(self) -> None:
         """Rebuild the sim table display from self.sim_positions."""
+        # 銘柄が作り直されていたら、古い実体のまま表示しないよう繋ぎ直す。
+        self._resync_sim_instruments()
         # Identify the cell currently being edited (if any) so the live-price
         # refresh doesn't clobber the user's in-progress input.
         editing_row: int = -1
@@ -8200,9 +8202,33 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         self._refresh_sim_table()
         self._run_sim_analysis()
 
+    def _resync_sim_instruments(self) -> None:
+        """各行の OptionData / UnderlyingData を、今エンジンにある実体に繋ぎ直す。
+
+        銘柄が kabus の窓を出入りすると OptionMaster 側で作り直されるため、
+        建玉を追加したときに掴んだ実体は、いずれ更新が来なくなる。vt_symbol
+        から引き直せば、作り直されたあとも最新を見続けられる。
+
+        エンジンに無い銘柄（窓から外れたまま戻っていない）は掴んだままに
+        する。最後に見えていた値を残すためで、これは今までの挙動と同じ。
+        """
+        for pos in self.sim_positions:
+            vt_symbol: str = pos.get("vt_symbol", "")
+            if not vt_symbol:
+                continue
+            instrument = self.option_engine.get_instrument(vt_symbol)
+            if instrument is None:
+                continue
+            if pos["kind"] == "futures":
+                if isinstance(instrument, UnderlyingData):
+                    pos["underlying_data"] = instrument
+            elif isinstance(instrument, OptionData):
+                pos["option_data"] = instrument
+
     def _get_sim_positions(self) -> list[dict]:
         """Return enabled simulation positions with live data.
         Closed positions are excluded from greek analysis (delta/gamma/theta/vega)."""
+        self._resync_sim_instruments()
         return [
             p for p in self.sim_positions
             if p.get("enabled", True) and not p.get("closed", False)
