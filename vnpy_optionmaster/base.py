@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections.abc import Callable
 from types import ModuleType
 from functools import lru_cache
@@ -1145,17 +1145,75 @@ class PreviousDayOptionData:
         for date in self.sorted_dates:
             if date >= dt:
                 continue
-            if date.weekday() >= 5:
-                # 土日ラベルは金曜夜間セッションぶん。次の営業日の一部であって
-                # 「前日」ではないので飛ばす。
-                continue
-            if self.trading_dates and date.date() not in self.trading_dates:
-                # 祝日ラベル（連休前の夜間セッションぶん）も同じ理由で飛ばす。
+            if not self.is_session_label(date):
                 continue
             found += 1
             if found >= back:
                 return date
         return None
+
+    def is_session_label(self, date: datetime) -> bool:
+        """そのスナップショットの日付が、日中立会のあった営業日のものか。
+
+        土日ラベルは金曜夜間セッションぶん、祝日ラベルは連休前の夜間ぶんで、
+        どちらも次の営業日の一部。「前日」や「週の初日」として拾うと、同じ
+        営業日の夜間と比べることになるので外す。
+        """
+        if date.weekday() >= 5:
+            return False
+        if self.trading_dates and date.date() not in self.trading_dates:
+            return False
+        return True
+
+    def get_week_start_datetime(self, dt: datetime) -> datetime | None:
+        """dt が属する週（月曜始まり）の、最初のスナップショットの時刻。
+
+        JPXの建玉残高表の前週比は「当該週の初日」と比べているので、それに
+        合わせる。週の初日のぶんがまだ無い（＝週明け初日そのもの）ときは、
+        その前にある最後のスナップショット＝先週末を基準にする。
+        """
+        week_start: datetime = (dt - timedelta(days=dt.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        candidates: list[datetime] = [
+            date for date in self.sorted_dates
+            if date < dt and self.is_session_label(date)
+        ]
+        if not candidates:
+            return None
+        in_week: list[datetime] = [d for d in candidates if d >= week_start]
+        if in_week:
+            return min(in_week)
+        return max(candidates)
+
+    def get_open_interest_curve(
+        self,
+        snapshot_dt: datetime | None,
+        chain: "ChainData"
+    ) -> tuple[dict[float, float], dict[float, float]]:
+        """その時刻のスナップショットの建玉残高（行使価格 → 残高）。
+
+        戻り値は (コール, プット)。値が入っていない銘柄は辞書に入れない
+        （0 と「記録が無い」を区別して、前日比を出せない行を空欄にするため）。
+        """
+        call_oi: dict[float, float] = {}
+        put_oi: dict[float, float] = {}
+        if snapshot_dt is None:
+            return call_oi, put_oi
+
+        day_bars: dict = self.bars.get(snapshot_dt, {})
+
+        for call in chain.calls.values():
+            bar = day_bars.get(call.vt_symbol)
+            if bar is not None and bar.open_interest:
+                call_oi[call.strike_price] = bar.open_interest
+
+        for put in chain.puts.values():
+            bar = day_bars.get(put.vt_symbol)
+            if bar is not None and bar.open_interest:
+                put_oi[put.strike_price] = bar.open_interest
+
+        return call_oi, put_oi
 
     def add_bar(self, bar: BarData) -> None:
         day_datetime = bar.datetime

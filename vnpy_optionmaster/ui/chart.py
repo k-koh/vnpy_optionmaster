@@ -51,9 +51,331 @@ SLIDE_RGB: tuple = (255, 170, 51)     # 滑り
 DECOMP_FRONT_ALPHA: int = 130
 
 
+class OptionDailyHistoryChart(QtWidgets.QWidget):
+    """1銘柄の日次推移（建玉残高・建玉前日比・出来高）。
+
+    IVカーブの中段パネルでバーを押すと開く。データは日足スナップショット
+    （毎営業日15:45）をそのまま並べたもの。建玉残高はJPXが引け後に1日1回
+    出す値なので、この粒度で十分。
+    """
+
+    CALL_COLOR: str = "#ffa500"
+    PUT_COLOR: str = "#9b7bff"
+    DAY_CHOICES: tuple = (10, 20, 30, 60, 90, 120, 250)
+
+    def __init__(
+        self,
+        option_engine: OptionEngine,
+        chain_symbol: str,
+        strike: float,
+        option_type: int,
+    ) -> None:
+        """option_type: 1=コール, -1=プット, 0=両方"""
+        super().__init__()
+
+        self.option_engine: OptionEngine = option_engine
+        self.chain_symbol: str = chain_symbol
+        self.strike: float = strike
+        self.option_type: int = option_type
+        self.month: str = chain_symbol.split(".")[0]
+
+        self.curves: dict = {}
+        self.cursor_lines: dict = {}
+        self.cursor_labels: dict = {}
+        # カーソル用。reload のたびに引き直す。
+        #   dates      … 表示している営業日（X=0,1,2… に対応）
+        #   values[i]  … {段のキー: {系列名: 値}}
+        self.dates: list = []
+        self.values: list = []
+        self.series_labels: list = []
+        self.init_ui()
+        self.reload()
+
+    # ------------------------------------------------------------------ UI
+    def init_ui(self) -> None:
+        cp_text: str = {1: "コール", -1: "プット"}.get(self.option_type, "コール/プット")
+        self.setWindowTitle(f"{self.month} {cp_text} {self.strike:.0f} 日次推移")
+        self.resize(900, 700)
+
+        self.days_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        for days in self.DAY_CHOICES:
+            self.days_combo.addItem(f"{days}日", days)
+        self.days_combo.setCurrentIndex(2)
+        self.days_combo.currentIndexChanged.connect(lambda *_: self.reload())
+
+        reload_button: QtWidgets.QPushButton = QtWidgets.QPushButton("再読込")
+        reload_button.clicked.connect(self.reload)
+
+        self.status_label: QtWidgets.QLabel = QtWidgets.QLabel("")
+
+        hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        hbox.addWidget(QtWidgets.QLabel("期間"))
+        hbox.addWidget(self.days_combo)
+        hbox.addWidget(reload_button)
+        hbox.addWidget(self.status_label)
+        hbox.addStretch()
+
+        window: pg.GraphicsLayoutWidget = pg.GraphicsLayoutWidget()
+        self.plots: dict = {}
+        for row, (key, title) in enumerate(
+            (("oi", "建玉残高"), ("oi_diff", "建玉前日比"), ("volume", "出来高"))
+        ):
+            plot = window.addPlot(row=row, col=0, title=title)
+            plot.showGrid(x=True, y=True)
+            plot.setLabel("left", title)
+            plot.setMenuEnabled(False)
+            plot.setMouseEnabled(False, False)
+            if row:
+                plot.setXLink(self.plots["oi"])
+            if row == 1:
+                # 前日比は0をまたぐので、どこが増減の境かを分かるようにする。
+                plot.addLine(y=0, pen=pg.mkPen("#808080", width=1))
+            self.plots[key] = plot
+
+            # カーソル。3段とも同じ日に合わせ、各段にその日の値を出す。
+            vline = pg.InfiniteLine(
+                angle=90, movable=False,
+                pen=pg.mkPen(color=(221, 221, 221, 140), width=1),
+            )
+            plot.addItem(vline, ignoreBounds=True)
+            vline.hide()
+            self.cursor_lines[key] = vline
+
+            label = pg.TextItem(color="#dddddd", anchor=(0, 0))
+            label.setFont(QtGui.QFont("", 10))
+            label.setParentItem(plot.vb)
+            label.setPos(8, 4)
+            label.hide()
+            self.cursor_labels[key] = label
+
+        self.plots["oi"].addLegend(colCount=2)
+
+        self.cursor_proxy = pg.SignalProxy(
+            self.plots["oi"].scene().sigMouseMoved,
+            rateLimit=60, slot=self._on_mouse_move,
+        )
+
+        vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
+        vbox.addLayout(hbox)
+        vbox.addWidget(window)
+        self.setLayout(vbox)
+
+    # ---------------------------------------------------------------- data
+    def option_symbols(self) -> list:
+        """この窓で出す (銘柄, 表示名, 色)。"""
+        wanted: tuple = (1, -1) if self.option_type == 0 else (self.option_type,)
+        result: list = []
+        for option_type in wanted:
+            cp_char: str = "C" if option_type > 0 else "P"
+            label: str = "コール" if option_type > 0 else "プット"
+            color: str = self.CALL_COLOR if option_type > 0 else self.PUT_COLOR
+            result.append((
+                f"{self.month}-{cp_char}-{self.strike:.0f}", label, color
+            ))
+        return result
+
+    def session_dates(self) -> set:
+        """日中立会があった日付（engine が先物1分足から作ったもの）。"""
+        prev_day_data = getattr(self.option_engine, "prev_day_option", None)
+        return set(getattr(prev_day_data, "trading_dates", None) or set())
+
+    def load_bars(self, symbol: str, days: int) -> list:
+        """日足スナップショットを古い順に。立会のなかった日付は外す。
+
+        スナップショットの日付は書いた時点で想定した翌営業日なので、金曜
+        夜間セッションぶんが土曜、連休前の夜間ぶんが祝日のラベルになる。
+        そのまま並べると、同じ営業日が2回出てきて前日比がずれる。
+        """
+        end: datetime = datetime.now(DB_TZ)
+        start: datetime = end - timedelta(days=days * 3 + 20)
+        database: BaseDatabase = get_database()
+        bars: list = database.load_bar_data(
+            symbol=symbol,
+            exchange=Exchange.JPX,
+            interval=Interval.DAILY,
+            start=start,
+            end=end,
+        )
+
+        sessions: set = self.session_dates()
+        # 祝日の判定は engine が見ている範囲でしかできない。それより古い
+        # 日付は土日だけで判定する。
+        oldest = min(sessions) if sessions else None
+
+        kept: list = []
+        for bar in bars:
+            date = bar.datetime.date()
+            if date.weekday() >= 5:
+                continue
+            if oldest is not None and date >= oldest and date not in sessions:
+                continue
+            kept.append(bar)
+        return kept[-days:] if len(kept) > days else kept
+
+    # -------------------------------------------------------------- cursor
+    def _hide_cursor(self) -> None:
+        for key in self.plots:
+            self.cursor_lines[key].hide()
+            self.cursor_labels[key].hide()
+
+    def _on_mouse_move(self, event) -> None:
+        """3段とも、マウスに一番近い営業日に縦線を合わせて値を出す。"""
+        if not self.dates:
+            return
+        pos = event[0]
+        inside = next(
+            (p for p in self.plots.values() if p.sceneBoundingRect().contains(pos)),
+            None,
+        )
+        if inside is None:
+            self._hide_cursor()
+            return
+
+        # 日足なので、棒と棒の間でも値が消えないよう一番近い日に吸い付かせる。
+        x: float = inside.vb.mapSceneToView(pos).x()
+        index: int = min(max(int(round(x)), 0), len(self.dates) - 1)
+        date_text: str = self.dates[index].strftime("%m/%d(%a)")
+        row: dict = self.values[index]
+
+        for key, plot in self.plots.items():
+            self.cursor_lines[key].setPos(index)
+            self.cursor_lines[key].show()
+
+            parts: list = []
+            for label in self.series_labels:
+                value = row[key].get(label)
+                if value is None:
+                    parts.append(f"{label} -")
+                elif key == "oi_diff":
+                    parts.append(f"{label} {value:+,.0f}")
+                else:
+                    parts.append(f"{label} {value:,.0f}")
+            text: str = "  ".join(parts)
+            self.cursor_labels[key].setText(
+                f"{date_text}  {text}" if key == "oi" else text
+            )
+            self.cursor_labels[key].show()
+
+    def reload(self) -> None:
+        """引き直して描く。"""
+        days: int = self.days_combo.currentData() or 30
+        series: list = []
+        for symbol, label, color in self.option_symbols():
+            bars = self.load_bars(symbol, days)
+            if bars:
+                series.append((symbol, label, color, bars))
+
+        for key, plot in self.plots.items():
+            plot.clear()
+            # clear() はカーソルの縦線も消すので、入れ直す。
+            plot.addItem(self.cursor_lines[key], ignoreBounds=True)
+        self.plots["oi_diff"].addLine(y=0, pen=pg.mkPen("#808080", width=1))
+        self._hide_cursor()
+
+        self.dates = []
+        self.values = []
+        self.series_labels = []
+
+        if not series:
+            self.status_label.setText("日足スナップショットがありません")
+            return
+
+        # 日付の目盛りは、出ている銘柄の日付をまとめたもの。コールとプットで
+        # 記録のある日が違う（行使価格ごとに記録の窓が動く）ので、まとめて
+        # から改めて期間ぶんに切る。銘柄ごとに切ると、期間より長い軸になる。
+        dates: list = sorted({bar.datetime.date() for _, _, _, bars in series for bar in bars})
+        if len(dates) > days:
+            dates = dates[-days:]
+            oldest_date = dates[0]
+            series = [
+                (symbol, label, color, [b for b in bars if b.datetime.date() >= oldest_date])
+                for symbol, label, color, bars in series
+            ]
+            series = [item for item in series if item[3]]
+            if not series:
+                self.status_label.setText("日足スナップショットがありません")
+                return
+        index_of: dict = {date: i for i, date in enumerate(dates)}
+        ticks: list = [(i, date.strftime("%m/%d")) for i, date in enumerate(dates)]
+        step: int = max(1, len(ticks) // 12)
+        for plot in self.plots.values():
+            plot.getAxis("bottom").setTicks([ticks[::step]])
+
+        self.dates = dates
+        self.series_labels = [label for _, label, _, _ in series]
+        self.values = [
+            {"oi": {}, "oi_diff": {}, "volume": {}} for _ in dates
+        ]
+
+        width: float = 0.8 / max(1, len(series))
+        for offset, (symbol, label, color, bars) in enumerate(series):
+            xs: list = [index_of[bar.datetime.date()] for bar in bars]
+            oi: list = [bar.open_interest for bar in bars]
+            volume: list = [bar.volume for bar in bars]
+            # 建玉前日比は、1本前のスナップショットとの差。間が飛んでいる日と、
+            # どちらかが0（記録が無い）の日は出さない。記録を取り始めた日に
+            # 0からの差が立って、実際の増減が読めなくなるため。
+            diff_x: list = []
+            diff_y: list = []
+            for i in range(1, len(bars)):
+                if xs[i] - xs[i - 1] != 1:
+                    continue
+                if not oi[i] or not oi[i - 1]:
+                    continue
+                diff_x.append(xs[i])
+                diff_y.append(oi[i] - oi[i - 1])
+
+            for i, bar in enumerate(bars):
+                row = self.values[xs[i]]
+                row["oi"][label] = oi[i]
+                row["volume"][label] = volume[i]
+            for x, value in zip(diff_x, diff_y):
+                self.values[x]["oi_diff"][label] = value
+
+            pen = pg.mkPen(color=color, width=2)
+            self.plots["oi"].plot(
+                xs, oi, pen=pen, symbol="o", symbolSize=6,
+                symbolBrush=color, name=f"{label} {self.strike:.0f}",
+            )
+            shift: float = (offset - (len(series) - 1) / 2.0) * width
+            self.plots["oi_diff"].addItem(pg.BarGraphItem(
+                x=[x + shift for x in diff_x], height=diff_y,
+                width=width, brush=pg.mkBrush(color),
+            ))
+            self.plots["volume"].addItem(pg.BarGraphItem(
+                x=[x + shift for x in xs], height=volume,
+                width=width, brush=pg.mkBrush(color),
+            ))
+
+        last_bars = series[0][3]
+        self.status_label.setText(
+            f"{len(dates)}営業日  "
+            f"{dates[0].strftime('%Y/%m/%d')} 〜 {dates[-1].strftime('%Y/%m/%d')}  "
+            f"（最新 建玉 {last_bars[-1].open_interest:,.0f} / "
+            f"出来高 {last_bars[-1].volume:,.0f}）"
+        )
+
+
 class OptionVolatilityChart(QtWidgets.QWidget):
 
     signal_timer: QtCore.Signal = QtCore.Signal(Event)
+
+    # 中段パネルの表示内容。(表示名, キー)
+    VOLUME_MODES: tuple = (
+        ("出来高", "volume"),
+        ("建玉残高", "oi"),
+        ("建玉前日比", "oi_d1"),
+        ("建玉前週比", "oi_w1"),
+    )
+    # 建玉パネルで数字を添えるバーの本数（コール・プットそれぞれの上位）
+    OI_LABEL_COUNT: int = 10
+    # パネルの見出しと縦軸の名前
+    VOLUME_MODE_TITLES: dict = {
+        "volume": "出来高",
+        "oi": "建玉残高",
+        "oi_d1": "建玉前日比",
+        "oi_w1": "建玉前週比",
+    }
 
     def __init__(self, option_engine: OptionEngine, portfolio_name: str) -> None:
         """"""
@@ -86,6 +408,16 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.prev_underlying_prices: dict[str, float] = {}
         self._prev_underlying_loaded_date: str | None = None
         self.total_volume_bars: dict[str, pg.BarGraphItem] = {}
+        # 建玉残高（および前日比・前週比）。コールとプットは合算せず、
+        # 行使価格の右と左に分けて並べる。
+        self.oi_call_bars: dict[str, pg.BarGraphItem] = {}
+        self.oi_put_bars: dict[str, pg.BarGraphItem] = {}
+        # 中段パネルに今描いてあるバーの位置。クリックした場所から銘柄を
+        # 引くのに使う。(x座標, 限月, 行使価格, 1=C/-1=P/0=両方)
+        self._volume_bar_hits: list = []
+        self._volume_bar_width: float = 100.0
+        # 開いた日次推移の窓。参照を持っておかないと即座に閉じてしまう。
+        self.history_windows: list = []
 
         self.prev_call_curves: dict[str, pg.PlotCurveItem] = {}
         self.prev_put_curves: dict[str, pg.PlotCurveItem] = {}
@@ -164,6 +496,25 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.decomp_check.toggled.connect(self._on_decomp_toggled)
         hbox.addWidget(self.decomp_check)
 
+        # 中段パネルに何を出すか。出来高と建玉残高は同じ場所を使い回す。
+        self.volume_mode_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        for label, key in self.VOLUME_MODES:
+            self.volume_mode_combo.addItem(label, key)
+        self.volume_mode_combo.setToolTip(
+            "中段のパネルに出すものを選びます。\n"
+            "  出来高       本日の約定枚数（コール＋プットの合計）\n"
+            "  建玉残高     銘柄ごとの建玉残高（コール／プット別）\n"
+            "  建玉前日比   前営業日の引けからの増減\n"
+            "  建玉前週比   当該週の初日からの増減\n"
+            "建玉残高はJPXが引け後に1日1回出す値なので、前日比・前週比は"
+            "日足スナップショットに記録したぶんから計算します。"
+        )
+        self.volume_mode_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self.volume_mode_combo.currentIndexChanged.connect(self._on_volume_mode_changed)
+        hbox.addWidget(self.volume_mode_combo)
+
         # Re-read the previous session's option data (e.g. after editing bars
         # in the database) without restarting the app.
         self.reload_prev_button: QtWidgets.QPushButton = QtWidgets.QPushButton(
@@ -221,6 +572,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.volume_chart.setMenuEnabled(False)
         self.volume_chart.setMouseEnabled(False, False)
         self.volume_chart.setMaximumHeight(200)
+        # バーを押したら、その銘柄の日次推移を別窓で出す。
+        self.volume_chart.scene().sigMouseClicked.connect(self._on_volume_chart_clicked)
 
         graphics_window.nextRow()
 
@@ -263,6 +616,93 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
         self.update_curve_data()
         self.update_curve_visible() # Ensure visibility is updated for newly created items
+
+    def volume_mode(self) -> str:
+        """中段パネルに何を出すか（"volume" / "oi" / "oi_d1" / "oi_w1"）。"""
+        return self.volume_mode_combo.currentData() or "volume"
+
+    def _on_volume_mode_changed(self, *_args) -> None:
+        """中段パネルの表示内容を切り替える。"""
+        title: str = self.VOLUME_MODE_TITLES.get(self.volume_mode(), "出来高")
+        self.volume_chart.setTitle(title)
+        self.volume_chart.setLabel("left", title)
+        self.update_curve_data()
+        self.update_curve_visible()
+
+    def _open_interest_series(
+        self, chain: "ChainData", mode: str
+    ) -> tuple[dict[float, float], dict[float, float]]:
+        """行使価格 → 建玉残高（または前日比・前週比）を、コール／プットで返す。
+
+        残高そのものは今のティックから、比較対象は日足スナップショット
+        （15:45）から取る。建玉残高はJPXが引け後に1日1回出す値なので、
+        日足の粒度で足りる。
+
+        比較対象の記録が無い銘柄は辞書に入れない。0 として描くと「増減なし」
+        と区別がつかなくなるため。
+        """
+        call_now: dict[float, float] = {}
+        put_now: dict[float, float] = {}
+        for call in chain.calls.values():
+            if call.tick and call.tick.open_interest:
+                call_now[call.strike_price] = call.tick.open_interest
+        for put in chain.puts.values():
+            if put.tick and put.tick.open_interest:
+                put_now[put.strike_price] = put.tick.open_interest
+
+        if mode == "oi":
+            return call_now, put_now
+
+        prev_day_data = self.option_engine.prev_day_option
+        if not prev_day_data:
+            return {}, {}
+
+        now: datetime = datetime.now(DB_TZ)
+        if mode == "oi_d1":
+            base_dt = prev_day_data.get_prev_day_datetime(now)
+        else:
+            base_dt = prev_day_data.get_week_start_datetime(now)
+        call_base, put_base = prev_day_data.get_open_interest_curve(base_dt, chain)
+
+        call_diff: dict[float, float] = {
+            k: v - call_base[k] for k, v in call_now.items() if k in call_base
+        }
+        put_diff: dict[float, float] = {
+            k: v - put_base[k] for k, v in put_now.items() if k in put_base
+        }
+        return call_diff, put_diff
+
+    def _on_volume_chart_clicked(self, event) -> None:
+        """中段パネルのバーを押したら、その銘柄の日次推移を別窓で出す。
+
+        シーンはIVカーブと共用なので、中段パネルの中かどうかを先に見る。
+        バーは行使価格の左右にずらして描いてあるので、押された位置に一番
+        近いバーを探せば、コールかプットかまで決まる。
+        """
+        if not self._volume_bar_hits:
+            return
+        if event.button() != QtCore.Qt.MouseButton.LeftButton:
+            return
+        scene_pos = event.scenePos()
+        if not self.volume_chart.sceneBoundingRect().contains(scene_pos):
+            return
+
+        point = self.volume_chart.vb.mapSceneToView(scene_pos)
+        x: float = point.x()
+        bar_x, chain_symbol, strike, option_type = min(
+            self._volume_bar_hits, key=lambda hit: abs(hit[0] - x)
+        )
+        # 近くに何も無いところを押したときは開かない。
+        if abs(bar_x - x) > max(self._volume_bar_width, 1.0):
+            return
+
+        window: OptionDailyHistoryChart = OptionDailyHistoryChart(
+            self.option_engine, chain_symbol, strike, option_type
+        )
+        window.show()
+        self.history_windows.append(window)
+        # 閉じた窓はためない。
+        self.history_windows = [w for w in self.history_windows if w.isVisible()]
 
     def _on_decomp_toggled(self, checked: bool) -> None:
         """Switch the bottom subplot between 前日比IV and its decomposition."""
@@ -451,6 +891,23 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         )
         self.volume_chart.addItem(self.total_volume_bars[chain_symbol])
 
+        # 建玉残高はコール／プットを分けて出す。限月の色をそのまま使い、
+        # プットは薄くして区別する（前日比IVの正負バーと同じ描き分け）。
+        self.oi_call_bars[chain_symbol] = pg.BarGraphItem(
+            x=[], height=[], width=1.0,
+            brush=pg.mkBrush(color=color),
+            name=f"{symbol} コール建玉",
+        )
+        self.oi_put_bars[chain_symbol] = pg.BarGraphItem(
+            x=[], height=[], width=1.0,
+            brush=pg.mkBrush(color=color + (100,)),
+            name=f"{symbol} プット建玉",
+        )
+        self.volume_chart.addItem(self.oi_call_bars[chain_symbol])
+        self.volume_chart.addItem(self.oi_put_bars[chain_symbol])
+        self.oi_call_bars[chain_symbol].hide()
+        self.oi_put_bars[chain_symbol].hide()
+
         self.iv_diff_pos_bars[chain_symbol] = pg.BarGraphItem(
             x=[],
             height=[],
@@ -511,6 +968,14 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             self.total_volume_bars[chain_symbol], symbol,
         )
         self._register_legend(
+            chain_symbol, self.volume_chart,
+            self.oi_call_bars[chain_symbol], f"{symbol} コール建玉",
+        )
+        self._register_legend(
+            chain_symbol, self.volume_chart,
+            self.oi_put_bars[chain_symbol], f"{symbol} プット建玉",
+        )
+        self._register_legend(
             chain_symbol, self.iv_diff_chart,
             self.iv_diff_pos_bars[chain_symbol], symbol,
         )
@@ -544,9 +1009,22 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             if checkbox is not None and not checkbox.isChecked():
                 continue
             for plot, item, label in self._legend_entries[chain_symbol]:
+                if plot is self.volume_chart and not self._volume_legend_wanted(item):
+                    # 中段パネルは出来高か建玉のどちらかしか描かない。描いて
+                    # いない方を凡例に残すと、⊘ のアイコンだけが並ぶ。
+                    continue
                 legend = getattr(plot, "legend", None)
                 if legend is not None:
                     legend.addItem(item, label)
+
+    def _volume_legend_wanted(self, item: pg.BarGraphItem) -> bool:
+        """そのバーが、いま選ばれている中段パネルのモードのものか。"""
+        is_volume_bar: bool = any(
+            item is bar for bar in self.total_volume_bars.values()
+        )
+        if self.volume_mode() == "volume":
+            return is_volume_bar
+        return not is_volume_bar
 
     def update_curve_data(self) -> None:
         """"""
@@ -556,6 +1034,11 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         max_volumes: float = 0.0
         max_iv_diff_pos: float = 0.0
         min_iv_diff_neg: float = 0.0
+        # 建玉系モードの縦軸。前日比・前週比はマイナスにもなる。
+        mode: str = self.volume_mode()
+        oi_max: float = 0.0
+        oi_min: float = 0.0
+        self._volume_bar_hits = []
 
         # First, calculate max values from selected chains for text label offsetting
         for chain in portfolio.chains.values():
@@ -582,6 +1065,13 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             total_volumes = [call_volume_map.get(s, 0) + put_volume_map.get(s, 0) for s in all_strikes]
             if total_volumes:
                 max_volumes = max(max_volumes, max(total_volumes))
+
+            if mode != "volume":
+                oi_call_map, oi_put_map = self._open_interest_series(chain, mode)
+                oi_values: list[float] = list(oi_call_map.values()) + list(oi_put_map.values())
+                if oi_values:
+                    oi_max = max(oi_max, max(oi_values))
+                    oi_min = min(oi_min, min(oi_values))
 
             # Calculate IV difference
             prev_call_ivs: list = []
@@ -1018,33 +1508,99 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
             bar_width = strike_step * 0.25 if strike_step else 100
 
-            self.total_volume_bars[chain.chain_symbol].setOpts(
-                x=sorted_volume_strikes, height=sorted_total_volumes, width=bar_width
-            )
-
-            # Add text labels for Volume bars
             chain_color = self.chain_colors[chain.chain_symbol]
             font = QtGui.QFont()
             font.setPointSize(8)
 
-            # Calculate dynamic offset based on the maximum volume
-            if max_volumes > 0:
-                volume_text_offset = max_volumes * text_offset_scale
-            else:
-                volume_text_offset = 20 # Default offset
-
-            for strike, volume in zip(sorted_volume_strikes, sorted_total_volumes):
-                if volume == 0:
-                    continue
-                text_item = pg.TextItem(
-                    text=f"{volume:.0f}",
-                    color=chain_color,
-                    anchor=(0.5, 0)
+            self._volume_bar_width = bar_width
+            if mode == "volume":
+                self.total_volume_bars[chain.chain_symbol].setOpts(
+                    x=sorted_volume_strikes, height=sorted_total_volumes, width=bar_width
                 )
-                text_item.setFont(font)
-                text_item.setPos(strike, volume + volume_text_offset) # Position with dynamic offset
-                self.volume_chart.addItem(text_item)
-                self.total_volume_text_items[chain.chain_symbol].append(text_item)
+                # 出来高はコールとプットを足した1本なので、押されたら両方出す。
+                for strike in sorted_volume_strikes:
+                    self._volume_bar_hits.append(
+                        (strike, chain.chain_symbol, strike, 0)
+                    )
+
+                # Calculate dynamic offset based on the maximum volume
+                if max_volumes > 0:
+                    volume_text_offset = max_volumes * text_offset_scale
+                else:
+                    volume_text_offset = 20 # Default offset
+
+                for strike, volume in zip(sorted_volume_strikes, sorted_total_volumes):
+                    if volume == 0:
+                        continue
+                    text_item = pg.TextItem(
+                        text=f"{volume:.0f}",
+                        color=chain_color,
+                        anchor=(0.5, 0)
+                    )
+                    text_item.setFont(font)
+                    text_item.setPos(strike, volume + volume_text_offset) # Position with dynamic offset
+                    self.volume_chart.addItem(text_item)
+                    self.total_volume_text_items[chain.chain_symbol].append(text_item)
+            else:
+                # 建玉はコールとプットを合算せず、行使価格の右と左に並べる。
+                # 同じ行使価格でも残高は大きく違うので、合計では読めない。
+                oi_call_map, oi_put_map = self._open_interest_series(chain, mode)
+                half: float = bar_width / 2.0
+                call_x: list = sorted(oi_call_map)
+                put_x: list = sorted(oi_put_map)
+                self.oi_call_bars[chain.chain_symbol].setOpts(
+                    x=[k + half for k in call_x],
+                    height=[oi_call_map[k] for k in call_x],
+                    width=bar_width,
+                )
+                self.oi_put_bars[chain.chain_symbol].setOpts(
+                    x=[k - half for k in put_x],
+                    height=[oi_put_map[k] for k in put_x],
+                    width=bar_width,
+                )
+                for strike in call_x:
+                    self._volume_bar_hits.append(
+                        (strike + half, chain.chain_symbol, strike, 1)
+                    )
+                for strike in put_x:
+                    self._volume_bar_hits.append(
+                        (strike - half, chain.chain_symbol, strike, -1)
+                    )
+
+                span: float = max(abs(oi_max), abs(oi_min)) or 1.0
+                oi_text_offset: float = span * text_offset_scale
+                # 出来高と違って建玉はほぼ全行使価格に付くので、全部に数字を
+                # 添えると200pxの帯が文字で埋まる。目立つものだけ書く。
+                labelled: set = set()
+                for table in (oi_call_map, oi_put_map):
+                    labelled.update(
+                        sorted(table, key=lambda k: abs(table[k]), reverse=True)[
+                            : self.OI_LABEL_COUNT
+                        ]
+                    )
+                for xs, table, offset in (
+                    (call_x, oi_call_map, half),
+                    (put_x, oi_put_map, -half),
+                ):
+                    for strike in xs:
+                        if strike not in labelled:
+                            continue
+                        value: float = table[strike]
+                        if not value:
+                            continue
+                        above: bool = value >= 0
+                        text_item = pg.TextItem(
+                            text=f"{value:+,.0f}" if mode != "oi" else f"{value:,.0f}",
+                            color=chain_color,
+                            anchor=(0.5, 0 if above else 1),
+                        )
+                        text_item.setFont(font)
+                        text_item.setPos(
+                            strike + offset,
+                            value + (oi_text_offset if above else -oi_text_offset),
+                        )
+                        self.volume_chart.addItem(text_item)
+                        self.total_volume_text_items[chain.chain_symbol].append(text_item)
 
             bar_width_diff = bar_width
             self.iv_diff_pos_bars[chain.chain_symbol].setOpts(x=pos_strikes, height=pos_heights, width=bar_width_diff)
@@ -1231,8 +1787,16 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 self.iv_diff_neg_text_items[chain.chain_symbol].append(text_item)
 
         # Set Y-range for volume chart to provide padding for text labels
-        y_max_volume = max_volumes * 1.5 if max_volumes > 0 else 10
-        self.volume_chart.setYRange(0, y_max_volume)
+        if mode == "volume":
+            y_max_volume = max_volumes * 1.5 if max_volumes > 0 else 10
+            self.volume_chart.setYRange(0, y_max_volume)
+        elif mode == "oi":
+            self.volume_chart.setYRange(0, oi_max * 1.5 if oi_max > 0 else 10)
+        else:
+            # 前日比・前週比は0をまたぐので、上下に同じだけ余白を取る。
+            span = max(abs(oi_max), abs(oi_min))
+            pad = span * 0.5 if span > 0 else 10
+            self.volume_chart.setYRange(oi_min - pad, oi_max + pad)
 
         # Set Y-range for IV diff chart to provide padding for text labels
         padding_pos = max_iv_diff_pos * 0.5 if max_iv_diff_pos > 0 else 0.5
@@ -1268,6 +1832,9 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             underlying_line = self.underlying_price_lines[chain_symbol]
             prev_underlying_line = self.prev_underlying_price_lines[chain_symbol]
             total_volume_bar = self.total_volume_bars[chain_symbol]
+            oi_call_bar = self.oi_call_bars[chain_symbol]
+            oi_put_bar = self.oi_put_bars[chain_symbol]
+            volume_mode: str = self.volume_mode()
             iv_diff_pos_bar = self.iv_diff_pos_bars[chain_symbol]
             iv_diff_neg_bar = self.iv_diff_neg_bars[chain_symbol]
             level_bar = self.iv_level_bars[chain_symbol]
@@ -1311,6 +1878,10 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                     text_item.setVisible(True)
                 for text_item in self.total_volume_text_items[chain_symbol]:
                     text_item.show()
+                # 中段パネルは出来高か建玉かのどちらか。使わない方は隠す。
+                total_volume_bar.setVisible(volume_mode == "volume")
+                oi_call_bar.setVisible(volume_mode != "volume")
+                oi_put_bar.setVisible(volume_mode != "volume")
             else:
                 call_mid_curve.hide()
                 call_bid_curve.hide()
@@ -1330,6 +1901,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                 underlying_line.hide()
                 prev_underlying_line.hide()
                 total_volume_bar.hide()
+                oi_call_bar.hide()
+                oi_put_bar.hide()
                 iv_diff_pos_bar.hide()
                 iv_diff_neg_bar.hide()
                 for text_item in self.eris_neighbor_labels[chain_symbol]:
