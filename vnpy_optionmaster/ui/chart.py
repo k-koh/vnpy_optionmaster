@@ -48,6 +48,9 @@ mpl.rcParams['axes.unicode_minus'] = False
 # IV分解の積み上げ 2 段の色。前面になる段は重なりを透かすため半透明。
 LEVEL_RGB: tuple = (0, 229, 138)      # 面の上下
 SLIDE_RGB: tuple = (255, 170, 51)     # 滑り
+# IV分解の合計（＝前日比IV）。限月の色は1限月目が純赤で、緑・橙に並べると
+# 暗くて読めない。3行を同じだけ読ませたいので、分解中だけ白で出す。
+TOTAL_RGB: tuple = (255, 255, 255)
 DECOMP_FRONT_ALPHA: int = 130
 
 
@@ -1130,6 +1133,32 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             if neg_heights:
                 min_iv_diff_neg = min(min_iv_diff_neg, min(neg_heights))
 
+        # 縦軸の範囲はラベルを置く前に決めておく。逃がし量を「縦軸の幅の
+        # 何%」で測るため（エントリー判定と同じ）。最大値に対する割合だと、
+        # 棒が短い行使価格で数字だけが遠くに浮いてしまう。
+        padding_pos: float = max_iv_diff_pos * 0.5 if max_iv_diff_pos > 0 else 0.5
+        padding_neg: float = abs(min_iv_diff_neg * 0.5) if min_iv_diff_neg < 0 else 0.5
+        y_max_iv: float = max_iv_diff_pos + padding_pos
+        y_min_iv: float = min_iv_diff_neg - padding_neg
+        if y_min_iv >= y_max_iv:
+            y_min_iv = -5.0
+            y_max_iv = 5.0
+        # 棒の先から数字までの隙間と、次の行までの送り幅。
+        iv_label_pad: float = (y_max_iv - y_min_iv) * 0.012
+        iv_label_row: float = (y_max_iv - y_min_iv) * 0.038
+        # 置いた数字がどこまで届いたか。最後に縦軸をそこまで広げる。棒の高さ
+        # だけで決めると、外に出した数字が上下で切れる。
+        label_top: float = y_max_iv
+        label_bottom: float = y_min_iv
+
+        def _note_label(y: float, anchor_y: int) -> None:
+            """数字1行ぶんの占める範囲を縦軸の要求に取り込む。"""
+            nonlocal label_top, label_bottom
+            if anchor_y:
+                label_top = max(label_top, y + iv_label_row)
+            else:
+                label_bottom = min(label_bottom, y - iv_label_row)
+
         text_offset_scale: float = 6.0/15.0
 
         for chain in portfolio.chains.values():
@@ -1703,88 +1732,84 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
             if self.decomp_check.isChecked():
                 # IV分解中は前日比の棒を隠しているので、その数値もここで出す。
-                # 棒の外側に合計（＝前日比IV）、緑と橙の境目に 面の上下。
-                # One row height, in data units. Two rows in a single HTML item
-                # cannot be centred (Qt ignores the alignment there), so the
-                # two numbers are separate items, each centred on the bar.
-                row_h: float = (
-                    (max_iv_diff_pos - min_iv_diff_neg) * 0.09
-                ) or 0.15
+                # 合計（＝前日比IV）と 面の上下 の2つ。滑りは差なので出さない。
+                #
+                # 面の上下と滑りは符号が逆になることが多く、その場合 棒は0を
+                # またいで上下どちらにも伸びる。だから「棒の先から外へ」では
+                # なく、数字ごとに「自分の棒が伸びている側の外」に置く:
+                #   同符号 … 同じ側に2行（外側が合計、内側が面の上下）
+                #   異符号 … 上下に分かれる（緑は緑の棒の側、合計は滑りの側）
+                # どちらでも数字が棒の上に乗らない。
                 for strike, level, slide in zip(level_x, level_h, slide_h):
                     total: float = level + slide
-                    up: bool = total >= 0
-                    out_offset: float = (
-                        max_iv_diff_pos if up else abs(min_iv_diff_neg)
-                    ) * text_offset_scale or 0.3
-                    base_y: float = total + (out_offset if up else -out_offset)
+                    # この行使価格の棒全体が占める範囲
+                    high: float = max(0.0, level, total)
+                    low: float = min(0.0, level, total)
 
-                    # 合成後 always sits on the row FURTHER from the bar, with
-                    # 面の上下 right under it. A bar pointing down used to reach
-                    # the 合成後 row and cover it.
-                    if up:
-                        total_y: float = base_y + row_h
-                        level_y: float = base_y
-                    else:
-                        total_y = base_y - row_h
-                        level_y = base_y - row_h * 2
+                    # 外から順に 合計 / 面の上下 / 滑り。色は棒と同じにして、
+                    # どの数字がどの段のものか一目で分かるようにする。
+                    upper: list = []
+                    lower: list = []
+                    for value, text, color in (
+                        (total, f"{total:+.2f}", TOTAL_RGB),
+                        (level, f"（{level:+.2f}）", LEVEL_RGB),
+                        (slide, f"[{slide:+.2f}]", SLIDE_RGB),
+                    ):
+                        (upper if value >= 0 else lower).append((text, color))
 
-                    total_item = pg.TextItem(
-                        text=f"{total:.2f}%",
-                        color=chain_color,
-                        anchor=(0.5, 0 if up else 1),
-                    )
-                    total_item.setFont(font)
-                    total_item.setPos(strike, total_y)
-                    total_item.setZValue(5)
-                    self.iv_diff_chart.addItem(total_item)
-                    self.iv_diff_pos_text_items[chain.chain_symbol].append(total_item)
+                    placed: list = [
+                        (upper, high, iv_label_pad, 1),
+                        (lower, low, -iv_label_pad, 0),
+                    ]
+                    for items, edge, gap, anchor_y in placed:
+                        for index, (text, color) in enumerate(items):
+                            # 先頭（合計）を一番外の行にする
+                            step: int = len(items) - 1 - index
+                            y: float = edge + gap + iv_label_row * step * (
+                                1 if anchor_y else -1
+                            )
+                            item = pg.TextItem(
+                                text=text, color=color, anchor=(0.5, anchor_y)
+                            )
+                            item.setFont(font)
+                            item.setPos(strike, y)
+                            item.setZValue(5)
+                            self.iv_diff_chart.addItem(item)
+                            self.iv_diff_pos_text_items[chain.chain_symbol].append(item)
+                            _note_label(y, anchor_y)
 
-                    level_item = pg.TextItem(
-                        text=f"（{level:+.2f}）",
-                        color=(0, 229, 138),
-                        anchor=(0.5, 0 if up else 1),
-                    )
-                    level_item.setFont(font)
-                    level_item.setPos(strike, level_y)
-                    level_item.setZValue(5)
-                    self.iv_diff_chart.addItem(level_item)
-                    self.iv_diff_pos_text_items[chain.chain_symbol].append(level_item)
-
-            if max_iv_diff_pos > 0:
-                iv_text_offset_pos = max_iv_diff_pos * text_offset_scale
-            else:
-                iv_text_offset_pos = 0.5
-
+            # 分解OFFのときは棒1本なので、その先のすぐ外に数字を置く。
+            # anchor の y は「文字のどこを指定座標に合わせるか」で、1=下端、
+            # 0=上端。上向きの棒は文字の下端を棒の先に合わせると上に出る。
             for strike, height in (
                 [] if self.decomp_check.isChecked() else zip(pos_strikes, pos_heights)
             ):
                 text_item = pg.TextItem(
-                    text=f"{height:.2f}%",
+                    # 分解中の3行と同じ書式（符号つき・%なし）。色だけは棒と
+                    # 同じ限月の色のままにして、どの限月かを示す。
+                    text=f"{height:+.2f}",
                     color=chain_color,
-                    anchor=(0.5, 0) # Center above the bar
+                    anchor=(0.5, 1),    # 文字の下端を棒の先に = 棒の上に出る
                 )
                 text_item.setFont(font)
-                text_item.setPos(strike, height + iv_text_offset_pos)
+                text_item.setPos(strike, height + iv_label_pad)
                 self.iv_diff_chart.addItem(text_item)
                 self.iv_diff_pos_text_items[chain.chain_symbol].append(text_item)
-
-            if min_iv_diff_neg < 0:
-                iv_text_offset_neg = abs(min_iv_diff_neg) * text_offset_scale
-            else:
-                iv_text_offset_neg = 0.5
+                _note_label(height + iv_label_pad, 1)
 
             for strike, height in (
                 [] if self.decomp_check.isChecked() else zip(neg_strikes, neg_heights)
             ):
                 text_item = pg.TextItem(
-                    text=f"{height:.2f}%",
+                    text=f"{height:+.2f}",
                     color=chain_color,
-                    anchor=(0.5, 1) # Center below the bar
+                    anchor=(0.5, 0),    # 文字の上端を棒の先に = 棒の下に出る
                 )
                 text_item.setFont(font)
-                text_item.setPos(strike, height - iv_text_offset_neg)
+                text_item.setPos(strike, height - iv_label_pad)
                 self.iv_diff_chart.addItem(text_item)
                 self.iv_diff_neg_text_items[chain.chain_symbol].append(text_item)
+                _note_label(height - iv_label_pad, 0)
 
         # Set Y-range for volume chart to provide padding for text labels
         if mode == "volume":
@@ -1798,18 +1823,10 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             pad = span * 0.5 if span > 0 else 10
             self.volume_chart.setYRange(oi_min - pad, oi_max + pad)
 
-        # Set Y-range for IV diff chart to provide padding for text labels
-        padding_pos = max_iv_diff_pos * 0.5 if max_iv_diff_pos > 0 else 0.5
-        padding_neg = abs(min_iv_diff_neg * 0.5) if min_iv_diff_neg < 0 else 0.5
-
-        y_max_iv = max_iv_diff_pos + padding_pos
-        y_min_iv = min_iv_diff_neg - padding_neg
-
-        if y_min_iv >= y_max_iv:
-            y_min_iv = -5
-            y_max_iv = 5
-
-        self.iv_diff_chart.setYRange(y_min_iv, y_max_iv)
+        # 範囲はラベルを置く前に仮決めし、実際に置いた数字の端まで広げる。
+        # IV分解では棒が 面の上下 と 合計 の両方向に伸びるので、前日比の
+        # 最大・最小だけでは足りない。
+        self.iv_diff_chart.setYRange(label_bottom, label_top)
 
     def update_curve_visible(self) -> None:
         """"""
