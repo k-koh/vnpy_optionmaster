@@ -690,14 +690,35 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         if not self.volume_chart.sceneBoundingRect().contains(scene_pos):
             return
 
+        # 当たり判定は全限月ぶん貯めてあるが、チェックを外した限月のバーは
+        # 描かれていない。同じ行使価格のバーは限月どうしで重なるので、ここで
+        # 絞らないと、隠れているほうが先に見つかって別の限月の窓が開く。
+        # （チェックの切替は再描画を呼ばないので、貯める側では絞れない。）
+        hits: list = [
+            hit for hit in self._volume_bar_hits if self._chain_shown(hit[1])
+        ]
+        if not hits:
+            return
+
         point = self.volume_chart.vb.mapSceneToView(scene_pos)
         x: float = point.x()
-        bar_x, chain_symbol, strike, option_type = min(
-            self._volume_bar_hits, key=lambda hit: abs(hit[0] - x)
-        )
+        nearest: tuple = min(hits, key=lambda hit: abs(hit[0] - x))
         # 近くに何も無いところを押したときは開かない。
-        if abs(bar_x - x) > max(self._volume_bar_width, 1.0):
+        if abs(nearest[0] - x) > max(self._volume_bar_width, 1.0):
             return
+
+        # 同じ場所に複数の限月が重なっているときは、見た目で選べないので訊く。
+        overlapped: list = [
+            hit for hit in hits if abs(hit[0] - nearest[0]) < 1e-6
+        ]
+        if len(overlapped) > 1:
+            chosen = self._ask_which_chain(overlapped)
+            if chosen is None:
+                return
+        else:
+            chosen = nearest
+
+        bar_x, chain_symbol, strike, option_type = chosen
 
         window: OptionDailyHistoryChart = OptionDailyHistoryChart(
             self.option_engine, chain_symbol, strike, option_type
@@ -706,6 +727,24 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.history_windows.append(window)
         # 閉じた窓はためない。
         self.history_windows = [w for w in self.history_windows if w.isVisible()]
+
+    def _chain_shown(self, chain_symbol: str) -> bool:
+        """その限月をいま描いているか（チェックボックスの状態）。"""
+        checkbox = self.chain_checks.get(chain_symbol)
+        return checkbox is None or checkbox.isChecked()
+
+    def _ask_which_chain(self, hits: list) -> tuple:
+        """重なったバーのうち、どの限月かを選んでもらう。"""
+        menu: QtWidgets.QMenu = QtWidgets.QMenu(self)
+        actions: dict = {}
+        for hit in sorted(hits, key=lambda hit: hit[1]):
+            _bar_x, chain_symbol, strike, option_type = hit
+            name: str = chain_symbol.split(".")[0]
+            kind: str = {1: "コール", -1: "プット"}.get(option_type, "")
+            action = menu.addAction(f"{name}　{strike:.0f}　{kind}".rstrip("　"))
+            action.setData(chain_symbol)
+            actions[action] = hit
+        return actions.get(menu.exec(QtGui.QCursor.pos()))
 
     def _on_decomp_toggled(self, checked: bool) -> None:
         """Switch the bottom subplot between 前日比IV and its decomposition."""
