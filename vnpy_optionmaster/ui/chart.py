@@ -14,7 +14,7 @@ from vnpy.trader.constant import Exchange, Interval, OptionPrevIvType
 from vnpy.trader.database import DB_TZ, get_database, BaseDatabase
 from vnpy.trader.object import BarData
 
-from vnpy.trader.utility import load_json, save_json
+from vnpy.trader.utility import jpx_session_key, load_json, save_json
 
 from ..base import PortfolioData, OptionData, PreviousDayOptionData, ChainData, UnderlyingData
 from ..engine import OptionEngine, Event, EventEngine
@@ -439,6 +439,13 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         # Δ値 / IV / 価格 / 売買差 for the strike above and below each Δ0.1
         # strike — the next candidates when the Δ0.1 one is not tradable.
         self.eris_neighbor_labels: dict[str, list[pg.TextItem]] = {}
+        # Δ0.1 / Δ0.02 の線のラベルと、作ったときの高さ（0〜1）。
+        # 重なりを避けて持ち上げるとき、毎回ここから計算し直す
+        # （前回ずらした位置からさらにずらすと、際限なく上がっていく）。
+        self.strike_label_anchors: list[tuple[str, object, float]] = []
+        # 持ち上げた数字と、その行使価格の点をつなぐ引き出し線。
+        # 並べ直すたびに引き直すので、消せるように持っておく。
+        self._label_leaders: list = []
         self.iv_diff_pos_text_items: dict[str, list[pg.TextItem]] = {} # Added for IV diff text
         self.iv_diff_neg_text_items: dict[str, list[pg.TextItem]] = {} # Added for IV diff text
         self.total_volume_text_items: dict[str, list[pg.TextItem]] = {} # Added for Volume text
@@ -728,6 +735,132 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         # 閉じた窓はためない。
         self.history_windows = [w for w in self.history_windows if w.isVisible()]
 
+    def _layout_impv_labels(self) -> None:
+        """IVカーブの数字が重ならないように、上へ逃がす。
+
+        コール側はカーブが寝ているので、Δ0.1 / Δ0.02 の線のラベルも、隣の
+        行使価格に付けた数字も、2限月ぶんが同じ高さに並ぶ。ラベルの横幅は
+        行使価格にして4本ぶんほどあるため、そのままだと必ず重なる。
+
+        置く順番:
+          1. カーブ上の数字（隣の行使価格）… 高さが値そのものを指している
+             ので、ここを動かさずに済ませたい。先に場所を取る。
+          2. 線のラベル … 縦の位置に意味が無いので、重なるぶんは上へ逃がす。
+
+        どちらも「相手の上端のすぐ上」へ飛ばすだけなので、段数は重なった
+        数しか増えない。
+        """
+        if not self.isVisible():
+            return
+        view_box = self.impv_chart.vb
+        (_x_min, _x_max), (y_min, y_max) = view_box.viewRange()
+        span_y: float = y_max - y_min
+        if span_y <= 0:
+            return
+
+        def view_rect(item) -> tuple | None:
+            """画面上の占める範囲を、データ座標の (左, 右, 下, 上) で返す。"""
+            scene_rect = item.sceneBoundingRect()
+            if scene_rect.isEmpty():
+                return None
+            top_left = view_box.mapSceneToView(scene_rect.topLeft())
+            bottom_right = view_box.mapSceneToView(scene_rect.bottomRight())
+            left, right = sorted((top_left.x(), bottom_right.x()))
+            bottom, top = sorted((top_left.y(), bottom_right.y()))
+            return left, right, bottom, top
+
+        def overlaps(a: tuple, b: tuple) -> bool:
+            return not (
+                a[1] <= b[0] or b[1] <= a[0] or a[3] <= b[2] or b[3] <= a[2]
+            )
+
+        for leader in self._label_leaders:
+            self.impv_chart.removeItem(leader)
+        self._label_leaders.clear()
+
+        placed: list[tuple] = []
+        gap: float = span_y * 0.004        # ラベル同士のすき間
+        # これ以上離れたら引き出し線を出す（数字1行ぶんくらい）
+        leader_threshold: float = span_y * 0.02
+
+        def lift(rect: tuple) -> float:
+            """重ならなくなるまで持ち上げる量。上に出すぎるなら諦めて0。"""
+            dy: float = 0.0
+            for _ in range(len(placed) + 1):
+                candidate = (rect[0], rect[1], rect[2] + dy, rect[3] + dy)
+                blocker = next(
+                    (other for other in placed if overlaps(candidate, other)), None
+                )
+                if blocker is None:
+                    return dy
+                dy = blocker[3] + gap - rect[2]
+                if rect[3] + dy > y_max:
+                    # 表示の外に追い出すくらいなら、重なっていても元の位置。
+                    return 0.0
+            return dy
+
+        # ---- 1. カーブ上の数字。重なるときだけ上へ重ねる。
+        neighbors: list = []
+        for chain_symbol, items in self.eris_neighbor_labels.items():
+            if not self._chain_shown(chain_symbol):
+                continue
+            neighbors.extend(items)
+        neighbors.sort(key=lambda item: item.pos().x())
+        for item in neighbors:
+            item.setPos(*item.base_data_pos)
+
+        for item in neighbors:
+            rect = view_rect(item)
+            if rect is None:
+                continue
+            dy: float = lift(rect)
+            if dy:
+                point_x: float = item.pos().x()
+                point_y: float = item.pos().y()
+                item.setPos(point_x, point_y + dy)
+                if dy > leader_threshold:
+                    self._add_label_leader(item, point_x, point_y, point_y + dy)
+            placed.append((rect[0], rect[1], rect[2] + dy, rect[3] + dy))
+
+        # ---- 2. 線のラベル。毎回いちど基準の高さに戻してから測る。
+        line_labels: list = []
+        for chain_symbol, line, base_position in self.strike_label_anchors:
+            if not self._chain_shown(chain_symbol) or not line.isVisible():
+                continue
+            line.label.setPosition(base_position)
+            line_labels.append((line.value(), line))
+        line_labels.sort(key=lambda entry: entry[0])
+
+        for _strike, line in line_labels:
+            rect = view_rect(line.label)
+            if rect is None:
+                continue
+            dy = lift(rect)
+            if dy:
+                line.label.setPosition(line.label.orthoPos + dy / span_y)
+            placed.append((rect[0], rect[1], rect[2] + dy, rect[3] + dy))
+
+    def _add_label_leader(
+        self, item: pg.TextItem, x: float, y_point: float, y_label: float
+    ) -> None:
+        """数字と、その行使価格の点を細い線でつなぐ。
+
+        数字の色をそのまま薄くして使う。点のすぐ上から始めて数字の下端
+        までなので、カーブにも文字にもかからない。
+        """
+        color = item.color if hasattr(item, "color") else None
+        rgb: tuple = tuple(pg.colorTuple(pg.mkColor(color))[:3]) if color else (200, 200, 200)
+        leader = pg.PlotCurveItem(
+            x=[x, x],
+            y=[y_point, y_label],
+            pen=pg.mkPen(color=rgb + (110,), width=1, style=QtCore.Qt.DotLine),
+        )
+        leader.setZValue(4)         # 数字(5)より後ろ、カーブより前
+        # ignoreBounds: 縦軸の自動調整には数えさせない。逃がした数字まで
+        # 届く線なので、数えると軸が伸び、それでまた数字が動いてしまう。
+        self.impv_chart.addItem(leader, ignoreBounds=True)
+        self._label_leaders.append(leader)
+
     def _chain_shown(self, chain_symbol: str) -> bool:
         """その限月をいま描いているか（チェックボックスの状態）。"""
         checkbox = self.chain_checks.get(chain_symbol)
@@ -907,6 +1040,14 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             label=symbol + " 前日先物",
             labelOpts={'position': prev_position, 'color': (255, 165, 0), 'fill': (200, 200, 200, 50), 'movable': False}
         )
+
+        for line, base_position in (
+            (self.eris_p_strike_lines[chain_symbol], max(0.05, 0.95 - label_shift)),
+            (self.eris_c_strike_lines[chain_symbol], min(0.95, 0.01 + label_shift)),
+            (self.delta002_p_strike_lines[chain_symbol], max(0.05, 0.92 - label_shift)),
+            (self.delta002_c_strike_lines[chain_symbol], min(0.95, 0.04 + label_shift)),
+        ):
+            self.strike_label_anchors.append((chain_symbol, line, base_position))
 
         self.impv_chart.addItem(self.eris_p_strike_lines[chain_symbol])
         self.impv_chart.addItem(self.eris_c_strike_lines[chain_symbol])
@@ -1190,9 +1331,20 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         label_top: float = y_max_iv
         label_bottom: float = y_min_iv
 
+        # いま数字を置いている限月を表示しているか。チェックを外した限月も
+        # 棒と数字は一度描いてから隠しているだけなので、これで弾かないと
+        # 見えない数字のぶんまで縦軸が伸びる。
+        label_chain_shown: bool = True
+
         def _note_label(y: float, anchor_y: int) -> None:
-            """数字1行ぶんの占める範囲を縦軸の要求に取り込む。"""
+            """数字1行ぶんの占める範囲を縦軸の要求に取り込む。
+
+            表示していない限月の数字は数えない（棒の高さの最大・最小も
+            同じようにチェックの入った限月だけで数えている）。
+            """
             nonlocal label_top, label_bottom
+            if not label_chain_shown:
+                return
             if anchor_y:
                 label_top = max(label_top, y + iv_label_row)
             else:
@@ -1201,6 +1353,7 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         text_offset_scale: float = 6.0/15.0
 
         for chain in portfolio.chains.values():
+            label_chain_shown = self._chain_shown(chain.chain_symbol)
             text_offset_scale = text_offset_scale - 1.0/15.0
             # Clear previous text items for IV diff chart
             for text_item in self.iv_diff_pos_text_items[chain.chain_symbol]:
@@ -1479,6 +1632,12 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                     )
                     label_item.setFont(neighbor_font)
                     label_item.setPos(opt.strike_price, opt.mid_impv * 100)
+                    # 本来の位置＝その行使価格の点。重なりをほどくときは毎回
+                    # ここへ戻してから測り直す（前回ずらした位置から積み上げ
+                    # ると、呼ぶたびに上がっていく）。
+                    label_item.base_data_pos = (
+                        opt.strike_price, opt.mid_impv * 100
+                    )
                     label_item.setZValue(5)
                     self.impv_chart.addItem(label_item)
                     self.eris_neighbor_labels[chain.chain_symbol].append(label_item)
@@ -1867,9 +2026,14 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         # 最大・最小だけでは足りない。
         self.iv_diff_chart.setYRange(label_bottom, label_top)
 
+        # 数字の重なりをほどくのは、縦軸が決まって描き終わってから。
+        self._layout_impv_labels()
+
     def update_curve_visible(self) -> None:
         """"""
         self._rebuild_legends()
+        # 限月を隠すとその段が空くので、残りを詰め直す。表示/非表示を
+        # 終えてから呼ぶ必要があるので、この関数の最後で呼んでいる。
         for chain_symbol, checkbox in self.chain_checks.items():
             call_mid_curve: pg.PlotCurveItem = self.call_mid_curves[chain_symbol]
             call_bid_curve: pg.PlotCurveItem = self.call_bid_curves[chain_symbol]
@@ -1969,6 +2133,8 @@ class OptionVolatilityChart(QtWidgets.QWidget):
                     text_item.hide()
                 for text_item in self.total_volume_text_items[chain_symbol]:
                     text_item.hide()
+
+        self._layout_impv_labels()
 
     def _load_prev_day_futures_close(self, chain_symbol: str) -> float | None:
         """Load previous day's futures close price for a chain.
@@ -3942,19 +4108,32 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
 
         n_dates: int = len(date_labels)
 
-        # Session-boundary vertical lines (intraday buckets only):
-        #   night session start → 16:00 bucket (先物の取引日の起点、17:00立会開始)
-        #   day session start   → 08:00 bucket (8:45立会開始)
-        night_idx = [i for i, lbl in enumerate(date_labels) if lbl.endswith(" 16:00")]
-        day_idx = [i for i, lbl in enumerate(date_labels) if lbl.endswith(" 08:00")]
+        # セッションの変わり目の縦線（日足ラベルには時刻が無いので出ない）。
+        # 株価チャート・エントリー判定と同じ jpx_session_key で、立会開始を
+        # 含む足の手前に引く。時刻を決め打ちしていたときは、1時間足の夜間
+        # （17:00 の足）に 16:00 の足が無く、線が出ていなかった。
+        night_idx: list[int] = []
+        day_idx: list[int] = []
+        prev_session_key: tuple | None = None
+        for i, label_text in enumerate(date_labels):
+            try:
+                bucket_dt = datetime.strptime(label_text, "%Y-%m-%d %H:%M")
+            except ValueError:
+                continue
+            session_key: tuple = jpx_session_key(bucket_dt)
+            if prev_session_key is not None and session_key != prev_session_key:
+                (day_idx if session_key[1] else night_idx).append(i)
+            prev_session_key = session_key
         for target_ax in (ax, ax_skew):
             if target_ax is None:
                 continue
+            # 線は足の中心ではなく1本前との境目に引く（先物チャート・
+            # 株価チャートと同じ）。線の右側が新しいセッション。
             for i in night_idx:
-                target_ax.axvline(x=i, color="#9aa0a6", linewidth=0.8,
+                target_ax.axvline(x=i - 0.5, color="#9aa0a6", linewidth=0.8,
                                   linestyle="-", alpha=0.45, zorder=0)
             for i in day_idx:
-                target_ax.axvline(x=i, color="#5f6368", linewidth=0.6,
+                target_ax.axvline(x=i - 0.5, color="#5f6368", linewidth=0.6,
                                   linestyle="--", alpha=0.4, zorder=0)
 
         # ---- 週の変わり目の縦線（株価チャートの先物チャートと同じ）
@@ -3976,7 +4155,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             if target_ax is None:
                 continue
             for i in week_idx:
-                target_ax.axvline(x=i, color="#ffffff", linewidth=1.6,
+                target_ax.axvline(x=i - 0.5, color="#ffffff", linewidth=1.6,
                                   linestyle="-", alpha=0.75, zorder=0.5)
 
         if night_idx:
@@ -6094,19 +6273,22 @@ class EntrySignalChart(QtWidgets.QWidget):
         ax_bottom.tick_params(axis="x", labelbottom=True, colors="#9aa3ad", length=3)
 
         # ---- セッション開始（日中 08:45 / 夜間 17:00）の縦線
-        # 株価チャートの市場時間線と同じグレーの破線。開始時刻ちょうどの
-        # バーが無い場合（時間足が荷い、引けていない等）も、セッションが切り替わった
-        # 最初のバーに引く。棒より後ろ（zorder）なので読みの邪魔にならない。
-        prev_session: datetime | None = None
+        # 株価チャートの市場時間線と同じグレーの破線。棒より後ろ（zorder）
+        # なので読みの邪魔にならない。
+        #
+        # 判定は株価チャートと同じ jpx_session_key。開始時刻ちょうどの足が
+        # 無くても（30分足なら 08:45 は 08:30 の足の中、2時間足なら 17:00 は
+        # 16:00 の足の中）、立会開始を含む足の手前に引ける。
+        prev_session: tuple | None = None
         for i, r in enumerate(rows):
-            session: datetime = self._session_start(r["dt"])
+            session: tuple = jpx_session_key(r["dt"])
             if prev_session is not None and session != prev_session:
                 # 値のパネル（IV・枚数）には引かない。あちらの縦線は
                 # 「基準が入れ替わって棒が0から描き直される位置」だけに
                 # して、意味を混ぜない。
                 for ax in (ax_fut,):
                     ax.axvline(
-                        i, color="#646464", linewidth=0.9,
+                        i - 0.5, color="#646464", linewidth=0.9,
                         linestyle="--", alpha=0.9, zorder=0.6,
                     )
             prev_session = session
@@ -6119,14 +6301,14 @@ class EntrySignalChart(QtWidgets.QWidget):
             week: tuple = r["dt"].isocalendar()[:2]
             if prev_week is not None and week != prev_week:
                 ax_fut.axvline(
-                    i, color="#ffffff", linewidth=1.6,
+                    i - 0.5, color="#ffffff", linewidth=1.6,
                     linestyle="-", alpha=0.75, zorder=0.7,
                 )
             prev_week = week
 
         # 基準が入れ替わった足の区切り線（株価チャートの iv_item と同じ）。
         # 基準固定がOFFのときだけ出る（ONなら全足同じ基準なので変わらない）。
-        # 足の開始位置（左端）に引くので、セッション線（足の中心）とは重ならない。
+        # セッション線・週線と同じく足と足の境目に引く。
         for i, r in enumerate(rows):
             if not i:
                 continue
