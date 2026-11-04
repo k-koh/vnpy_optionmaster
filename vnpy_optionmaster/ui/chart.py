@@ -5862,6 +5862,25 @@ class EntrySignalChart(QtWidgets.QWidget):
                 va="center", ha="left", zorder=4,
             )
             y_lo, y_hi = ax_fut.get_ylim()
+
+            def sigma_axis_tag(price: float, tag_color: str) -> None:
+                """σの段の値段を右の目盛り列に出す（点数図と同じ札）。
+                裏の目盛りの数字と重なるので地色を敷いて隠す。現在値の
+                タグ（zorder 6）より奥に置く。"""
+                if not (y_lo <= price <= y_hi):
+                    return
+                ax_fut.annotate(
+                    f"{price:,.0f}",
+                    xy=(1.0, price), xycoords=ax_fut.get_yaxis_transform(),
+                    xytext=(3, 0), textcoords="offset points",
+                    color=tag_color, fontsize=8, va="center", ha="left",
+                    bbox=dict(boxstyle="square,pad=0.2", fc="#101418",
+                              ec="none"),
+                    annotation_clip=False, zorder=5,
+                )
+
+            # 値段は最新の足の段（右端で線が終わる高さ）
+            sigma_axis_tag(base_y[-1], "#ffff00")
             for mult in SIGMA_STEPS:
                 for sign, color in ((1.0, "#ff4b4b"), (-1.0, "#4bffff")):
                     ys: list[float] = [
@@ -5888,6 +5907,7 @@ class EntrySignalChart(QtWidgets.QWidget):
                         textcoords="offset points", color=color, fontsize=8,
                         va="center", ha="left", zorder=4,
                     )
+                    sigma_axis_tag(ys[-1], color)
         # ---- 範囲トレンド（手動）
         # 選んだ範囲の高値どうし・安値どうしを結んで延ばす。線は破線にして、
         # σや現在値の線と区別する。範囲は時刻で持っているので、足が流れても
@@ -5940,6 +5960,19 @@ class EntrySignalChart(QtWidgets.QWidget):
             bbox=dict(boxstyle="square,pad=0.25", fc=last_color, ec="none"),
             annotation_clip=False, zorder=6,
         )
+        # 現在値が 0σ（前日終値）から何σ離れているかを、現在値タグのすぐ上に
+        # 出す（株価チャートの先物パネルと同じ）。色は＋なら赤、−なら水色。
+        now_sigma: float | None = self.futures_sigma(last_row)
+        if now_sigma is not None:
+            ax_fut.annotate(
+                f"{now_sigma:+.2f}σ",
+                xy=(1.0, last_price), xycoords=ax_fut.get_yaxis_transform(),
+                xytext=(3, 8), textcoords="offset points",
+                ha="left", va="bottom",
+                color=up_color if now_sigma >= 0 else down_color, fontsize=8,
+                bbox=dict(boxstyle="square,pad=0.2", fc="#101418", ec="none"),
+                annotation_clip=False, zorder=6.5,
+            )
 
         ax_fut.set_ylabel("先物", color="#cccccc", fontsize=10)
         ax_fut.tick_params(labelbottom=False, labelsize=9)
