@@ -547,7 +547,9 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.impv_chart = graphics_window.addPlot(row=0, col=0, title="インプライド・ボラティリティ・カーブ")
         self.impv_chart.showGrid(x=True, y=True)
         self.impv_chart.setLabel("left", "インプライド・ボラティリティ")
-        self.impv_chart.setLabel("bottom", "権利行使価格")
+        # X軸の名前（権利行使価格）は出さず、その行に先物σの値段の札を置く。
+        # 名前を消すと軸が目盛りの1行ぶんに縮むので、高さを固定して行を残す。
+        self.impv_chart.getAxis("bottom").setHeight(44)
         self.impv_chart.addLegend()
         self.impv_chart.setMenuEnabled(False)
         self.impv_chart.setMouseEnabled(False, False)
@@ -568,6 +570,40 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.impv_proxy = pg.SignalProxy(
             self.impv_chart.scene().sigMouseMoved, rateLimit=60, slot=self._on_impv_mouse_move
         )
+
+        # 先物のσ縦線（ペイオフ図の損益チャートと同じ）。前日先物 ×
+        # (1 ± ATM日率IV × n)、n = 0.5 / 1.0 / 1.5 / 2.0。上は赤・下は水色の
+        # 破線。各線（と 0σ = 前日先物）の値段を下のX軸の上に札で出す。
+        # 札は PlotItem の子にして、描画範囲の外（X軸の目盛りの列）に置く。
+        impv_plot_item = self.impv_chart
+        self.fut_sigma_lines: list[tuple[float, pg.InfiniteLine | None, pg.TextItem]] = []
+        for mult in (0.0, 0.5, -0.5, 1.0, -1.0, 1.5, -1.5, 2.0, -2.0):
+            if mult > 0:
+                rgb: tuple = (255, 75, 75)
+            elif mult < 0:
+                rgb = (75, 255, 255)
+            else:
+                rgb = (255, 165, 0)     # 前日先物の線と同じ橙
+            line: pg.InfiniteLine | None = None
+            if mult:
+                line = pg.InfiniteLine(
+                    angle=90, movable=False,
+                    pen=pg.mkPen(color=rgb + (110,), width=1.5,
+                                 style=QtCore.Qt.PenStyle.DashLine),
+                )
+                line.hide()
+                self.impv_chart.addItem(line, ignoreBounds=True)
+            tag = pg.TextItem(color=rgb, anchor=(0.5, 1.0),
+                              fill=pg.mkBrush((16, 20, 24)))
+            tag.setFont(QtGui.QFont("Arial", 8))
+            tag.setParentItem(impv_plot_item)
+            tag.setZValue(20)
+            tag.hide()
+            self.fut_sigma_lines.append((mult, line, tag))
+        self._fut_sigma_prices: dict[float, float] = {}
+        impv_vb = self.impv_chart.getViewBox()
+        impv_vb.sigRangeChanged.connect(self._place_fut_sigma_tags)
+        impv_vb.sigResized.connect(self._place_fut_sigma_tags)
 
         graphics_window.nextRow()
 
@@ -601,6 +637,37 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         self.iv_diff_chart.setMenuEnabled(False)
         self.iv_diff_chart.setMouseEnabled(False, False)
         self.iv_diff_chart.setMaximumHeight(400)
+
+        # IVのσ帯（エントリー判定の前日比IVと同じ）。1σ = ATM IV / √252
+        # （1日ぶんの想定変動、IVポイント）。±0.5σ, ±1.0σ … の水平線を
+        # 白い破線で引き、左端に段の名前を出す。高さは update で入れる。
+        sigma_pen = pg.mkPen(color=(255, 255, 255, 190), width=1,
+                             style=QtCore.Qt.PenStyle.DashLine)
+        # 段の名前と値は線とは別の TextItem にして、左のY軸のすぐ右に
+        # 置く（InfiniteLine の label は位置が軸から離れてしまうため）。
+        self.iv_sigma_lines: list[tuple[float, pg.InfiniteLine, pg.TextItem]] = []
+        # 名前の字は左のY軸の目盛り数字と同じ（フォント・大きさ・色）。
+        # 目盛りのフォントを指定していなければ、軸はアプリの既定フォントで描く。
+        left_axis = self.iv_diff_chart.getAxis("left")
+        tick_font = left_axis.style.get("tickFont") or QtWidgets.QApplication.font()
+        tick_color = left_axis.textPen().color()
+        for mult in SIGMA_STEPS:
+            for sign in (1.0, -1.0):
+                line = pg.InfiniteLine(angle=0, movable=False, pen=sigma_pen)
+                line.setZValue(3)
+                line.hide()
+                self.iv_diff_chart.addItem(line, ignoreBounds=True)
+                label = pg.TextItem(color=tick_color, anchor=(0.0, 0.5))
+                label.setFont(QtGui.QFont(tick_font))
+                label.setZValue(4)
+                label.hide()
+                self.iv_diff_chart.addItem(label, ignoreBounds=True)
+                self.iv_sigma_lines.append((sign * mult, line, label))
+        # 横の表示範囲が変わったら（窓の大きさ・IVカーブ側の範囲）、
+        # 名前を左端に付け直す。
+        iv_diff_vb = self.iv_diff_chart.getViewBox()
+        iv_diff_vb.sigRangeChanged.connect(self._place_iv_sigma_labels)
+        iv_diff_vb.sigResized.connect(self._place_iv_sigma_labels)
 
         for chain_symbol in chain_symbols:
             self.add_impv_curve(chain_symbol)
@@ -860,6 +927,30 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         # 届く線なので、数えると軸が伸び、それでまた数字が動いてしまう。
         self.impv_chart.addItem(leader, ignoreBounds=True)
         self._label_leaders.append(leader)
+
+    # 前日比IVから外す遠いOTMのしきい値（両方を満たすものを外す）
+    IV_DIFF_MIN_DELTA: float = 0.005
+    IV_DIFF_MIN_PRICE: float = 10.0
+
+    def _iv_diff_excluded(self, opt: OptionData) -> bool:
+        """前日比IVの棒に入れないオプションか。|Δ| < 0.005 かつ 値段 < 10円。
+
+        値段は気配の仲値（売り・買いが揃っていなければ直近の約定値）。
+        値段が分からないものは判断できないので外さない。
+        """
+        if not opt.size:
+            return False
+        delta: float = abs(opt.theo_delta / opt.size)
+        if delta >= self.IV_DIFF_MIN_DELTA:
+            return False
+        tick = opt.tick
+        if tick is None:
+            return False
+        if tick.bid_price_1 and tick.ask_price_1:
+            price: float = (tick.bid_price_1 + tick.ask_price_1) / 2
+        else:
+            price = tick.last_price or 0.0
+        return 0 < price < self.IV_DIFF_MIN_PRICE
 
     def _chain_shown(self, chain_symbol: str) -> bool:
         """その限月をいま描いているか（チェックボックスの状態）。"""
@@ -1267,8 +1358,16 @@ class OptionVolatilityChart(QtWidgets.QWidget):
 
             prev_call_iv_map = {s: v for s, v in zip(call_strikes, prev_call_ivs)}
             prev_put_iv_map = {s: v for s, v in zip(put_strikes, prev_put_ivs)}
-            call_mid_impv_map = {s: v for s, v in zip(call_strikes, call_mid_impv)}
-            put_mid_impv_map = {s: v for s, v in zip(put_strikes, put_mid_impv)}
+            # 前日比IVには、Δが小さく値段も安い遠いOTMは入れない（数円の
+            # 気配でIVが大きく振れ、棒も縦軸も振り回されるため）。
+            iv_diff_skip_c: set = {c.strike_price for c in calls if self._iv_diff_excluded(c)}
+            iv_diff_skip_p: set = {p.strike_price for p in puts if self._iv_diff_excluded(p)}
+            call_mid_impv_map = {
+                s: v for s, v in zip(call_strikes, call_mid_impv) if s not in iv_diff_skip_c
+            }
+            put_mid_impv_map = {
+                s: v for s, v in zip(put_strikes, put_mid_impv) if s not in iv_diff_skip_p
+            }
 
             iv_diff_heights = []
             for strike in all_strikes:
@@ -1447,8 +1546,16 @@ class OptionVolatilityChart(QtWidgets.QWidget):
             all_strikes = sorted(list(set(call_strikes + put_strikes)))
             prev_call_iv_map = {s: v for s, v in zip(call_strikes, prev_call_ivs)}
             prev_put_iv_map = {s: v for s, v in zip(put_strikes, prev_put_ivs)}
-            call_mid_impv_map = {s: v for s, v in zip(call_strikes, call_mid_impv)}
-            put_mid_impv_map = {s: v for s, v in zip(put_strikes, put_mid_impv)}
+            # 前日比IVには、Δが小さく値段も安い遠いOTMは入れない（数円の
+            # 気配でIVが大きく振れ、棒も縦軸も振り回されるため）。
+            iv_diff_skip_c: set = {c.strike_price for c in calls if self._iv_diff_excluded(c)}
+            iv_diff_skip_p: set = {p.strike_price for p in puts if self._iv_diff_excluded(p)}
+            call_mid_impv_map = {
+                s: v for s, v in zip(call_strikes, call_mid_impv) if s not in iv_diff_skip_c
+            }
+            put_mid_impv_map = {
+                s: v for s, v in zip(put_strikes, put_mid_impv) if s not in iv_diff_skip_p
+            }
 
             for strike in all_strikes:
                 call_iv = call_mid_impv_map.get(strike, 0)
@@ -2024,10 +2131,89 @@ class OptionVolatilityChart(QtWidgets.QWidget):
         # 範囲はラベルを置く前に仮決めし、実際に置いた数字の端まで広げる。
         # IV分解では棒が 面の上下 と 合計 の両方向に伸びるので、前日比の
         # 最大・最小だけでは足りない。
+        # IVのσ帯: 表示中の限月のうち先頭（期近）の ATM IV を使う。±0.5σ は
+        # 常に見えるよう縦軸に入れ、±1.0σ 以上は軸に収まるときだけ出す
+        # （エントリー判定と同じ。軸をそれらに合わせて広げはしない）。
+        sigma_unit: float = 0.0     # 1σ（IVポイント）
+        for chain in portfolio.chains.values():
+            if self._chain_shown(chain.chain_symbol) and chain.atm_impv:
+                sigma_unit = chain.atm_impv * 100 / (252 ** 0.5)
+                break
+        if sigma_unit > 0:
+            sigma_half: float = sigma_unit * 0.5
+            label_top = max(label_top, sigma_half + iv_label_row)
+            label_bottom = min(label_bottom, -sigma_half - iv_label_row)
         self.iv_diff_chart.setYRange(label_bottom, label_top)
+
+        # 先物のσ縦線: 同じ限月（表示中の先頭）の前日先物と ATM IV で引く。
+        self._fut_sigma_prices = {}
+        for chain in portfolio.chains.values():
+            if not self._chain_shown(chain.chain_symbol):
+                continue
+            base_fut: float = self.prev_underlying_prices.get(chain.chain_symbol) or 0.0
+            if base_fut > 0 and chain.atm_impv:
+                daily_fut: float = chain.atm_impv / (252 ** 0.5)
+                for mult, _line, _tag in self.fut_sigma_lines:
+                    self._fut_sigma_prices[mult] = base_fut * (1 + daily_fut * mult)
+            break
+        for mult, line, _tag in self.fut_sigma_lines:
+            if line is None:
+                continue
+            if mult in self._fut_sigma_prices:
+                line.setPos(self._fut_sigma_prices[mult])
+                line.show()
+            else:
+                line.hide()
+        self._place_fut_sigma_tags()
+
+        for mult, line, label in self.iv_sigma_lines:
+            sigma_level: float = mult * sigma_unit
+            if sigma_unit > 0 and (
+                abs(mult) == 0.5 or label_bottom <= sigma_level <= label_top
+            ):
+                line.setPos(sigma_level)
+                line.show()
+                # 段の名前とそのIVポイント（例: +0.5σ 1.12）
+                label.setText(f"{mult:+.1f}σ {sigma_level:+.2f}")
+                label.show()
+            else:
+                line.hide()
+                label.hide()
+        self._place_iv_sigma_labels()
 
         # 数字の重なりをほどくのは、縦軸が決まって描き終わってから。
         self._layout_impv_labels()
+
+    def _place_fut_sigma_tags(self, *_args) -> None:
+        """先物σ縦線の値段の札を、IVカーブの下のX軸（目盛りの数字の列）に置く。
+        表示範囲の外の線は札も出さない。"""
+        vb = self.impv_chart.getViewBox()
+        (x0, x1), (y0, _y1) = vb.viewRange()
+        for mult, _line, tag in self.fut_sigma_lines:
+            price = self._fut_sigma_prices.get(mult)
+            if price is None or not (x0 <= price <= x1):
+                tag.hide()
+                continue
+            tag.setText(f"{price:,.0f}")
+            # 横は線の位置、縦はX軸の下端（目盛りの数字の下の行）に揃える。
+            local = self.impv_chart.mapFromScene(
+                vb.mapViewToScene(QtCore.QPointF(price, y0))
+            )
+            axis_bottom: float = self.impv_chart.mapFromScene(
+                self.impv_chart.getAxis("bottom").sceneBoundingRect().bottomLeft()
+            ).y()
+            tag.setPos(local.x(), axis_bottom - 1)
+            tag.show()
+
+    def _place_iv_sigma_labels(self, *_args) -> None:
+        """前日比IVのσ帯の名前を、表示範囲の左端（左のY軸のすぐ右）に置く。"""
+        vb = self.iv_diff_chart.getViewBox()
+        (x0, x1), _ = vb.viewRange()
+        width_px: float = vb.width()
+        # 軸から 4px だけ離す（データ座標に直して足す）
+        gap: float = (x1 - x0) / width_px * 4 if width_px > 0 else 0.0
+        for _mult, line, label in self.iv_sigma_lines:
+            label.setPos(x0 + gap, line.value())
 
     def update_curve_visible(self) -> None:
         """"""
@@ -9887,6 +10073,26 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         self._run_sim_analysis()
 
     @staticmethod
+    def _draw_sigma_x_tags(ax, prices, tags: list[tuple[float, str]]) -> None:
+        """前日終値・σ縦線の値段を、X軸の目盛りの数字の下の行（元のX軸名の
+        位置）に札で出す。点数図の札と同じ見た目（地は暗い色、字は線の色）。
+        描いている価格の範囲の外の線は出さない。"""
+        if not len(prices):
+            return
+        x_min, x_max = float(prices[0]), float(prices[-1])
+        for tag_x, tag_color in tags:
+            if not (x_min <= tag_x <= x_max):
+                continue
+            ax.annotate(
+                f"{tag_x:,.0f}",
+                xy=(tag_x, 0.0), xycoords=ax.get_xaxis_transform(),
+                xytext=(0, -19), textcoords="offset points",
+                ha="center", va="top", color=tag_color, fontsize=8,
+                bbox=dict(boxstyle="square,pad=0.2", fc="#101418", ec="none"),
+                annotation_clip=False, zorder=6,
+            )
+
+    @staticmethod
     def _find_upside_breakeven(
         prices, pnl: list[float], current_price: float
     ) -> float | None:
@@ -10011,6 +10217,9 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 x=base_price, color="#FFD700", linestyle=":", alpha=0.9,
                 linewidth=2.2, label=f"前日終値: {base_price:.0f}",
             )
+            # 線の値段をX軸の目盛りの列に札で出す（点数図の札と同じ見た目:
+            # 地は暗い色、字は線の色。裏の目盛りの数字は札で隠れる）。
+            x_tags: list[tuple[float, str]] = [(base_price, "#FFD700")]
             if daily_iv and daily_iv > 0:
                 for mult in (0.5, 1.0, 1.5, 2.0):
                     upper: float = base_price * (1 + daily_iv * mult)
@@ -10023,6 +10232,9 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                         x=lower, color="#4BFFFF", linestyle="--",
                         linewidth=1.5, alpha=0.4,
                     )
+                    x_tags.append((upper, "#FF4B4B"))
+                    x_tags.append((lower, "#4BFFFF"))
+            self._draw_sigma_x_tags(self.pnl_ax, prices, x_tags)
 
         # Current P&L: prefer the directly-computed total (matches the table's
         # 合計損益 and is correct per-month); fall back to interpolating the
@@ -10085,7 +10297,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
         if greeks_str:
             title += f"    {greeks_str}"
         self.pnl_ax.set_title(title)
-        self.pnl_ax.set_xlabel("原資産価格")
+        # X軸名（原資産価格）は出さない。その行に先物σの値段の札を置く。
         self.pnl_ax.set_ylabel("損益 (千円)")
         self.pnl_ax.legend(loc="upper right", fontsize=8, framealpha=0.7)
         self.pnl_ax.grid(True, alpha=0.3)
@@ -10322,16 +10534,23 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                     x=base_price, color="#FFD700", linestyle=":", alpha=0.9,
                     linewidth=2.2,
                 )
+                gk_tags: list[tuple[float, str]] = [(base_price, "#FFD700")]
                 if daily_iv and daily_iv > 0:
                     for mult in (0.5, 1.0, 1.5, 2.0):
+                        gk_upper: float = base_price * (1 + daily_iv * mult)
+                        gk_lower: float = base_price * (1 - daily_iv * mult)
                         ax.axvline(
-                            x=base_price * (1 + daily_iv * mult),
+                            x=gk_upper,
                             color="#FF4B4B", linestyle="--", linewidth=1.5, alpha=0.4,
                         )
                         ax.axvline(
-                            x=base_price * (1 - daily_iv * mult),
+                            x=gk_lower,
                             color="#4BFFFF", linestyle="--", linewidth=1.5, alpha=0.4,
                         )
+                        gk_tags.append((gk_upper, "#FF4B4B"))
+                        gk_tags.append((gk_lower, "#4BFFFF"))
+                # 損益タブと同じく、線の値段をX軸の目盛りの下の行に出す
+                self._draw_sigma_x_tags(ax, prices, gk_tags)
 
             # Futures entry price markers
             if futures_entries:
@@ -10371,7 +10590,7 @@ class PayoffDiagramChart(QtWidgets.QWidget):
                 )
 
             ax.set_title(title)
-            ax.set_xlabel("原資産価格")
+            # X軸名（原資産価格）は出さない。その行に先物σの値段の札を置く。
             ax.set_ylabel(ylabel[key])
             ax.legend(loc="upper right", fontsize=8, framealpha=0.7)
             ax.grid(True, alpha=0.3)
