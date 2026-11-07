@@ -4872,7 +4872,6 @@ class EntrySignalChart(QtWidgets.QWidget):
         hbox.addWidget(self.d002_put_check)
         hbox.addWidget(self.d002_call_check)
         hbox.addWidget(self.volume_check)
-        hbox.addWidget(self.fixed_ref_check)
         hbox.addWidget(self.cursor_check)
         hbox.addWidget(self.range_trend_check)
         hbox.addWidget(QtWidgets.QLabel("透明度"))
@@ -4881,6 +4880,8 @@ class EntrySignalChart(QtWidgets.QWidget):
         hbox.addWidget(self.tick_check)
         hbox.addWidget(button)
         hbox.addWidget(self.status_label)
+        # よく切り替えるので右端（Y軸の上）に置く
+        hbox.addWidget(self.fixed_ref_check)
 
         # Values under the mouse, so a bar can be read without counting columns.
         self.cursor_label: QtWidgets.QLabel = QtWidgets.QLabel(
