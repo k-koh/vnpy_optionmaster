@@ -3161,6 +3161,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             "show_pinned": self.pinned_check.isChecked(),
             "show_delta_lines": self.delta_lines_check.isChecked(),
             "show_current_price": self.current_price_check.isChecked(),
+            "show_fut_sigma": self.fut_sigma_check.isChecked(),
             "interval": self.interval_combo.currentText(),
             "auto_refresh": self.auto_refresh_check.isChecked(),
             "refresh_interval": self.refresh_interval_spin.value(),
@@ -3190,6 +3191,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             (self.pinned_check, "show_pinned", False),
             (self.delta_lines_check, "show_delta_lines", True),
             (self.current_price_check, "show_current_price", True),
+            (self.fut_sigma_check, "show_fut_sigma", True),
         ]
         for box, key, default in checks:
             box.blockSignals(True)
@@ -3335,6 +3337,15 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self.current_price_check.setToolTip("先物の現在値に水平線と価格ラベルを表示")
         self.current_price_check.toggled.connect(self.run_analysis)
 
+        # 先物σの横線（点数図と同じ: 前日終値 × (1 ± ATM日率IV × n)）
+        self.fut_sigma_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("先物σ")
+        self.fut_sigma_check.setChecked(True)
+        self.fut_sigma_check.setToolTip(
+            "先物の ±0.5σ, ±1.0σ … の横線（点数図と同じ）。\n"
+            "σ = 前日終値 × ATM IV / √252。先物の軸に収まる段だけ描く"
+        )
+        self.fut_sigma_check.toggled.connect(self.run_analysis)
+
         # Auto-refresh: interval (minutes) + enable checkbox, before 更新 button
         self.refresh_interval_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
         self.refresh_interval_spin.setMinimum(1)
@@ -3377,6 +3388,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         hbox.addWidget(self.level_check)
         hbox.addWidget(self.vi_check)
         hbox.addWidget(self.current_price_check)
+        hbox.addWidget(self.fut_sigma_check)
         hbox.addWidget(self.refresh_interval_spin)
         hbox.addWidget(self.auto_refresh_check)
         hbox.addWidget(button)
@@ -4574,6 +4586,49 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     bbox=dict(boxstyle="square,pad=0.2", fc="#101418", ec="none"),
                     annotation_clip=False, zorder=7,
                 )
+
+        # 先物σの横線（点数図と同じ: 前日終値 × (1 ± ATM日率IV × n)、上は赤・
+        # 下は水色の破線）。ATM IV は最新の値。軸は広げず、収まる段だけ描く。
+        if (ax2 is not None and self._fut_pre_close
+                and self.fut_sigma_check.isChecked()):
+            atm_now: float | None = None
+            for src in (series.get(atm_label), pinned_series.get(atm_label)):
+                for v in reversed(src or []):
+                    if not np.isnan(v):
+                        atm_now = v
+                        break
+                if atm_now:
+                    break
+            if atm_now:
+                pc = self._fut_pre_close
+                daily: float = atm_now / 100.0 / (252 ** 0.5)
+                f_lo, f_hi = ax2.get_ylim()
+                for mult in SIGMA_STEPS:
+                    for sign, s_color in ((1.0, "#ff4b4b"), (-1.0, "#4bffff")):
+                        price: float = pc * (1 + sign * daily * mult)
+                        if not (f_lo <= price <= f_hi):
+                            continue
+                        ax2.axhline(
+                            price, color=s_color, linewidth=0.9,
+                            linestyle="--", alpha=0.8, zorder=5,
+                        )
+                        ax2.annotate(
+                            f"{sign * mult:+.1f}σ",
+                            xy=(0.0, price), xycoords=ax2.get_yaxis_transform(),
+                            xytext=(4, 0), textcoords="offset points",
+                            color=s_color, fontsize=8, va="center", ha="left",
+                            zorder=7,
+                        )
+                        ax2.annotate(
+                            f"{price:,.0f}",
+                            xy=(1.0, price), xycoords=ax2.get_yaxis_transform(),
+                            xytext=(3, 0), textcoords="offset points",
+                            color=s_color, fontsize=8, va="center", ha="left",
+                            bbox=dict(boxstyle="square,pad=0.2", fc="#101418",
+                                      ec="none"),
+                            annotation_clip=False, zorder=7,
+                        )
+                ax2.set_ylim(f_lo, f_hi)    # σ線で軸を広げない
 
         n_dates: int = len(date_labels)
 
