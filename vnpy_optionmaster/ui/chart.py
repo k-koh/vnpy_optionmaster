@@ -2657,8 +2657,15 @@ def _load_option_bars_with_today(days: int) -> list[BarData]:
     return daily_bars
 
 
-def _bucket_floor(dt: datetime, hours: int) -> datetime:
-    """Floor a datetime to the start of its `hours`-hour bucket."""
+def _bucket_floor(dt: datetime, minutes: int) -> datetime:
+    """Floor a datetime to the start of its `minutes`-minute bucket.
+
+    60分未満（30m）は時の中で分を切り捨て、60分以上は N 時間で切り捨てる。"""
+    if minutes < 60:
+        return dt.replace(
+            minute=dt.minute - dt.minute % minutes, second=0, microsecond=0
+        )
+    hours: int = minutes // 60
     return dt.replace(
         hour=dt.hour - dt.hour % hours, minute=0, second=0, microsecond=0
     )
@@ -3097,6 +3104,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
     VI_COLOR: str = "#ff4081"     # 日経VI（ピンク）
     # 線上の差分ラベルは |差分| がこの値以上のときだけ出す（小さい動きは省く）
     DIFF_LABEL_MIN: float = 0.5
+    # 先物の価格軸を IV の右目盛りの外へずらす量（pt）
+    FUT_AXIS_OFFSET_PT: float = 36.0
 
     DELTA_TARGETS: list[tuple[str, float, str]] = [
         ("ATM (Δ0.50)", -0.50, "#ffffff"),
@@ -3160,6 +3169,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             "show_vi": self.vi_check.isChecked(),
             "show_pinned": self.pinned_check.isChecked(),
             "show_delta_lines": self.delta_lines_check.isChecked(),
+            "show_futures": self.futures_check.isChecked(),
             "show_current_price": self.current_price_check.isChecked(),
             "show_fut_sigma": self.fut_sigma_check.isChecked(),
             "interval": self.interval_combo.currentText(),
@@ -3180,16 +3190,17 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         # 起動途中（まだ非表示）で描き直すと、データが無いときの警告
         # ダイアログが開いて止まる。最初の描画は showEvent に任せる。
         checks: list[tuple[QtWidgets.QCheckBox, str, bool]] = [
-            (self.decay_check, "show_decay", False),
-            (self.pinned_decay_check, "show_pinned_decay", False),
-            (self.vi_decay_check, "show_vi_decay", False),
-            (self.level_decay_check, "show_level_decay", False),
-            (self.envelope_check, "show_envelope", False),
+            (self.decay_check, "show_decay", True),
+            (self.pinned_decay_check, "show_pinned_decay", True),
+            (self.vi_decay_check, "show_vi_decay", True),
+            (self.level_decay_check, "show_level_decay", True),
+            (self.envelope_check, "show_envelope", True),
             (self.skew_check, "show_skew", False),
-            (self.level_check, "show_level", True),
+            (self.level_check, "show_level", False),
             (self.vi_check, "show_vi", True),
-            (self.pinned_check, "show_pinned", False),
-            (self.delta_lines_check, "show_delta_lines", True),
+            (self.pinned_check, "show_pinned", True),
+            (self.delta_lines_check, "show_delta_lines", False),
+            (self.futures_check, "show_futures", True),
             (self.current_price_check, "show_current_price", True),
             (self.fut_sigma_check, "show_fut_sigma", True),
         ]
@@ -3197,10 +3208,10 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             box.blockSignals(True)
             box.setChecked(data.get(key, default))
             box.blockSignals(False)
-        self.interval_combo.setCurrentText(data.get("interval", "4H"))
+        self.interval_combo.setCurrentText(data.get("interval", "1H"))
         self.refresh_interval_spin.setValue(data.get("refresh_interval", 5))
         # Setting this checked starts the timer via _on_auto_refresh_toggled.
-        self.auto_refresh_check.setChecked(data.get("auto_refresh", False))
+        self.auto_refresh_check.setChecked(data.get("auto_refresh", True))
 
     def _on_auto_refresh_toggled(self, checked: bool) -> None:
         """Start/stop the auto-refresh timer when the checkbox is toggled.
@@ -3267,8 +3278,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         # 時間足: 1D uses per-strike option chain (current behaviour); intraday
         # intervals resample the futures minute-bar IV (ATM / eris Δ0.1).
         self.interval_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
-        self.interval_combo.addItems(["1H", "2H", "4H", "8H", "12H", "1D"])
-        self.interval_combo.setCurrentText("4H")
+        self.interval_combo.addItems(["30m", "1H", "2H", "4H", "8H", "12H", "1D"])
+        self.interval_combo.setCurrentText("1H")
 
         self.delta_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
         self.delta_combo.addItem("全デルタ")
@@ -3278,34 +3289,40 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         # IV理論減衰（直近のピークから 1/√t）。デルタ線（＋日経VI）用と
         # ピン留め線用を別々に切り替える。
         self.decay_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("デルタ線 減衰")
+        self.decay_check.setChecked(True)
         self.decay_check.setToolTip(
             "Put Δ0.10 / ATM / Call Δ0.10 のIV理論減衰（破線）"
         )
         self.decay_check.toggled.connect(self.run_analysis)
         self.vi_decay_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("日経VI 減衰")
+        self.vi_decay_check.setChecked(True)
         self.vi_decay_check.setToolTip(
             "日経VI のIV理論減衰（破線）。日経VI を表示しているときだけ出ます。"
         )
         self.vi_decay_check.toggled.connect(self.run_analysis)
         self.level_decay_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("面の上下 減衰")
+        self.level_decay_check.setChecked(True)
         self.level_decay_check.setToolTip(
             "ATM 面の上下 のIV理論減衰（黄色の点線）。面の上下を表示しているときだけ出ます。"
         )
         self.level_decay_check.toggled.connect(self.run_analysis)
         self.pinned_decay_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("ピン留め 減衰")
+        self.pinned_decay_check.setChecked(True)
         self.pinned_decay_check.setToolTip(
             "ピン留め線（固定行使価格）のIV理論減衰（点線）。\n"
             "ピン留め線を表示しているときだけ出ます。"
         )
         self.pinned_decay_check.toggled.connect(self.run_analysis)
         self.envelope_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("残像")
+        self.envelope_check.setChecked(True)
         self.skew_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("スキュー")
         self.pinned_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("ピン留め(固定行使価格)")
+        self.pinned_check.setChecked(True)
 
         # デルタ線（Put Δ0.10 / ATM / Call Δ0.10）の表示/非表示。
         # ピン留め線とほぼ重なるので、ピン留めだけ見たいときに消せる。
         self.delta_lines_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("デルタ線")
-        self.delta_lines_check.setChecked(True)
+        self.delta_lines_check.setChecked(False)
         self.delta_lines_check.setToolTip(
             "Put Δ0.10 / ATM / Call Δ0.10 のIV線（前日比・残像・理論減衰を含む）の表示/非表示"
         )
@@ -3315,7 +3332,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         # 通常のATM線との差が「滑り」なので、2本並べるとボラそのものが買われて
         # いるのか、先物が動いてスマイル上を滑っただけなのかが分かる。
         self.level_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("面の上下")
-        self.level_check.setChecked(True)
+        self.level_check.setChecked(False)
         self.level_check.setToolTip(
             "ATMの面の上下だけのIV（前日と同じモネネスで測り直した今日のIV）。\n"
             "ATM線より上なら、先物の動きを除いてもボラが買われています。"
@@ -3330,6 +3347,16 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             "時間足ではその足の最後の値、1D ではセッションの最後の値。"
         )
         self.vi_check.toggled.connect(self.run_analysis)
+
+        # 先物（ローソク足／終値線と右の価格軸）の表示・非表示。
+        # OFF のときは先物の現在値・前日終値・σ線も一緒に消える。
+        self.futures_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("先物")
+        self.futures_check.setChecked(True)
+        self.futures_check.setToolTip(
+            "先物のローソク足と右の価格軸を表示。\n"
+            "OFF にすると先物の現在値・前日終値・σ線も表示しない"
+        )
+        self.futures_check.toggled.connect(self.run_analysis)
 
         # Futures current-value line + right-edge price tag (like 株価チャット).
         self.current_price_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("現在値")
@@ -3360,6 +3387,9 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         self._refresh_timer.timeout.connect(self._auto_refresh)
         self.auto_refresh_check.toggled.connect(self._on_auto_refresh_toggled)
         self.refresh_interval_spin.valueChanged.connect(self._on_refresh_interval_changed)
+        # 既定は ON。connect の後に入れてタイマーも起こす（まだ非表示なので
+        # すぐの再描画は走らない）。
+        self.auto_refresh_check.setChecked(True)
 
         # Timestamp of the last refresh (manual or auto), to confirm updates
         self.last_update_label: QtWidgets.QLabel = QtWidgets.QLabel("最終更新: ---")
@@ -3387,6 +3417,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         hbox.addWidget(self.pinned_check)
         hbox.addWidget(self.level_check)
         hbox.addWidget(self.vi_check)
+        hbox.addWidget(self.futures_check)
         hbox.addWidget(self.current_price_check)
         hbox.addWidget(self.fut_sigma_check)
         hbox.addWidget(self.refresh_interval_spin)
@@ -3512,11 +3543,11 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         return pinned_series, anchor_symbols
 
     def _build_intraday_pinned(
-        self, month: str, days: int, hours: int, date_labels: list[str],
+        self, month: str, days: int, minutes: int, date_labels: list[str],
         incremental: bool = False,
     ) -> tuple[dict[str, list[float]], dict[str, str]]:
         """Pinned (固定行使価格) series for intraday, from the 15m per-strike
-        option bars, bucketed to the chosen `hours`-hour interval and aligned to
+        option bars, bucketed to the chosen `minutes`-minute interval and aligned to
         date_labels (the futures-based main-series buckets).
 
         This is by far the heaviest query in the window (every strike of 期間 at
@@ -3524,7 +3555,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         idempotent: an incremental refresh reads from the newest bar already
         merged and leaves the closed buckets alone."""
         now: datetime = datetime.now(DB_TZ)
-        key: tuple = (month, days, hours)
+        key: tuple = (month, days, minutes)
 
         if not incremental or key != self._pin_key:
             self._pin_key = key
@@ -3547,12 +3578,15 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         for bar in month_bars:
             if bar.iv <= 0 or bar.delta == 0 or not bar.symbol:
                 continue
-            bucket_key: str = _bucket_floor(bar.datetime, hours).strftime(
+            bucket_key: str = _bucket_floor(bar.datetime, minutes).strftime(
                 "%Y-%m-%d %H:%M"
             )
             syms = bucket_syms.setdefault(bucket_key, {})
             prev = syms.get(bar.symbol)
-            if prev is None or bar.datetime > prev.datetime:
+            # 15m の足は記録側が毎分同じ時刻で上書き（upsert）するので、
+            # 同時刻でも新しく読んだ方で置き換える。">" だと形成中の足が
+            # 最初に読んだ値のまま止まり、最後の点がリアルタイムで動かない。
+            if prev is None or bar.datetime >= prev.datetime:
                 syms[bar.symbol] = bar
             if self._pin_dt is None or bar.datetime > self._pin_dt:
                 self._pin_dt = bar.datetime
@@ -3560,10 +3594,10 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         if self._pin_dt is None:
             # No 15m option bars anywhere in 期間: remember that, so the next
             # tick asks for the tail only instead of rescanning the window.
-            self._pin_dt = now - timedelta(hours=hours)
+            self._pin_dt = now - timedelta(minutes=minutes)
 
         self._prune_buckets(
-            bucket_syms, _bucket_floor(now - timedelta(days=days), hours)
+            bucket_syms, _bucket_floor(now - timedelta(days=days), minutes)
         )
 
         date_bars: dict[str, list[BarData]] = {
@@ -3581,9 +3615,9 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             del buckets[stale]
 
     def _build_intraday_series(
-        self, month: str, days: int, hours: int, incremental: bool = False
+        self, month: str, days: int, minutes: int, incremental: bool = False
     ) -> tuple[list[str], dict[str, list[float]], dict[str, tuple[float, float, float, float]]]:
-        """Resample futures minute-bar IV to `hours`-hour buckets.
+        """Resample futures minute-bar IV to `minutes`-minute buckets.
 
         Uses the ATM / eris Δ0.1 IV recorded on the underlying futures minute
         bars (the only intraday IV available). Returns (labels, series,
@@ -3596,7 +3630,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         """
         symbol: str = f"nk-{month}"
         now: datetime = datetime.now(DB_TZ)
-        cache_key: tuple = (symbol, days, hours)
+        cache_key: tuple = (symbol, days, minutes)
 
         if not incremental or cache_key != self._fut_key:
             self._fut_key = cache_key
@@ -3622,7 +3656,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         for bar in bars:
             if getattr(bar, "pre_close", 0):
                 self._fut_pre_close = bar.pre_close
-            bdt: datetime = _bucket_floor(bar.datetime, hours)
+            bdt: datetime = _bucket_floor(bar.datetime, minutes)
             key: str = bdt.strftime("%Y-%m-%d %H:%M")
             b = buckets.get(key)
             if b is None:
@@ -3650,7 +3684,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 if getattr(bar, "n225_vi", None):
                     b["vi"] = bar.n225_vi
 
-        self._prune_buckets(buckets, _bucket_floor(now - timedelta(days=days), hours))
+        self._prune_buckets(buckets, _bucket_floor(now - timedelta(days=days), minutes))
         if not buckets:
             return [], {}, {}
 
@@ -3864,7 +3898,8 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             end=now,
         ):
             existing = self._fallback_bars.get(bar.symbol)
-            if existing is None or bar.datetime > existing.datetime:
+            # 同時刻の足が上書きされていても新しく読んだ方を使う
+            if existing is None or bar.datetime >= existing.datetime:
                 self._fallback_bars[bar.symbol] = bar
             if self._fallback_dt is None or bar.datetime > self._fallback_dt:
                 self._fallback_dt = bar.datetime
@@ -3943,9 +3978,11 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                         QtWidgets.QMessageBox.Ok,
                     )
                 return
-            hours: int = {"1H": 1, "2H": 2, "4H": 4, "8H": 8, "12H": 12}[interval_label]
+            minutes: int = {
+                "30m": 30, "1H": 60, "2H": 120, "4H": 240, "8H": 480, "12H": 720,
+            }[interval_label]
             date_labels, series, futures_ohlc = self._build_intraday_series(
-                futures_month, days, hours, incremental
+                futures_month, days, minutes, incremental
             )
             if not date_labels:
                 if show_warnings:
@@ -3958,7 +3995,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             # Pinned (固定行使価格) from the recorded 15m per-strike option bars.
             if want_pinned:
                 pinned_series, anchor_symbols = self._build_intraday_pinned(
-                    futures_month, days, hours, date_labels, incremental
+                    futures_month, days, minutes, date_labels, incremental
                 )
 
         futures_prices: dict[str, float] = {d: v[3] for d, v in futures_ohlc.items()}
@@ -3986,14 +4023,18 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         if not tags:
             return
         y0, y1 = ax.get_ylim()
-        tags = [(lx, v, c) for lx, v, c in tags if y0 <= v <= y1]
+        # 札は (x, 値, 色) か (x, 値, 色, 最後の差分)。差分は接続線の上に出す。
+        tags = [
+            (t[0], t[1], t[2], t[3] if len(t) > 3 else None)
+            for t in tags if y0 <= t[1] <= y1
+        ]
         if not tags:
             return
 
         # 札の列が最後の点に重なると線が隠れるので、右端に札の幅＋線の分の
         # 余白を取る（最後の点 → 札 の線が必ず見えるように）。
         need_px: float = 70.0
-        x_last: float = max(lx for lx, _v, _c in tags)
+        x_last: float = max(t[0] for t in tags)
         x0, x1 = ax.get_xlim()
         width_px: float = ax.bbox.width
         if width_px > need_px * 2:
@@ -4006,12 +4047,12 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         from_px = ax.transData.inverted().transform
         min_gap_px: float = 15.0
         items = sorted(
-            ((to_px((0, v))[1], lx, v, c) for lx, v, c in tags),
+            ((to_px((0, v))[1], lx, v, c, d) for lx, v, c, d in tags),
             key=lambda t: t[0],
         )
         avoid: list[float] = sorted(avoid_px or [])
         placed: list[float] = []
-        for py, _lx, _v, _c in items:
+        for py, _lx, _v, _c, _d in items:
             if placed and py - placed[-1] < min_gap_px:
                 py = placed[-1] + min_gap_px
             for r in avoid:
@@ -4031,7 +4072,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 ceiling = py - min_gap_px
 
         trans = blended_transform_factory(ax.transAxes, ax.transData)
-        for (_py_orig, lx, v, c), py in zip(items, placed):
+        for (_py_orig, lx, v, c, d), py in zip(items, placed):
             y_tag: float = from_px((0, py))[1]
             draw_ax.annotate(
                 f"{v:.1f}",
@@ -4046,6 +4087,20 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     linestyle=(0, (2, 2)), shrinkA=0, shrinkB=2,
                 ),
             )
+            if d is not None:
+                # 最後の点 → 札 の線の中ほどに、最後の差分（0.5 未満でも出す）
+                p0 = to_px((lx, v))
+                tag_left_px: float = ax.transAxes.transform((0.999, 0))[0] - 34
+                mid_px = ((p0[0] + tag_left_px) / 2, (p0[1] + py) / 2)
+                mx, my = from_px(mid_px)
+                draw_ax.annotate(
+                    f"{d:+.1f}", xy=(mx, my), xycoords="data",
+                    xytext=(0, 2), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=8, fontweight="bold",
+                    color=c, zorder=8, annotation_clip=False,
+                    bbox=dict(boxstyle="square,pad=0.1", fc="black",
+                              alpha=0.7, ec="none"),
+                )
 
     def update_chart(
         self,
@@ -4062,6 +4117,9 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             pinned_series = {}
         if anchor_symbols is None:
             anchor_symbols = {}
+        # 右側は「IV目盛り → 先物の価格目盛り」の順。先物の軸と札（前日終値・
+        # σの値段）はこの分（pt）だけ外側にずらして、IV目盛りと重ねない。
+        fut_axis_off: float = self.FUT_AXIS_OFFSET_PT
 
         x = np.arange(len(date_labels))
 
@@ -4137,9 +4195,9 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
 
         # 各線の現在IV（最後の有効値）— 右のY軸の内側に札として出す。
         # (最後の点のx, 値, 色)
-        iv_axis_tags: list[tuple[float, float, str]] = []
+        iv_axis_tags: list[tuple] = []
         # デルタ線（ATM / Put / Call）の札。ピン留め線の札がある系列は出さない。
-        delta_tags: dict[str, tuple[float, float, str]] = {}
+        delta_tags: dict[str, tuple] = {}
 
         def _last_valid(vals) -> tuple[float, float] | None:
             """最後の有効な点 (x, 値)。"""
@@ -4149,34 +4207,50 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     return float(x[i]), float(v)
             return None
 
+        def _last_diff(vals) -> tuple[int, float | None]:
+            """最後の有効な点の添字と、その1本前との差分（1本前が欠測なら None）。
+            札への接続線の上に出す差分（0.5 未満でも出す）に使う。"""
+            for i in range(len(vals) - 1, -1, -1):
+                v = vals[i]
+                if v is not None and not np.isnan(v):
+                    if i >= 1 and not np.isnan(vals[i - 1]):
+                        return i, float(v - vals[i - 1])
+                    return i, None
+            return -1, None
+
+        def _draw_envelope(vals: list[float], env_color: str) -> None:
+            """IV残像: 直近 envelope_window 本の高値・安値の帯（線の後ろ）。"""
+            arr_e = np.array(vals, dtype=float)
+            n = len(arr_e)
+            roll_hi = np.full(n, np.nan)
+            roll_lo = np.full(n, np.nan)
+            for i in range(n):
+                j0 = max(0, i - envelope_window + 1)
+                window = arr_e[j0:i + 1]
+                valid = window[~np.isnan(window)]
+                if valid.size:
+                    roll_hi[i] = valid.max()
+                    roll_lo[i] = valid.min()
+            mask = ~(np.isnan(roll_hi) | np.isnan(roll_lo))
+            if mask.any():
+                ax.fill_between(
+                    x, roll_lo, roll_hi, where=mask,
+                    color=env_color, alpha=0.2, linewidth=0,
+                )
+
         for label, target_delta, color in plot_targets:
             if not show_delta_lines:
                 break
             values: list[float] = series[label]
             last_iv = _last_valid(values)
+            _last_idx, last_diff = _last_diff(values)
             if last_iv is not None:
                 # ピン留めの札が出るときはそちらを残す（値がほぼ同じため）
-                delta_tags[label] = (*last_iv, color)
+                delta_tags[label] = (*last_iv, color, last_diff)
 
             # IV残像 (rolling high/low band) — plotted behind the line
             if show_envelope:
-                arr = np.array(values, dtype=float)
-                n = len(arr)
-                roll_hi = np.full(n, np.nan)
-                roll_lo = np.full(n, np.nan)
-                for i in range(n):
-                    j0 = max(0, i - envelope_window + 1)
-                    window = arr[j0:i + 1]
-                    valid = window[~np.isnan(window)]
-                    if valid.size:
-                        roll_hi[i] = valid.max()
-                        roll_lo[i] = valid.min()
-                mask = ~(np.isnan(roll_hi) | np.isnan(roll_lo))
-                if mask.any():
-                    ax.fill_between(
-                        x, roll_lo, roll_hi, where=mask,
-                        color=color, alpha=0.2, linewidth=0,
-                    )
+                _draw_envelope(values, color)
 
             ax.plot(x, values, color=color, linewidth=1.5, label=label, marker=".", markersize=3)
 
@@ -4199,6 +4273,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 if np.isnan(prev_val) or np.isnan(curr_val):
                     continue
                 diff_val: float = curr_val - prev_val
+                # 0.5 未満は出さない（最後の差分は札への接続線の上に必ず出る）
                 if abs(diff_val) < self.DIFF_LABEL_MIN:
                     continue
                 mid_x: float = (x[i - 1] + x[i]) / 2
@@ -4219,7 +4294,9 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             if np.any(~np.isnan(level_arr)):
                 last_level = _last_valid(level_values)
                 if last_level is not None:
-                    iv_axis_tags.append((*last_level, "#ffd600"))
+                    iv_axis_tags.append(
+                        (*last_level, "#ffd600", _last_diff(level_values)[1])
+                    )
                 ax.plot(
                     x, level_values,
                     color="#ffd600", linewidth=1.6,
@@ -4243,8 +4320,12 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         if self.vi_check.isChecked() and vi_values:
             if np.any(~np.isnan(np.array(vi_values, dtype=float))):
                 last_vi = _last_valid(vi_values)
+                _vi_idx, vi_last_diff = _last_diff(vi_values)
                 if last_vi is not None:
-                    iv_axis_tags.append((*last_vi, self.VI_COLOR))
+                    iv_axis_tags.append((*last_vi, self.VI_COLOR, vi_last_diff))
+                # 日経VI 残像（デルタ線と同じ: 直近20本の高値・安値の帯）
+                if show_envelope:
+                    _draw_envelope(vi_values, self.VI_COLOR)
                 ax.plot(
                     x, vi_values,
                     color=self.VI_COLOR, linewidth=1.6, alpha=0.95,
@@ -4266,6 +4347,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     curr_v: float = vi_values[i]
                     if np.isnan(prev_v) or np.isnan(curr_v):
                         continue
+                    # 0.5 未満は出さない（最後の差分は接続線の上に必ず出る）
                     if abs(curr_v - prev_v) < self.DIFF_LABEL_MIN:
                         continue
                     ax.text(
@@ -4298,11 +4380,16 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     continue
                 pin_color: str = pinned_colors.get(label, color)
                 last_pin = _last_valid(pinned_values)
+                _pin_idx, pin_last_diff = _last_diff(pinned_values)
                 if last_pin is not None:
-                    iv_axis_tags.append((*last_pin, pin_color))
+                    iv_axis_tags.append((*last_pin, pin_color, pin_last_diff))
                     delta_tags.pop(label, None)
                 anchor_sym = anchor_symbols.get(label, "")
                 # Pull strike out of "nk-2606-P-54000" → "54000" for the legend.
+                # デルタ線を隠しているときは、残像をピン留め線の方に出す
+                # （デルタ線の残像と2重にならないよう、表示中は出さない）。
+                if show_envelope and not show_delta_lines:
+                    _draw_envelope(pinned_values, pin_color)
                 strike_str: str = anchor_sym.split("-")[-1] if anchor_sym else ""
                 pinned_label: str = f"{label} ピン留め(K={strike_str})" if strike_str else f"{label} ピン留め"
                 ax.plot(
@@ -4331,6 +4418,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     curr_v: float = pinned_values[i]
                     if np.isnan(prev_v) or np.isnan(curr_v):
                         continue
+                    # 0.5 未満は出さない（最後の差分は接続線の上に必ず出る）
                     if abs(curr_v - prev_v) < self.DIFF_LABEL_MIN:
                         continue
                     ax.text(
@@ -4446,8 +4534,14 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 price = futures_prices.get(d, float("nan"))
                 futures_values.append(price)
 
+        # 「先物」OFF: 先物を描かない（ax2 が None のままなので、現在値・
+        # 前日終値・σ線・カーソルの先物値もまとめて出ない）。
+        show_futures: bool = self.futures_check.isChecked()
+        if not show_futures:
+            futures_values = []
+
         ax2 = None
-        if futures_ohlc and any(d in futures_ohlc for d in date_labels):
+        if show_futures and futures_ohlc and any(d in futures_ohlc for d in date_labels):
             # Candles drawn exactly like 株価チャート's CandleItem:
             #   陽線 = UP_COLOR filled, 陰線 = DOWN_COLOR hollow, 1px ヒゲ.
             #
@@ -4529,7 +4623,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 ],
                 loc="upper right", fontsize=8, framealpha=0.7,
             )
-        elif futures_prices and any(not np.isnan(v) for v in futures_values):
+        elif show_futures and futures_prices and any(not np.isnan(v) for v in futures_values):
             # Fallback to a line when only close prices are available
             ax2 = ax.twinx()
             # Keep the futures line behind the IV lines (see note above).
@@ -4543,6 +4637,20 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             ax2.set_ylabel("先物価格", color="#66ff66")
             ax2.tick_params(axis="y", labelcolor="#66ff66")
             ax2.legend(loc="upper right", fontsize=8, framealpha=0.7)
+
+        # 最新の ATM IV（年率%）。先物σ（横線・現在値のσ）の 1σ に使う。
+        # ATM 線が無いときは ATM ピン留めの値で代える。
+        atm_now: float | None = None
+        for src in (series.get(atm_label), pinned_series.get(atm_label)):
+            for v in reversed(src or []):
+                if not np.isnan(v):
+                    atm_now = v
+                    break
+            if atm_now:
+                break
+        # 先物の現在値が 0σ（前日終値）から何σ離れているか（エントリー判定・
+        # 株価チャットと同じ式: (現在値 − 前日終値) / (前日終値 × ATM日率IV)）。
+        fut_now_sigma: float | None = None
 
         # Futures current-value: horizontal line + right-edge price tag on the
         # secondary axis (like 株価チャット's 現在値). Toggled by the checkbox.
@@ -4567,6 +4675,23 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                     bbox=dict(boxstyle="round,pad=0.18", fc="#66ff66",
                               ec="none", alpha=0.95),
                 )
+                # 現在値の札のすぐ上に σ（σ の文字は付けない）。＋は赤、−は水色。
+                if self._fut_pre_close and atm_now:
+                    daily_now: float = atm_now / 100.0 / (252 ** 0.5)
+                    fut_now_sigma = (
+                        (last_futures_price - self._fut_pre_close)
+                        / (self._fut_pre_close * daily_now)
+                    )
+                    ax2.annotate(
+                        f"{fut_now_sigma:+.2f}",
+                        xy=(0.999, last_futures_price), xycoords=tag_trans,
+                        xytext=(0, 8), textcoords="offset points",
+                        ha="right", va="bottom", fontsize=8, fontweight="bold",
+                        color="#ff4b4b" if fut_now_sigma >= 0 else "#4bffff",
+                        bbox=dict(boxstyle="square,pad=0.2", fc="#101418",
+                                  ec="none"),
+                        annotation_clip=False, zorder=7,
+                    )
 
         # 先物の前日終値の横線（点数図の 0σ と同じ見た目: 黄の破線、値段は
         # 右の目盛り列に暗い地・黄色の字の札）。軸の外なら描かない。
@@ -4581,7 +4706,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 ax2.annotate(
                     f"{pc:,.0f}",
                     xy=(1.0, pc), xycoords=ax2.get_yaxis_transform(),
-                    xytext=(3, 0), textcoords="offset points",
+                    xytext=(3 + fut_axis_off, 0), textcoords="offset points",
                     color="#ffff00", fontsize=8, va="center", ha="left",
                     bbox=dict(boxstyle="square,pad=0.2", fc="#101418", ec="none"),
                     annotation_clip=False, zorder=7,
@@ -4591,14 +4716,6 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         # 下は水色の破線）。ATM IV は最新の値。軸は広げず、収まる段だけ描く。
         if (ax2 is not None and self._fut_pre_close
                 and self.fut_sigma_check.isChecked()):
-            atm_now: float | None = None
-            for src in (series.get(atm_label), pinned_series.get(atm_label)):
-                for v in reversed(src or []):
-                    if not np.isnan(v):
-                        atm_now = v
-                        break
-                if atm_now:
-                    break
             if atm_now:
                 pc = self._fut_pre_close
                 daily: float = atm_now / 100.0 / (252 ** 0.5)
@@ -4622,7 +4739,7 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                         ax2.annotate(
                             f"{price:,.0f}",
                             xy=(1.0, price), xycoords=ax2.get_yaxis_transform(),
-                            xytext=(3, 0), textcoords="offset points",
+                            xytext=(3 + fut_axis_off, 0), textcoords="offset points",
                             color=s_color, fontsize=8, va="center", ha="left",
                             bbox=dict(boxstyle="square,pad=0.2", fc="#101418",
                                       ec="none"),
@@ -4656,9 +4773,10 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
             for i in night_idx:
                 target_ax.axvline(x=i - 0.5, color="#9aa0a6", linewidth=0.8,
                                   linestyle="-", alpha=0.45, zorder=0)
+            # 日中（08:45）開始はエントリー判定と同じ見た目（濃いめのグレー破線）
             for i in day_idx:
-                target_ax.axvline(x=i - 0.5, color="#5f6368", linewidth=0.6,
-                                  linestyle="--", alpha=0.4, zorder=0)
+                target_ax.axvline(x=i - 0.5, color="#646464", linewidth=0.9,
+                                  linestyle="--", alpha=0.9, zorder=0.6)
 
         # ---- 週の変わり目の縦線（株価チャートの先物チャートと同じ）
         # ISO週が変わった最初の位置に白の実線。セッションの区切り（灰色の
@@ -4696,6 +4814,14 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
         title: str = f"IV時系列 — {delta_selection}" if delta_selection != "全デルタ" else "IV時系列（デルタレベル別）"
         ax.set_title(title, fontsize=12)
         ax.set_ylabel("IV (年率%)")
+
+        # IV目盛りを右側にも（左と同じ値。secondary_yaxis は ax の範囲に
+        # 自動で追従する）。先物の価格軸はその外側へずらす。
+        ax.secondary_yaxis("right")
+        if ax_skew is not None:
+            ax_skew.secondary_yaxis("right").tick_params(axis="y", labelsize=8)
+        if ax2 is not None:
+            ax2.spines["right"].set_position(("outward", fut_axis_off))
 
         # X-axis labels go on the bottom-most subplot only.
         if ax_skew is not None:
@@ -4763,7 +4889,14 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
 
         # Trim outer whitespace to match IVEventDecayChart compactness
         bottom_margin = 0.07 if ax_skew is not None else 0.08
-        self.fig.subplots_adjust(left=0.045, right=0.97, top=0.96, bottom=bottom_margin, hspace=0.05)
+        # 右の余白: IV目盛り、先物があればその外に先物目盛り＋「先物価格」。
+        right_pt: float = 40.0 + (fut_axis_off + 62.0 if ax2 is not None else 0.0)
+        fig_w_px: float = self.fig.get_figwidth() * self.fig.dpi
+        right: float = 1.0 - right_pt * self.fig.dpi / 72.0 / max(fig_w_px, 1.0)
+        self.fig.subplots_adjust(
+            left=0.045, right=max(right, 0.80), top=0.96,
+            bottom=bottom_margin, hspace=0.05,
+        )
 
         # 札はレイアウト確定後に置く（画面上の間隔を px で決めるため）。
         # 先物の現在値の札（右軸の内側）と重ならないよう、その高さを避ける。
@@ -4773,7 +4906,10 @@ class IVTimeSeriesChart(QtWidgets.QWidget):
                 fv = futures_prices.get(d)
                 if fv is not None and not (isinstance(fv, float) and np.isnan(fv)):
                     ax2.get_ylim()  # 自動スケールを確定させてから座標変換する
-                    fut_avoid_px.append(float(ax2.transData.transform((0, fv))[1]))
+                    fv_px: float = float(ax2.transData.transform((0, fv))[1])
+                    fut_avoid_px.append(fv_px)
+                    if fut_now_sigma is not None:
+                        fut_avoid_px.append(fv_px + 15)  # 札の上のσ
                     break
         self._draw_iv_axis_tags(ax, iv_axis_tags, avoid_px=fut_avoid_px)
         self.canvas.draw()
@@ -5154,13 +5290,11 @@ class EntrySignalChart(QtWidgets.QWidget):
         for box in (self.atm_check, self.put_check, self.call_check,
                     self.level_check, self.sigma_check, self.d002_put_check,
                     self.d002_call_check, self.volume_check):
-            # 既定は Δ0.02 の両翼と枚数だけ。ATM と 面の上下 は互いにほぼ
-            # 重なり、Δ0.1 は Δ0.02 と形が似るので、まずは一番外側の
-            # ウィングだけを出して、必要に応じて足していく。
+            # 既定は Δ0.1 PUT/CALL・σ・枚数（使っている設定に合わせた）。
             # 初期値は必ず connect の前に入れる（接続後に変えると、
             # まだ揃っていないウィジェットを使って再描画が走る）。
             box.setChecked(box in (
-                self.d002_put_check, self.d002_call_check, self.volume_check,
+                self.put_check, self.call_check, self.volume_check,
                 self.sigma_check,
             ))
             if box not in (self.sigma_check, self.d002_put_check,
@@ -5307,12 +5441,12 @@ class EntrySignalChart(QtWidgets.QWidget):
         self.max_bars_spin.setValue(data.get("max_bars", self.MAX_COLUMNS))
         self.alpha_spin.setValue(data.get("fill_alpha", 0.45))
         self.atm_check.setChecked(data.get("show_atm", False))
-        self.put_check.setChecked(data.get("show_put", False))
-        self.call_check.setChecked(data.get("show_call", False))
+        self.put_check.setChecked(data.get("show_put", True))
+        self.call_check.setChecked(data.get("show_call", True))
         self.level_check.setChecked(data.get("show_level", False))
         self.sigma_check.setChecked(data.get("show_sigma", True))
-        self.d002_put_check.setChecked(data.get("show_d002_put", True))
-        self.d002_call_check.setChecked(data.get("show_d002_call", True))
+        self.d002_put_check.setChecked(data.get("show_d002_put", False))
+        self.d002_call_check.setChecked(data.get("show_d002_call", False))
         self.volume_check.setChecked(data.get("show_volume", True))
         self.fixed_ref_check.setChecked(data.get("fixed_reference", False))
         self.cursor_check.setChecked(data.get("show_cursor", True))
@@ -6509,7 +6643,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         now_sigma: float | None = self.futures_sigma(last_row)
         if now_sigma is not None:
             ax_fut.annotate(
-                f"{now_sigma:+.2f}σ",
+                f"{now_sigma:+.2f}",
                 xy=(1.0, last_price), xycoords=ax_fut.get_yaxis_transform(),
                 xytext=(3, 8), textcoords="offset points",
                 ha="left", va="bottom",
@@ -6671,7 +6805,7 @@ class EntrySignalChart(QtWidgets.QWidget):
         # と同じ、右の目盛りの外。軸の外に出たときは端で止めて矢印を足す。
         iv_sigma: float | None = self.futures_sigma(rows[-1])
         if iv_sigma is not None:
-            sigma_text: str = f"{iv_sigma:+.2f}σ"
+            sigma_text: str = f"{iv_sigma:+.2f}"
             sigma_y: float = iv_sigma
             iv_y0, iv_y1 = ax_iv.get_ylim()
             if iv_sigma > iv_y1:
